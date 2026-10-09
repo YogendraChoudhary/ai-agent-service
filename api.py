@@ -1,5 +1,7 @@
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from src.text_processing_agent import (
     process_user_query,
@@ -26,6 +28,7 @@ import time
 import uuid
 import json
 import os
+import uvicorn
 
 # Configure logging
 logging.basicConfig(
@@ -35,16 +38,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app = FastAPI(title="Text Processing Agent API")
 
-# Enable CORS for all routes
-CORS(app, resources={
-    r"/agent/*": {
-        "origins": "*",  # Allow all origins
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+# Enable CORS for all routes (matching Flask CORS configuration)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 # Supported AI models
 SUPPORTED_MODELS = ['openai', 'claude', 'grok', 'deepseek', 'gemini']
@@ -219,15 +222,25 @@ def validate_and_get_api_key(license_key: str, model_provider: str, request_id: 
     return api_key, None, license_meta
 
 
-@app.route('/agent/process', methods=['POST'])
-def process_text():
+@app.post('/agent/process')
+async def process_text(request: Request):
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
     logger.info(f"[{request_id}] ========== NEW REQUEST ==========")
 
     try:
-        data = request.get_json()
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
+
+        if not data or not isinstance(data, dict):
+            logger.warning(f"[{request_id}] VALIDATION FAILED - Missing request body")
+            return JSONResponse(
+                status_code=400,
+                content={'error': 'Missing required fields: type, query, model, api_key'}
+            )
 
         # Log request details (without sensitive data)
         logger.info(f"[{request_id}] Request received")
@@ -239,11 +252,12 @@ def process_text():
         # Validate required fields
         required_fields = ['type', 'query', 'model', 'api_key']
         missing_fields = [field for field in required_fields if field not in data or not data[field]]
-        if not data or missing_fields:
+        if missing_fields:
             logger.warning(f"[{request_id}] VALIDATION FAILED - Missing fields: {missing_fields}")
-            return jsonify({
-                'error': f'Missing required fields: {", ".join(missing_fields)}'
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Missing required fields: {", ".join(missing_fields)}'}
+            )
 
         agent_type = data['type']
         user_query = data['query']
@@ -254,9 +268,10 @@ def process_text():
         # Validate model provider
         if model_provider not in SUPPORTED_MODELS:
             logger.warning(f"[{request_id}] VALIDATION FAILED - Invalid model: {model_provider}")
-            return jsonify({
-                'error': f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}'
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}'}
+            )
 
         type_mapping = {
             'fix_grammar': 'Fix grammar: ',
@@ -273,9 +288,10 @@ def process_text():
 
         if agent_type not in type_mapping:
             logger.warning(f"[{request_id}] VALIDATION FAILED - Invalid type: {agent_type}")
-            return jsonify({
-                'error': f'Invalid type. Must be one of: {", ".join(type_mapping.keys())}'
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Invalid type. Must be one of: {", ".join(type_mapping.keys())}'}
+            )
 
         # Build query based on type with secondary_prompt support
         if agent_type == 'enhance_with_ai' and secondary_prompt:
@@ -291,7 +307,13 @@ def process_text():
         logger.info(f"[{request_id}] Calling AI model...")
 
         ai_start_time = time.time()
-        response = process_user_query(full_query, model_provider=model_provider, api_key=api_key, request_id=request_id)
+        response = await run_in_threadpool(
+            process_user_query,
+            full_query,
+            model_provider=model_provider,
+            api_key=api_key,
+            request_id=request_id
+        )
         ai_duration = time.time() - ai_start_time
 
         logger.info(f"[{request_id}] AI response received in {ai_duration:.2f}s")
@@ -312,23 +334,27 @@ def process_text():
         logger.info(f"[{request_id}] SUCCESS - Total time: {total_duration:.2f}s")
         logger.info(f"[{request_id}] ================================")
 
-        return jsonify({
-            'success': True,
-            'markdown_response': response
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                'success': True,
+                'markdown_response': response
+            }
+        )
 
     except Exception as e:
         total_duration = time.time() - start_time
         logger.error(f"[{request_id}] FAILED - Error: {str(e)}")
         logger.error(f"[{request_id}] Total time: {total_duration:.2f}s")
         logger.info(f"[{request_id}] ================================")
-        return jsonify({
-            'error': str(e)
-        }), 500
+        return JSONResponse(
+            status_code=500,
+            content={'error': str(e)}
+        )
 
 
-@app.route('/agent/stream', methods=['POST'])
-def stream_text():
+@app.post('/agent/stream')
+async def stream_text(request: Request):
     """
     Streaming endpoint for AI text processing.
     Returns Server-Sent Events (SSE) with markdown content chunks.
@@ -339,7 +365,17 @@ def stream_text():
     logger.info(f"[{request_id}] ========== NEW STREAM REQUEST ==========")
 
     try:
-        data = request.get_json()
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
+
+        if not data or not isinstance(data, dict):
+            logger.warning(f"[{request_id}] VALIDATION FAILED - Missing request body")
+            return JSONResponse(
+                status_code=400,
+                content={'error': 'Missing required fields: type, query, model, api_key'}
+            )
 
         # Log request details (without sensitive data)
         logger.info(f"[{request_id}] Stream request received")
@@ -351,11 +387,12 @@ def stream_text():
         # Validate required fields
         required_fields = ['type', 'query', 'model', 'api_key']
         missing_fields = [field for field in required_fields if field not in data or not data[field]]
-        if not data or missing_fields:
+        if missing_fields:
             logger.warning(f"[{request_id}] VALIDATION FAILED - Missing fields: {missing_fields}")
-            return jsonify({
-                'error': f'Missing required fields: {", ".join(missing_fields)}'
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Missing required fields: {", ".join(missing_fields)}'}
+            )
 
         agent_type = data['type']
         user_query = data['query']
@@ -366,14 +403,21 @@ def stream_text():
         # Validate model provider
         if model_provider not in SUPPORTED_MODELS:
             logger.warning(f"[{request_id}] VALIDATION FAILED - Invalid model: {model_provider}")
-            return jsonify({
-                'error': f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}'
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}'}
+            )
 
         # Validate license and get appropriate API key
         api_key, error, license_meta = validate_and_get_api_key(license_key, model_provider, request_id)
         if error:
-            return jsonify({'error': error['error'], 'code': error.get('code')}), error['status']
+            error_content = {'error': error['error']}
+            if error.get('code'):
+                error_content['code'] = error['code']
+            return JSONResponse(
+                status_code=error['status'],
+                content=error_content
+            )
 
         user_id = license_meta['user_id']
         is_byok = license_meta['requires_user_api_keys']
@@ -381,19 +425,22 @@ def stream_text():
 
         image_urls, image_error = validate_reference_images(data.get('image_urls'), request_id)
         if image_error:
-            return jsonify({'error': image_error['error']}), image_error['status']
+            return JSONResponse(
+                status_code=image_error['status'],
+                content={'error': image_error['error']}
+            )
 
         if image_urls and not supports_vision(model_provider):
             logger.warning(f"[{request_id}] VALIDATION FAILED - {model_provider} cannot accept image input")
-            # Build the provider list from the allowlist itself — a hardcoded
-            # sentence silently goes stale the moment a provider is added or
-            # (as with grok) removed.
             usable = ", ".join(sorted(VISION_CAPABLE_PROVIDERS))
-            return jsonify({
-                'error': f"The '{model_provider}' model cannot read images. "
-                         f"Switch to one of: {usable}.",
-                'code': 'VISION_NOT_SUPPORTED',
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={
+                    'error': f"The '{model_provider}' model cannot read images. "
+                             f"Switch to one of: {usable}.",
+                    'code': 'VISION_NOT_SUPPORTED',
+                }
+            )
 
         type_mapping = {
             'fix_grammar': 'Fix grammar: ',
@@ -410,14 +457,6 @@ def stream_text():
             'extract_image_text': '',
         }
 
-        # Request types that map to a specific agent, bypassing the keyword
-        # routing inside process_user_query_stream.
-        #
-        # These come from an explicit user action (the image action picker), not
-        # from sniffing the prompt. Guessing intent from free text was the
-        # original design and it was unreliable in both directions: "provide an
-        # html template" missed the email agent, while "write about our email
-        # template process" wrongly hit it.
         forced_agent_types = {
             'generate_email_template': 'email_template',
             'extract_image_text': 'text_extraction',
@@ -425,9 +464,10 @@ def stream_text():
 
         if agent_type not in type_mapping:
             logger.warning(f"[{request_id}] VALIDATION FAILED - Invalid type: {agent_type}")
-            return jsonify({
-                'error': f'Invalid type. Must be one of: {", ".join(type_mapping.keys())}'
-            }), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Invalid type. Must be one of: {", ".join(type_mapping.keys())}'}
+            )
 
         # Build query based on type with secondary_prompt support
         if agent_type == 'enhance_with_ai' and secondary_prompt:
@@ -447,11 +487,6 @@ def stream_text():
         upfront_reserved_scaled = 0
         if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
             upfront_reserved_scaled = text_credits_scaled(input_chars, 0)
-            # Reference images are billed at the same rate as generated ones.
-            # They are not free: a full-page design reference costs roughly as
-            # many input tokens as several thousand characters of prose, which
-            # text_credits_scaled() cannot see. Retune this rate independently
-            # if input and output images should differ.
             if image_urls:
                 upfront_reserved_scaled += IMAGE_CREDITS_SCALED * len(image_urls)
             ok, available_scaled = credit_manager.reserve(user_id, upfront_reserved_scaled)
@@ -460,12 +495,15 @@ def stream_text():
                     f"[{request_id}] Insufficient credits: needed={upfront_reserved_scaled} "
                     f"available={available_scaled}"
                 )
-                return jsonify({
-                    "error": "Insufficient credits",
-                    "code": "INSUFFICIENT_CREDITS",
-                    "available": available_scaled,
-                    "needed": upfront_reserved_scaled,
-                }), 402
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "error": "Insufficient credits",
+                        "code": "INSUFFICIENT_CREDITS",
+                        "available": available_scaled,
+                        "needed": upfront_reserved_scaled,
+                    }
+                )
 
         def generate():
             output_chars = 0
@@ -582,7 +620,7 @@ def stream_text():
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
             except GeneratorExit:
-                # Client disconnected — generator is being closed by Flask/WSGI.
+                # Client disconnected — generator is being closed.
                 # Clean up the cancel entry if present.
                 cancelled_requests.pop(request_id, None)
                 logger.info(f"[{request_id}] Generator closed by client disconnect (output_chars={output_chars})")
@@ -636,7 +674,6 @@ def stream_text():
                             success=True,
                         )
                 elif had_error and not is_byok:
-                    
                     if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
                         total_reserved_scaled = (
                             upfront_reserved_scaled
@@ -662,9 +699,9 @@ def stream_text():
                 if not had_error and original_prompt:
                     fire_prompt_history_save(user_id, original_prompt)
 
-        return Response(
+        return StreamingResponse(
             generate(),
-            mimetype='text/event-stream',
+            media_type='text/event-stream',
             headers={
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
@@ -677,13 +714,14 @@ def stream_text():
         logger.error(f"[{request_id}] STREAM FAILED - Error: {str(e)}")
         logger.error(f"[{request_id}] Total time: {total_duration:.2f}s")
         logger.info(f"[{request_id}] ================================")
-        return jsonify({
-            'error': str(e)
-        }), 500
+        return JSONResponse(
+            status_code=500,
+            content={'error': str(e)}
+        )
 
 
-@app.route('/agent/autocomplete', methods=['POST'])
-def autocomplete_text():
+@app.post('/agent/autocomplete')
+async def autocomplete_text(request: Request):
     """
     Lightweight endpoint for inline text autocomplete suggestions.
     Returns a short predicted text continuation based on cursor context.
@@ -695,7 +733,16 @@ def autocomplete_text():
     logger.info(f"[{request_id}] ========== AUTOCOMPLETE REQUEST ==========")
 
     try:
-        data = request.get_json()
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
+
+        if not data or not isinstance(data, dict):
+            return JSONResponse(
+                status_code=400,
+                content={'error': 'Missing required fields: text_before, model, api_key'}
+            )
 
         text_before = data.get('text_before', '')
         text_after = data.get('text_after', '')
@@ -704,15 +751,27 @@ def autocomplete_text():
 
         # Validate required fields
         if not text_before or not model_provider or not license_key:
-            return jsonify({'error': 'Missing required fields: text_before, model, api_key'}), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': 'Missing required fields: text_before, model, api_key'}
+            )
 
         if model_provider not in SUPPORTED_MODELS:
-            return jsonify({'error': f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}'}), 400
+            return JSONResponse(
+                status_code=400,
+                content={'error': f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}'}
+            )
 
         # Validate license and get API key
         api_key, error, license_meta = validate_and_get_api_key(license_key, model_provider, request_id)
         if error:
-            return jsonify({'error': error['error'], 'code': error.get('code')}), error['status']
+            error_content = {'error': error['error']}
+            if error.get('code'):
+                error_content['code'] = error['code']
+            return JSONResponse(
+                status_code=error['status'],
+                content=error_content
+            )
 
         user_id = license_meta['user_id']
         is_byok = license_meta['requires_user_api_keys']
@@ -729,12 +788,15 @@ def autocomplete_text():
                     f"[{request_id}] Autocomplete blocked: insufficient credits "
                     f"available={available}"
                 )
-                return jsonify({
-                    "error": "Insufficient credits",
-                    "code": "INSUFFICIENT_CREDITS",
-                    "available": available,
-                    "needed": AUTOCOMPLETE_CREDITS_SCALED,
-                }), 402
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "error": "Insufficient credits",
+                        "code": "INSUFFICIENT_CREDITS",
+                        "available": available,
+                        "needed": AUTOCOMPLETE_CREDITS_SCALED,
+                    }
+                )
             autocomplete_reserved = True
 
         # Truncate context to keep requests fast
@@ -743,7 +805,8 @@ def autocomplete_text():
 
         logger.info(f"[{request_id}] Autocomplete: model={model_provider}, context_before={len(text_before)} chars")
 
-        suggestion = get_autocomplete_suggestion(
+        suggestion = await run_in_threadpool(
+            get_autocomplete_suggestion,
             text_before=text_before,
             text_after=text_after,
             model_provider=model_provider,
@@ -795,10 +858,13 @@ def autocomplete_text():
                 )
                 logger.info(f"[{request_id}] Autocomplete credit deduction fired for user={user_id}")
 
-        return jsonify({
-            'success': True,
-            'suggestion': suggestion,
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                'success': True,
+                'suggestion': suggestion,
+            }
+        )
 
     except Exception as e:
         total_duration = time.time() - start_time
@@ -819,7 +885,7 @@ def autocomplete_text():
                 )
         except Exception:
             pass
-       
+
         try:
             if (
                 local_vars.get('user_id')
@@ -839,34 +905,43 @@ def autocomplete_text():
                 )
         except Exception:
             pass
-        return jsonify({'error': str(e)}), 500
+        return JSONResponse(
+            status_code=500,
+            content={'error': str(e)}
+        )
 
 
-
-@app.route('/agent/abort', methods=['POST'])
-def abort_request():
+@app.post('/agent/abort')
+async def abort_request(request: Request):
     """Cancel an in-flight stream request so the generator stops early."""
-    data = request.get_json() or {}
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    if not isinstance(data, dict):
+        data = {}
+
     req_id = data.get('request_id', '')
     license_key = data.get('api_key', '')
 
     if not req_id:
-        return jsonify({'error': 'Missing request_id'}), 400
+        return JSONResponse(status_code=400, content={'error': 'Missing request_id'})
 
     # Validate license key to prevent unauthenticated abuse
     if not license_key or not redis_manager:
-        return jsonify({'error': 'Unauthorized'}), 401
+        return JSONResponse(status_code=401, content={'error': 'Unauthorized'})
 
     license_result = redis_manager.validate_license(license_key)
     if not license_result['valid']:
-        return jsonify({'error': 'Unauthorized'}), 401
+        return JSONResponse(status_code=401, content={'error': 'Unauthorized'})
 
     # Clean up stale entries to prevent memory leaks
     _cleanup_stale_cancellations()
 
     cancelled_requests[req_id] = time.time()
     logger.info(f"[{req_id}] Request cancelled by client")
-    return jsonify({'success': True})
+    return JSONResponse(status_code=200, content={'success': True})
 
 
 def _cleanup_stale_cancellations():
@@ -880,4 +955,4 @@ def _cleanup_stale_cancellations():
 
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=False)
+    uvicorn.run("api:app", host="127.0.0.1", port=5000, reload=False)
