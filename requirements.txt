@@ -1,0 +1,35 @@
+# Core dependencies
+flask
+python-dotenv
+redis
+flask-cors
+cryptography
+requests
+certifi
+
+# AWS
+boto3
+
+# Agent framework (migrated from deprecated phidata -> agno)
+agno==2.8.5
+
+# Required by agno to sniff the MIME type of image input. Not pulled in by
+# agno itself — without it, any run carrying images fails with
+# "`filetype` not installed" and returns an empty response.
+filetype
+
+# Web-search backend used by agno's DuckDuckGoTools
+ddgs
+
+# HTML parsing for agno's WebsiteReader, which backs the read_web_page tool.
+# Not pulled in by agno itself — without it every page read fails with an
+# ImportError and the agent falls back to "could not verify".
+beautifulsoup4
+
+# AI Model Providers
+# NOTE: agno reaches Grok (xAI) and DeepSeek through the openai client, so no
+# separate `xai`/`deepseek` packages are needed.
+openai
+anthropic
+google-generativeai  # legacy Gemini SDK — still used by the autocomplete path
+google-genai          # new Google GenAI SDK — used for Gemini image generation
