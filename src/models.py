@@ -37,10 +37,12 @@ ADVANCED_MODEL_IDS = {
 }
 
 # Cheaper tier — used when an agent config sets use_advanced=False.
+# Tasks like grammar, table, simplify, etc. need fast non-reasoning models
+# with low TTFT (<1s) and deterministic temperature control.
 BASIC_MODEL_IDS = {
-    "openai": "gpt-5-mini",
+    "openai": "gpt-4o-mini",
     "claude": "claude-sonnet-5",
-    "grok": "grok-4.3",
+    "grok": "grok-4.20-0309-non-reasoning",
     "deepseek": "deepseek-chat",
     "gemini": "gemini-3.5-flash-lite",
 }
@@ -50,22 +52,10 @@ BASIC_MODEL_IDS = {
 # the model's cost comes straight out of our margin. Always the cheapest usable
 # model per provider, never the flagship. (This path previously ran on
 # claude-opus-5 at 5x the price of claude-haiku-4-5, for no benefit.)
-#
-# Grok note: grok-4.20-0309-non-reasoning is ~40% cheaper per reply than
-# grok-4.3 because it skips reasoning tokens, but it is a dated snapshot. Switch
-# only if autocomplete latency or spend becomes a problem.
-# OpenAI note: this path must stay on a NON-reasoning model. Unlike the chat
-# path (where agno normalises parameters), get_autocomplete_suggestion() calls
-# client.chat.completions.create(..., max_tokens=100) directly, and the GPT-5
-# family rejects `max_tokens` outright ("Unsupported parameter ... use
-# max_completion_tokens"). Moving this to gpt-5-mini returns an empty
-# suggestion on every keystroke. gpt-4o-mini is the correct model here: cheap,
-# non-reasoning, and still served by the API (it was retired from ChatGPT only).
-# Revisit only alongside a change to that call site.
 AUTOCOMPLETE_MODEL_IDS = {
     "openai": "gpt-4o-mini",
     "claude": "claude-haiku-4-5",
-    "grok": "grok-4.3",
+    "grok": "grok-4.20-0309-non-reasoning",
     "deepseek": "deepseek-chat",
     "gemini": "gemini-3.5-flash-lite",
 }
