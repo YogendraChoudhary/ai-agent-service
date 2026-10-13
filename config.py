@@ -14,8 +14,14 @@ from __future__ import annotations
 
 from typing import Optional
 
+from dotenv import find_dotenv, load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+# Populate os.environ so all modules using os.getenv() get values regardless of cwd
+_dotenv_path = find_dotenv()
+if _dotenv_path:
+    load_dotenv(_dotenv_path)
 
 
 class Settings(BaseSettings):
@@ -66,7 +72,7 @@ class Settings(BaseSettings):
     )
 
     model_config = {
-        "env_file": ".env",
+        "env_file": (".env", "../.env"),
         "env_file_encoding": "utf-8",
         "populate_by_name": True,
         "extra": "ignore",
