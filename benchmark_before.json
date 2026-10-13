@@ -1,0 +1,101 @@
+{
+  "timestamp": 1791882302.332128,
+  "autocomplete": {
+    "gemini": {
+      "provider": "gemini",
+      "runs": 5,
+      "timings": [
+        1.645,
+        1.088,
+        1.549,
+        1.233,
+        1.081
+      ],
+      "avg": 1.319,
+      "min": 1.081,
+      "max": 1.645,
+      "sample_output": " quality by detecting bugs early in the development cycle."
+    },
+    "openai": {
+      "provider": "openai",
+      "runs": 5,
+      "timings": [
+        1.19,
+        0.872,
+        0.949,
+        0.85,
+        0.909
+      ],
+      "avg": 0.954,
+      "min": 0.85,
+      "max": 1.19,
+      "sample_output": "quality and reduces the likelihood of bugs in production."
+    }
+  },
+  "streaming_tasks": [
+    {
+      "agent_type": "grammar",
+      "provider": "gemini",
+      "ttft": 5.47,
+      "total_time": 5.498,
+      "output_chars": 60,
+      "output_sample": "She doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "grammar",
+      "provider": "openai",
+      "ttft": 1.045,
+      "total_time": 1.192,
+      "output_chars": 60,
+      "output_sample": "She doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "table",
+      "provider": "gemini",
+      "ttft": 5.655,
+      "total_time": 6.505,
+      "output_chars": 444,
+      "output_sample": "| Language | Initial Release Year | Type System | Primary Use Case |\n| :--- | :--- | :--- | :--- |\n| Python | 1991 | Dyn..."
+    },
+    {
+      "agent_type": "table",
+      "provider": "openai",
+      "ttft": 1.022,
+      "total_time": 3.254,
+      "output_chars": 592,
+      "output_sample": "| Language | First released (year) | Typing | Primary use case(s) |\n|---|---:|---|---|\n| Python | 1991 | Dynamic (option..."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "gemini",
+      "ttft": 4.75,
+      "total_time": 4.753,
+      "output_chars": 66,
+      "output_sample": "The system's design requires everything to sync in the background."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "openai",
+      "ttft": 1.262,
+      "total_time": 1.607,
+      "output_chars": 86,
+      "output_sample": "The design approach needs complete coordination that does not happen at the same time."
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "gemini",
+      "ttft": 3.49,
+      "total_time": 3.69,
+      "output_chars": 68,
+      "output_sample": "I finished my project \ud83c\udf89 and I am going on holiday with friends! \ud83c\udfd6\ufe0f\u2708\ufe0f"
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "openai",
+      "ttft": 1.147,
+      "total_time": 1.546,
+      "output_chars": 72,
+      "output_sample": "I finished my project \u2705\ud83c\udf89 and I am going on holiday \ud83c\udfd6\ufe0f with friends \ud83d\udc6f\u200d\u2642\ufe0f!"
+    }
+  ]
+}

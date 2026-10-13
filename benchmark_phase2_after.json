@@ -1,0 +1,101 @@
+{
+  "timestamp": 1791885004.051905,
+  "autocomplete": {
+    "openai": {
+      "provider": "openai",
+      "runs": 5,
+      "timings": [
+        1.318,
+        0.979,
+        1.086,
+        1.16,
+        1.129
+      ],
+      "avg": 1.134,
+      "min": 0.979,
+      "max": 1.318,
+      "sample_output": "quality and reduces the likelihood of bugs in production."
+    },
+    "grok": {
+      "provider": "grok",
+      "runs": 5,
+      "timings": [
+        0.815,
+        0.742,
+        0.69,
+        0.691,
+        1.175
+      ],
+      "avg": 0.823,
+      "min": 0.69,
+      "max": 1.175,
+      "sample_output": "quality by identifying bugs early in the development cycle."
+    }
+  },
+  "streaming_tasks": [
+    {
+      "agent_type": "grammar",
+      "provider": "openai",
+      "ttft": 0.714,
+      "total_time": 0.882,
+      "output_chars": 60,
+      "output_sample": "She doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "grammar",
+      "provider": "grok",
+      "ttft": 0.597,
+      "total_time": 0.708,
+      "output_chars": 81,
+      "output_sample": "**Corrected Text:**\n\nShe doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "table",
+      "provider": "openai",
+      "ttft": 1.116,
+      "total_time": 2.177,
+      "output_chars": 465,
+      "output_sample": "| Language     | Year Introduced | Typing         | Primary Use Case                |\n|--------------|-----------------|..."
+    },
+    {
+      "agent_type": "table",
+      "provider": "grok",
+      "ttft": 1.304,
+      "total_time": 1.338,
+      "output_chars": 598,
+      "output_sample": "| Language     | First Released | Typing          | Primary Use Cases                          |\n|--------------|-------..."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "openai",
+      "ttft": 0.718,
+      "total_time": 0.876,
+      "output_chars": 82,
+      "output_sample": "The building design requires complete timing coordination that happens separately."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "grok",
+      "ttft": 1.109,
+      "total_time": 1.114,
+      "output_chars": 81,
+      "output_sample": "**Simplified version:**\n\nThe design approach requires full async synchronization."
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "openai",
+      "ttft": 0.713,
+      "total_time": 0.967,
+      "output_chars": 67,
+      "output_sample": "I finished my project \ud83c\udf89 and I am going on holiday \ud83c\udf34 with friends! \ud83e\udd73"
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "grok",
+      "ttft": 0.723,
+      "total_time": 0.88,
+      "output_chars": 128,
+      "output_sample": "**I finished my project** \u2705 **and I am going on holiday with friends!** \ud83c\udfd6\ufe0f\u2728\n\n**Time to relax and make some amazing memor..."
+    }
+  ]
+}

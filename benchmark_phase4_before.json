@@ -1,0 +1,29 @@
+{
+  "timestamp": 1791889611.5125709,
+  "phase": "phase4_before",
+  "search_fallback_resilience": {
+    "has_secondary_fallback": false,
+    "recovered_factual_results": false,
+    "sample_output": []
+  },
+  "parallel_multi_query_search": {
+    "sequential_time": 8.634,
+    "parallel_time": 11.743,
+    "speedup_seconds": -3.109,
+    "speedup_percent": -36.0
+  },
+  "parallel_multi_page_reading": {
+    "sequential_time": 2.048,
+    "parallel_time": 0.828,
+    "speedup_seconds": 1.22,
+    "speedup_percent": 59.6
+  },
+  "smart_global_tools": {
+    "count": 3,
+    "names": [
+      "<function create_image_tool.<locals>.generate_image_tool at 0x10d361d00>",
+      "websearch",
+      "<function create_web_read_tool.<locals>.read_web_page at 0x10d362fc0>"
+    ]
+  }
+}

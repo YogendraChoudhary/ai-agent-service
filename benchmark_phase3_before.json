@@ -1,0 +1,38 @@
+{
+  "timestamp": 1791887651.906506,
+  "phase": "phase3_before",
+  "prefix_cache_alignment": {
+    "system_prompt_byte_identical": false,
+    "has_dynamic_time_in_prefix": true,
+    "prompt_length": 1235
+  },
+  "web_reader": {
+    "wikipedia_success": false,
+    "wikipedia_chars": 111,
+    "wikipedia_duration": 3.177,
+    "wikipedia_sample": "ERROR: could not read that page (HTTPStatusError). Try another source, or say the figure could not be verified."
+  },
+  "search_reliability": {
+    "search_success": true,
+    "search_duration": 2.562,
+    "search_results_sample": "[\n  {\n    \"title\": \"Artificial intelligence development\",\n    \"href\": \"https://en.wikipedia.org/wiki/Artificial_intellig"
+  },
+  "claude_tools": {
+    "tool_count": 0,
+    "cache_system_prompt_enabled": false
+  },
+  "warm_request_streaming": {
+    "openai": {
+      "cold_ttft": 1.994,
+      "warm_ttft": 0.85,
+      "cold_total": 2.227,
+      "warm_total": 1.358
+    },
+    "gemini": {
+      "cold_ttft": 0.837,
+      "warm_ttft": 1.277,
+      "cold_total": 0.982,
+      "warm_total": 1.31
+    }
+  }
+}

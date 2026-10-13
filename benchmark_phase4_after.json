@@ -1,0 +1,39 @@
+{
+  "timestamp": 1791891151.152809,
+  "phase": "phase4_after",
+  "search_fallback_resilience": {
+    "has_secondary_fallback": true,
+    "recovered_factual_results": true,
+    "sample_output": [
+      {
+        "title": "Superconducting quantum computing",
+        "body": "Superconducting quantum computing is a branch of quantum computing and solid-state physics that implements superconducting electronic circuits as qubits in a quantum processor. These devices are typically microwave-frequency electronic circuits containing Josephson junctions, which are fabricated on solid state chips.",
+        "href": "https://en.wikipedia.org/wiki/Superconducting_quantum_computing",
+        "source": "Wikipedia Direct API"
+      }
+    ]
+  },
+  "parallel_multi_query_search": {
+    "sequential_time": 7.93,
+    "parallel_time": 3.803,
+    "speedup_seconds": 4.127,
+    "speedup_percent": 52.0
+  },
+  "parallel_multi_page_reading": {
+    "sequential_time": 1.936,
+    "parallel_time": 1.685,
+    "speedup_seconds": 0.251,
+    "speedup_percent": 13.0
+  },
+  "smart_global_tools": {
+    "count": 6,
+    "names": [
+      "<function create_image_tool.<locals>.generate_image_tool at 0x114f3e200>",
+      "<function create_multi_image_tool.<locals>.generate_multiple_images at 0x114f3e2a0>",
+      "websearch",
+      "<function create_parallel_search_tool.<locals>.parallel_web_search at 0x114f3e660>",
+      "<function create_web_read_tool.<locals>.read_web_page at 0x114f3f6a0>",
+      "<function create_parallel_read_tool.<locals>.read_multiple_web_pages at 0x114f3dc60>"
+    ]
+  }
+}

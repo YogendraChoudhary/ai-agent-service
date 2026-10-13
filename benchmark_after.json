@@ -1,0 +1,101 @@
+{
+  "timestamp": 1791883674.1098309,
+  "autocomplete": {
+    "gemini": {
+      "provider": "gemini",
+      "runs": 5,
+      "timings": [
+        1.119,
+        1.056,
+        1.124,
+        1.133,
+        1.29
+      ],
+      "avg": 1.144,
+      "min": 1.056,
+      "max": 1.29,
+      "sample_output": " quality by reducing human error and catching bugs early in the development cycle."
+    },
+    "openai": {
+      "provider": "openai",
+      "runs": 5,
+      "timings": [
+        1.275,
+        0.836,
+        0.86,
+        0.92,
+        1.023
+      ],
+      "avg": 0.983,
+      "min": 0.836,
+      "max": 1.275,
+      "sample_output": "quality and reduces the risk of bugs in production. It also streamlines the development process."
+    }
+  },
+  "streaming_tasks": [
+    {
+      "agent_type": "grammar",
+      "provider": "gemini",
+      "ttft": 1.335,
+      "total_time": 1.342,
+      "output_chars": 60,
+      "output_sample": "She doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "grammar",
+      "provider": "openai",
+      "ttft": 2.379,
+      "total_time": 2.472,
+      "output_chars": 60,
+      "output_sample": "She doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "table",
+      "provider": "gemini",
+      "ttft": 1.162,
+      "total_time": 1.899,
+      "output_chars": 413,
+      "output_sample": "| Language | Initial Release Year | Typing System | Primary Use Case |\n|---|---|---|---|\n| Python | 1991 | Dynamic, Stro..."
+    },
+    {
+      "agent_type": "table",
+      "provider": "openai",
+      "ttft": 3.71,
+      "total_time": 4.461,
+      "output_chars": 527,
+      "output_sample": "| Language | Year (first release) | Typing | Primary use case |\n|---|---:|---|---|\n| Python | 1991 | Dynamic, strong, du..."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "gemini",
+      "ttft": 1.149,
+      "total_time": 1.346,
+      "output_chars": 63,
+      "output_sample": "The design requires matching tasks that run at different times."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "openai",
+      "ttft": 2.913,
+      "total_time": 3.046,
+      "output_chars": 91,
+      "output_sample": "The system design requires all parts to stay fully synchronized using asynchronous methods."
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "gemini",
+      "ttft": 0.968,
+      "total_time": 1.021,
+      "output_chars": 67,
+      "output_sample": "I finished my project \ud83c\udf89 and I am going on holiday with friends! \u2708\ufe0f\ud83c\udf34"
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "openai",
+      "ttft": 3.418,
+      "total_time": 3.648,
+      "output_chars": 72,
+      "output_sample": "I finished my project \ud83c\udf89 and I am going on holiday \u2708\ufe0f with friends \ud83e\uddd1\u200d\ud83e\udd1d\u200d\ud83e\uddd1!"
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "timestamp": 1791887985.2259688,
+  "phase": "phase3_after",
+  "prefix_cache_alignment": {
+    "system_prompt_byte_identical": true,
+    "has_dynamic_time_in_prefix": false,
+    "prompt_length": 1179
+  },
+  "web_reader": {
+    "wikipedia_success": true,
+    "wikipedia_chars": 20013,
+    "wikipedia_duration": 0.988,
+    "wikipedia_sample": "From Wikipedia, the free encyclopedia\n\nIntelligence in machines\n\n\"AI\" redirects here. For other uses, see \nAI (disambiguation)\n and \nArtificial intell"
+  },
+  "search_reliability": {
+    "search_success": true,
+    "search_duration": 5.241,
+    "search_results_sample": "[\n  {\n    \"title\": \"Artificial intelligence development\",\n    \"href\": \"https://en.wikipedia.org/wiki/Artificial_intellig"
+  },
+  "claude_tools": {
+    "tool_count": 2,
+    "cache_system_prompt_enabled": true
+  },
+  "warm_request_streaming": {
+    "openai": {
+      "cold_ttft": 0.948,
+      "warm_ttft": 1.177,
+      "cold_total": 1.114,
+      "warm_total": 1.421
+    },
+    "gemini": {
+      "cold_ttft": 0.755,
+      "warm_ttft": 0.644,
+      "cold_total": 0.941,
+      "warm_total": 0.77
+    }
+  }
+}

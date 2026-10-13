@@ -1,0 +1,101 @@
+{
+  "timestamp": 1791884772.0873868,
+  "autocomplete": {
+    "openai": {
+      "provider": "openai",
+      "runs": 5,
+      "timings": [
+        1.241,
+        1.112,
+        1.09,
+        0.812,
+        1.168
+      ],
+      "avg": 1.085,
+      "min": 0.812,
+      "max": 1.241,
+      "sample_output": "quality and reduces the likelihood of bugs in production."
+    },
+    "grok": {
+      "provider": "grok",
+      "runs": 5,
+      "timings": [
+        4.381,
+        4.597,
+        6.752,
+        6.658,
+        5.072
+      ],
+      "avg": 5.492,
+      "min": 4.381,
+      "max": 6.752,
+      "sample_output": " quality by catching defects early and improving overall reliability."
+    }
+  },
+  "streaming_tasks": [
+    {
+      "agent_type": "grammar",
+      "provider": "openai",
+      "ttft": 2.613,
+      "total_time": 2.714,
+      "output_chars": 59,
+      "output_sample": "She doesn't like apples and they were going home yesterday."
+    },
+    {
+      "agent_type": "grammar",
+      "provider": "grok",
+      "ttft": 5.321,
+      "total_time": 5.391,
+      "output_chars": 60,
+      "output_sample": "She doesn't like apples, and they were going home yesterday."
+    },
+    {
+      "agent_type": "table",
+      "provider": "openai",
+      "ttft": 6.356,
+      "total_time": 7.173,
+      "output_chars": 546,
+      "output_sample": "| Language | First appeared | Typing | Primary use case |\n|---|---:|---|---|\n| Python | 1991 | Dynamically typed; strong..."
+    },
+    {
+      "agent_type": "table",
+      "provider": "grok",
+      "ttft": 5.338,
+      "total_time": 6.075,
+      "output_chars": 419,
+      "output_sample": "| Language   | Year | Typing          | Primary Use Case                          |\n|------------|------|---------------..."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "openai",
+      "ttft": 3.254,
+      "total_time": 3.337,
+      "output_chars": 65,
+      "output_sample": "The system design requires complete asynchronous synchronization."
+    },
+    {
+      "agent_type": "simplify",
+      "provider": "grok",
+      "ttft": 7.304,
+      "total_time": 7.364,
+      "output_chars": 65,
+      "output_sample": "The system design requires complete asynchronous synchronization."
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "openai",
+      "ttft": 2.911,
+      "total_time": 3.154,
+      "output_chars": 71,
+      "output_sample": "I finished my project \ud83c\udf89 and I am going on holiday with friends \u2708\ufe0f\ud83e\uddd1\u200d\ud83e\udd1d\u200d\ud83e\uddd1!"
+    },
+    {
+      "agent_type": "emojify",
+      "provider": "grok",
+      "ttft": 4.76,
+      "total_time": 4.891,
+      "output_chars": 68,
+      "output_sample": "I finished my project \u2705 and I am going on holiday with friends! \u2708\ufe0f\ud83c\udfd6\ufe0f"
+    }
+  ]
+}
