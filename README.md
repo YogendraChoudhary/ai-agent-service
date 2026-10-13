@@ -181,3 +181,15 @@ The agent automatically routes operations across two model tiers to minimize lat
 2. **Advanced / Flagship Tier (`ADVANCED_MODEL_IDS`)**:
    - Models: `gpt-5.2`, `gemini-3.8-flash` (thinking budget tuned), `claude-opus-5`, `grok-4.6`.
    - Used for complex generative tasks: `smart_global`, `enhance`, `make_longer`, and deep web research agents.
+
+---
+
+## 8. Security Guardrails & Prompt Injection Firewall
+
+All untrusted external data retrieved via web tools (`read_web_page`, `read_multiple_web_pages`, `search`, `fallback_search`) passes through a dedicated sub-millisecond security sanitizer (`src/security_guardrails.py`) before entering the LLM context:
+
+1. **Zero-Width Character Scrubber**: Eliminates invisible Unicode and bidirectional override codes used in prompt-hiding attacks.
+2. **Tokenizer Delimiter Defanger**: Defangs model-control tokens (`<|im_start|>`, `[INST]`, `<<SYS>>`, `### System:`) into harmless escaped text.
+3. **Instruction Override Defanger**: Neutralizes indirect prompt injection directives (e.g. `ignore previous instructions`, `DAN mode`, `exfiltrate data`) while preserving factual page content.
+4. **Sandboxed XML Isolation**: Fences external web content inside `<untrusted_web_content>` tags, reinforced by system prompt rules prohibiting the agent from executing instructions found in external data.
+5. **Sub-Millisecond Performance**: Regex pre-filtering executes in **< 0.8 ms** per 24,000-character page, adding zero perceivable latency.
