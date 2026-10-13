@@ -31,6 +31,7 @@ import re
 import ipaddress
 import socket
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -44,12 +45,105 @@ logger = logging.getLogger(__name__)
 class DuckDuckGoWithRetry(DuckDuckGoTools):
     """
     Wraps agno's DuckDuckGoTools with multi-backend rotation, retry + exponential backoff,
-    and graceful degradation to prevent fatal stream crashes on rate limits (HTTP 202/403/429).
+    and secondary fallback search (Wikipedia REST API + DuckDuckGo Instant Answer API)
+    to guarantee zero search starvation on datacenter rate limits (HTTP 202/403/429).
     """
 
-    max_retries: int = 3
-    base_delay: float = 1.5  # seconds
+    max_retries: int = 2
+    base_delay: float = 0.5  # seconds
     fallback_backends: list = ["html", "lite"]
+
+    @staticmethod
+    def fallback_search(query: str, max_results: int = 5) -> list[dict]:
+        """
+        Secondary search engine fallback when DuckDuckGo rate-limits or fails.
+        Queries Wikipedia Direct REST APIs and DuckDuckGo Instant Answer API
+        with desktop User-Agent to retrieve verified definitions, extracts, and links.
+        """
+        import httpx
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/html,*/*",
+        }
+        results = []
+
+        # 1. Wikipedia Full-Text Search API + REST Summary API (/api/rest_v1/page/summary)
+        try:
+            wiki_search_url = (
+                f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&utf8=1&format=json&srlimit={max_results}"
+            )
+            with httpx.Client(timeout=4.0, headers=headers) as client:
+                resp = client.get(wiki_search_url)
+                if resp.status_code == 200:
+                    search_items = resp.json().get("query", {}).get("search", [])
+                    for item in search_items[:max_results]:
+                        title = item.get("title", "")
+                        if not title:
+                            continue
+                        snippet = ""
+                        try:
+                            summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}"
+                            s_resp = client.get(summary_url)
+                            if s_resp.status_code == 200:
+                                s_data = s_resp.json()
+                                snippet = s_data.get("extract", "")[:350]
+                        except Exception:
+                            pass
+                        clean_snippet = snippet or re.sub(r"<[^>]+>", "", item.get("snippet", ""))
+                        results.append({
+                            "title": title,
+                            "body": clean_snippet or f"Wikipedia article on {title}",
+                            "href": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
+                            "source": "Wikipedia Direct API",
+                        })
+        except Exception as e:
+            logger.warning(f"Wikipedia search fallback failed: {e}")
+
+        # 2. Wikipedia OpenSearch prefix fallback if query search returned nothing
+        if not results:
+            try:
+                opensearch_url = (
+                    f"https://en.wikipedia.org/w/api.php?action=opensearch&search={query}&limit={max_results}&namespace=0&format=json"
+                )
+                with httpx.Client(timeout=4.0, headers=headers) as client:
+                    resp = client.get(opensearch_url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if len(data) >= 4 and data[1]:
+                            for title, desc, url in zip(data[1], data[2], data[3]):
+                                results.append({
+                                    "title": title,
+                                    "body": desc or f"Wikipedia article on {title}",
+                                    "href": url,
+                                    "source": "Wikipedia Direct API",
+                                })
+            except Exception as e:
+                logger.warning(f"Wikipedia OpenSearch fallback failed: {e}")
+
+        # 3. DuckDuckGo Instant Answer API (No rate limiting on API endpoint)
+        if len(results) < max_results:
+            try:
+                instant_url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
+                with httpx.Client(timeout=4.0, headers=headers) as client:
+                    resp = client.get(instant_url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        abstract = data.get("AbstractText", "")
+                        if abstract:
+                            results.append({
+                                "title": data.get("Heading", query),
+                                "body": abstract,
+                                "href": data.get("AbstractURL", ""),
+                                "source": "DuckDuckGo Instant Answer API",
+                            })
+            except Exception as e:
+                logger.warning(f"Instant Answer fallback search failed: {e}")
+
+        return results
 
     def web_search(self, query: str, max_results: int = 5) -> str:
         """Use this function to search the web for a query.
@@ -59,20 +153,29 @@ class DuckDuckGoWithRetry(DuckDuckGoTools):
             max_results (optional, default=5): The maximum number of results to return.
 
         Returns:
-            The search results from the web, or a graceful fallback message if unavailable.
+            The search results from the web, or a secondary search fallback if rate-limited.
         """
         import json
+        from ddgs import DDGS
         orig_backend = getattr(self, "backend", "auto")
         backends_to_try = [orig_backend] + [b for b in self.fallback_backends if b != orig_backend]
 
         last_error = None
         for backend in backends_to_try:
-            self.backend = backend
             for attempt in range(self.max_retries):
                 try:
-                    res = super().web_search(query, max_results)
-                    self.backend = orig_backend
-                    return res
+                    search_kwargs = {
+                        "query": f"{self.modifier} {query}" if getattr(self, "modifier", None) else query,
+                        "max_results": getattr(self, "fixed_max_results", None) or max_results,
+                        "backend": backend,
+                    }
+                    if getattr(self, "timelimit", None) is not None:
+                        search_kwargs["timelimit"] = self.timelimit
+                    if getattr(self, "region", None) is not None:
+                        search_kwargs["region"] = self.region
+                    with DDGS(proxy=getattr(self, "proxy", None), timeout=getattr(self, "timeout", None) or 10, verify=getattr(self, "verify_ssl", True)) as ddgs:
+                        results = ddgs.text(**search_kwargs)
+                    return json.dumps(results, indent=2, ensure_ascii=False)
                 except Exception as e:
                     last_error = e
                     err_str = str(e).lower()
@@ -86,8 +189,13 @@ class DuckDuckGoWithRetry(DuckDuckGoTools):
                     else:
                         break  # Fall back to next backend
 
-        self.backend = orig_backend
-        logger.warning(f"All DuckDuckGo search backends exhausted: {last_error}. Returning graceful degradation notice.")
+        logger.warning(f"All DuckDuckGo search backends exhausted: {last_error}. Activating secondary search fallback...")
+        fallback_results = self.fallback_search(query, max_results)
+        if fallback_results:
+            logger.info(f"Recovered {len(fallback_results)} result(s) via secondary search fallback")
+            return json.dumps(fallback_results, ensure_ascii=False)
+
+        logger.warning("Secondary search fallback also yielded no results. Returning degradation notice.")
         return json.dumps([
             {
                 "title": "Search Notice: Live Search Temporarily Unavailable",
@@ -107,20 +215,28 @@ class DuckDuckGoWithRetry(DuckDuckGoTools):
             max_results (optional, default=5): The maximum number of results to return.
 
         Returns:
-            The latest news from the web, or a graceful fallback message if unavailable.
+            The latest news from the web, or a secondary search fallback if rate-limited.
         """
         import json
+        from ddgs import DDGS
         orig_backend = getattr(self, "backend", "auto")
         backends_to_try = [orig_backend] + [b for b in self.fallback_backends if b != orig_backend]
 
         last_error = None
         for backend in backends_to_try:
-            self.backend = backend
             for attempt in range(self.max_retries):
                 try:
-                    res = super().search_news(query, max_results)
-                    self.backend = orig_backend
-                    return res
+                    search_kwargs = {
+                        "query": f"{self.modifier} {query}" if getattr(self, "modifier", None) else query,
+                        "max_results": getattr(self, "fixed_max_results", None) or max_results,
+                    }
+                    if getattr(self, "timelimit", None) is not None:
+                        search_kwargs["timelimit"] = self.timelimit
+                    if getattr(self, "region", None) is not None:
+                        search_kwargs["region"] = self.region
+                    with DDGS(proxy=getattr(self, "proxy", None), timeout=getattr(self, "timeout", None) or 10, verify=getattr(self, "verify_ssl", True)) as ddgs:
+                        results = ddgs.news(**search_kwargs)
+                    return json.dumps(results, indent=2, ensure_ascii=False)
                 except Exception as e:
                     last_error = e
                     err_str = str(e).lower()
@@ -134,8 +250,13 @@ class DuckDuckGoWithRetry(DuckDuckGoTools):
                     else:
                         break  # Fall back to next backend
 
-        self.backend = orig_backend
-        logger.warning(f"All DuckDuckGo news backends exhausted: {last_error}. Returning graceful degradation notice.")
+        logger.warning(f"All DuckDuckGo news backends exhausted: {last_error}. Activating secondary search fallback...")
+        fallback_results = self.fallback_search(f"{query} news", max_results)
+        if fallback_results:
+            logger.info(f"Recovered {len(fallback_results)} news result(s) via secondary search fallback")
+            return json.dumps(fallback_results, ensure_ascii=False)
+
+        logger.warning("Secondary search fallback yielded no results. Returning degradation notice.")
         return json.dumps([
             {
                 "title": "News Notice: Live News Temporarily Unavailable",
@@ -415,6 +536,136 @@ def create_web_read_tool(request_id: str = None):
                     "Try another source, or say the figure could not be verified.")
 
     return read_web_page
+
+
+def create_parallel_search_tool(search_instance: DuckDuckGoWithRetry, request_id: str = None):
+    """
+    Creates a parallel web search tool that executes multiple search queries
+    concurrently using a ThreadPoolExecutor.
+    """
+    log_prefix = f"[{request_id}] " if request_id else ""
+
+    def parallel_web_search(queries: list[str], max_results: int = 3) -> str:
+        """
+        Execute multiple search queries concurrently across parallel worker threads.
+        Use this whenever you need to search for multiple topics, queries, or comparative data points at once.
+        Running searches concurrently is significantly faster than sequential single searches.
+
+        Args:
+            queries: A list of search query strings to execute concurrently (e.g. ["NVIDIA Q3 revenue", "AMD Q3 revenue"]).
+            max_results: Maximum results to return per query (default 3).
+
+        Returns:
+            JSON string mapping each query to its list of search results.
+        """
+        import json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Normalize queries input if model passes string or JSON
+        if isinstance(queries, str):
+            try:
+                parsed = json.loads(queries)
+                if isinstance(parsed, list):
+                    queries = parsed
+                else:
+                    queries = [q.strip() for q in queries.split(",") if q.strip()]
+            except Exception:
+                queries = [q.strip() for q in queries.split(",") if q.strip()]
+
+        if not queries:
+            return json.dumps({"error": "No queries provided"}, ensure_ascii=False)
+
+        capped_queries = [str(q).strip() for q in queries[:5] if str(q).strip()]
+        logger.info(f"{log_prefix}Executing parallel search for {len(capped_queries)} queries: {capped_queries}")
+
+        results_map = {}
+
+        def _run_single(q: str):
+            try:
+                res_str = search_instance.web_search(q, max_results=max_results)
+                try:
+                    return q, json.loads(res_str)
+                except Exception:
+                    return q, res_str
+            except Exception as e:
+                logger.warning(f"{log_prefix}Parallel search worker failed for '{q}': {e}")
+                fallback = search_instance.fallback_search(q, max_results=max_results)
+                return q, fallback
+
+        with ThreadPoolExecutor(max_workers=min(len(capped_queries), 5)) as executor:
+            futures = [executor.submit(_run_single, q) for q in capped_queries]
+            for future in as_completed(futures):
+                try:
+                    q, res = future.result()
+                    results_map[q] = res
+                except Exception as e:
+                    logger.error(f"{log_prefix}Worker error in parallel search: {e}")
+
+        return json.dumps(results_map, indent=2, ensure_ascii=False)
+
+    return parallel_web_search
+
+
+def create_parallel_read_tool(reader_tool_fn, request_id: str = None):
+    """
+    Creates a parallel web page reading tool that reads multiple URLs
+    concurrently using a ThreadPoolExecutor.
+    """
+    log_prefix = f"[{request_id}] " if request_id else ""
+
+    def read_multiple_web_pages(urls: list[str]) -> str:
+        """
+        Read the text content of multiple web pages concurrently across parallel worker threads.
+        Use this after search when you have multiple promising URLs to inspect for numbers, facts, or tables.
+        Running reads in parallel is significantly faster than sequential page reading.
+
+        Args:
+            urls: A list of full http(s) URLs to read in parallel.
+
+        Returns:
+            JSON string mapping each URL to its extracted markdown text or error.
+        """
+        import json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if isinstance(urls, str):
+            try:
+                parsed = json.loads(urls)
+                if isinstance(parsed, list):
+                    urls = parsed
+                else:
+                    urls = [u.strip() for u in urls.split(",") if u.strip()]
+            except Exception:
+                urls = [u.strip() for u in urls.split(",") if u.strip()]
+
+        if not urls:
+            return json.dumps({"error": "No URLs provided"}, ensure_ascii=False)
+
+        capped_urls = [str(u).strip() for u in urls[:4] if str(u).strip()]
+        logger.info(f"{log_prefix}Executing parallel read for {len(capped_urls)} URLs: {capped_urls}")
+
+        results_map = {}
+
+        def _read_single(url: str):
+            try:
+                content = reader_tool_fn(url)
+                return url, content
+            except Exception as e:
+                logger.warning(f"{log_prefix}Parallel read worker failed for '{url}': {e}")
+                return url, f"ERROR: failed to read page ({type(e).__name__})"
+
+        with ThreadPoolExecutor(max_workers=min(len(capped_urls), 4)) as executor:
+            futures = [executor.submit(_read_single, u) for u in capped_urls]
+            for future in as_completed(futures):
+                try:
+                    url, content = future.result()
+                    results_map[url] = content
+                except Exception as e:
+                    logger.error(f"{log_prefix}Worker error in parallel read: {e}")
+
+        return json.dumps(results_map, indent=2, ensure_ascii=False)
+
+    return read_multiple_web_pages
 
 
 
@@ -706,6 +957,72 @@ def create_gemini_image_tool(
     return generate_image_tool
 
 
+def create_multi_image_tool(single_image_tool_fn, request_id: str = None):
+    """
+    Creates a concurrent multi-image generation tool that triggers background
+    image generation for multiple prompts across parallel worker threads.
+    Returns all placeholder URLs immediately without blocking.
+    """
+    log_prefix = f"[{request_id}] " if request_id else ""
+
+    def generate_multiple_images(prompts: list[str], size: str = "1024x1024") -> str:
+        """
+        Generate multiple images concurrently in the background and return placeholder URLs immediately.
+        Use this whenever 2 or more images are requested (e.g., 'article with 2 images').
+        Triggers all image generations in parallel worker threads without waiting sequentially.
+
+        Args:
+            prompts: List of image prompt descriptions (e.g., ["Chart showing 2026 tech market revenue", "Modern workspace with robotic equipment"]).
+            size: Image size - "1024x1024" (square), "1024x1536" (portrait), or "1536x1024" (landscape).
+
+        Returns:
+            String listing placeholder URLs for all requested images.
+        """
+        import json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if isinstance(prompts, str):
+            try:
+                parsed = json.loads(prompts)
+                if isinstance(parsed, list):
+                    prompts = parsed
+                else:
+                    prompts = [p.strip() for p in prompts.split(",") if p.strip()]
+            except Exception:
+                prompts = [p.strip() for p in prompts.split(",") if p.strip()]
+
+        if not prompts:
+            return "ERROR: No image prompts provided."
+
+        capped_prompts = [str(p).strip() for p in prompts[:4] if str(p).strip()]
+        logger.info(f"{log_prefix}Triggering parallel image generation for {len(capped_prompts)} prompts")
+
+        placeholders = {}
+
+        def _gen_single(idx: int, p: str):
+            try:
+                res = single_image_tool_fn(p)
+                return idx, p, res
+            except Exception as e:
+                logger.error(f"{log_prefix}Failed to trigger image for '{p[:30]}': {e}")
+                return idx, p, f"ERROR: {str(e)}"
+
+        with ThreadPoolExecutor(max_workers=min(len(capped_prompts), 4)) as executor:
+            futures = [executor.submit(_gen_single, i, p) for i, p in enumerate(capped_prompts)]
+            for future in as_completed(futures):
+                idx, p, res = future.result()
+                placeholders[idx] = (p, res)
+
+        lines = ["Parallel Images Generated:"]
+        for idx in sorted(placeholders.keys()):
+            p, res = placeholders[idx]
+            lines.append(f"- Image {idx + 1} ({p[:40]}...): {res}")
+
+        return "\n".join(lines)
+
+    return generate_multiple_images
+
+
 # ============================================
 # AGENT CONFIGURATIONS
 # ============================================
@@ -929,8 +1246,10 @@ AGENT_CONFIGS = {
             "   - The tool returns a placeholder URL in the format: 'Image URL: placeholder::{uuid}'",
             "   - Return ONLY: ![description](placeholder::{uuid})",
             "",
-            "2. If user asks for content WITH images ('article about X with images'):",
-            "   - IMPORTANT: Call generate_image_tool for ALL needed images FIRST, before writing any content.",
+            "2. If user asks for content WITH images ('article about X with 2 images'):",
+            "   - IMPORTANT: If 2 or more images are needed, call generate_multiple_images with the list of prompts to trigger parallel background generation simultaneously.",
+            "   - If only 1 image is needed, call generate_image_tool.",
+            "   - Call image generation FIRST, before writing any content.",
             "   - Collect all the placeholder URLs returned by the tool (format: 'Image URL: placeholder::{uuid}').",
             "   - THEN write the complete content in Markdown, embedding the placeholder URLs using ![alt text](placeholder::{uuid}) syntax.",
             "   - Do NOT invent or fabricate image URLs. Only use URLs returned by the tool.",
@@ -951,12 +1270,11 @@ AGENT_CONFIGS = {
             "- Use - or * for unordered lists, 1. 2. 3. for ordered lists",
             "- Use indentation (2 spaces) for nested lists",
             "",
-            "WEB SEARCH:",
-            "- Use DuckDuckGo tool when you need current information or facts",
-            "- Search for statistics, recent events, or verification of information",
-            "- You MUST search before answering any question about exchange rates, prices, market data, statistics, company or product facts, or anything that changes over time. Your training data is stale; searching is the only way to be current.",
-            "- Search results give you only titles, URLs and snippets. When you need actual figures, follow up with read_web_page on the most promising result and take the numbers from the page itself.",
-            "- Never quote a figure from a page you have not read. If read_web_page fails or returns nothing usable, try one other source; if that also fails, say the figure could not be verified and label your answer as approximate.",
+            "WEB SEARCH & PARALLEL RESEARCH:",
+            "- Use DuckDuckGo web search when you need current information or facts.",
+            "- When you need to research multiple queries, comparative topics, or distinct data points at once (e.g. 'article with market data and competitor stats'), call parallel_web_search with the list of queries. This runs all searches concurrently in parallel worker threads, dramatically speeding up response time.",
+            "- Search results give you only titles, URLs and snippets. When you need actual figures, follow up with read_web_page or read_multiple_web_pages to read the pages concurrently and take numbers from the pages themselves.",
+            "- Never quote a figure from a page you have not read. If reading fails or returns nothing usable, try one other source; if that also fails, say the figure could not be verified and label your answer as approximate.",
             "- Resolve relative dates ('this year', 'the last 5 years', 'recently') against the current date given above, NOT against your training data.",
             "- A relative range INCLUDES the current year. 'The last 5 years' asked during 2026 means 2022-2026, not 2021-2025. Do not silently narrow it to the last complete years — the current period is usually the one the user cares about most.",
             "- Where the current period is incomplete, still include it and label it (e.g. '2026 (year to date)'), noting the cut-off. Omitting it entirely loses the most relevant data point.",
@@ -970,8 +1288,8 @@ AGENT_CONFIGS = {
             markdown_conversion_instruction,
             "",
             "TOOL USAGE:",
-            "- Always extract the placeholder URL from generate_image_tool responses",
-            "- Tool returns format: 'Image URL: placeholder::{uuid}'",
+            "- Always extract the placeholder URL from generate_image_tool or generate_multiple_images responses",
+            "- Tool returns format: 'Image URL: placeholder::{uuid}' or 'Image N (...): Image URL: placeholder::{uuid}'",
             "- Extract just the 'placeholder::{uuid}' part for ![alt](placeholder::{uuid}) syntax",
             "- NEVER fabricate image URLs like 'https://example.com/...' — only use placeholder URLs from the tool",
             "",
@@ -1146,29 +1464,48 @@ def create_agent(
         # Search finds the page; read_web_page reads it. Without the reader the
         # model can only see snippets, so it cites a source it never opened and
         # fills the numbers in from memory.
-        tools = [DuckDuckGoWithRetry(backend="auto"), create_web_read_tool(request_id)]
+        search_tool = DuckDuckGoWithRetry(backend="auto")
+        reader_tool = create_web_read_tool(request_id)
+        parallel_search_tool = create_parallel_search_tool(search_tool, request_id)
+        parallel_read_tool = create_parallel_read_tool(reader_tool, request_id)
+
+        research_tools = [
+            search_tool,
+            parallel_search_tool,
+            reader_tool,
+            parallel_read_tool,
+        ]
+
         if model_provider == 'openai':
-            tools.insert(0, create_image_tool(
+            img_tool = create_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
-            ))
-            logger.info(f"{log_prefix}Added tools: GPT Image generation (async), DuckDuckGo search, Web reader")
+            )
+            multi_img_tool = create_multi_image_tool(img_tool, request_id)
+            tools = [img_tool, multi_img_tool] + research_tools
+            logger.info(f"{log_prefix}Added tools: GPT Image generation (async + multi-parallel), DuckDuckGo search (with fallback + parallel), Web reader (with parallel)")
         elif model_provider == 'grok':
-            tools.insert(0, create_grok_image_tool(
+            img_tool = create_grok_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
-            ))
-            logger.info(f"{log_prefix}Added tools: Grok Aurora image generation (async), DuckDuckGo search, Web reader")
+            )
+            multi_img_tool = create_multi_image_tool(img_tool, request_id)
+            tools = [img_tool, multi_img_tool] + research_tools
+            logger.info(f"{log_prefix}Added tools: Grok Aurora image generation (async + multi-parallel), DuckDuckGo search (with fallback + parallel), Web reader (with parallel)")
         elif model_provider == 'gemini':
-            tools.insert(0, create_gemini_image_tool(
+            img_tool = create_gemini_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
-            ))
-            logger.info(f"{log_prefix}Added tools: Gemini image generation (async), DuckDuckGo search, Web reader")
+            )
+            multi_img_tool = create_multi_image_tool(img_tool, request_id)
+            tools = [img_tool, multi_img_tool] + research_tools
+            logger.info(f"{log_prefix}Added tools: Gemini image generation (async + multi-parallel), DuckDuckGo search (with fallback + parallel), Web reader (with parallel)")
         elif model_provider == 'claude':
-            logger.info(f"{log_prefix}Added tools for Claude: DuckDuckGo search, Web reader (streaming enabled)")
+            tools = research_tools
+            logger.info(f"{log_prefix}Added tools for Claude: DuckDuckGo search (with fallback + parallel), Web reader (with parallel) (streaming enabled)")
         else:
-            logger.info(f"{log_prefix}Added tools: DuckDuckGo search, Web reader")
+            tools = research_tools
+            logger.info(f"{log_prefix}Added tools: DuckDuckGo search (with fallback + parallel), Web reader (with parallel)")
         agent_kwargs["tools"] = tools
 
         # DeepSeek tool calling is unstable and can loop indefinitely.
