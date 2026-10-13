@@ -43,18 +43,13 @@ logger = logging.getLogger(__name__)
 
 class DuckDuckGoWithRetry(DuckDuckGoTools):
     """
-    Wraps agno's DuckDuckGoTools with retry + exponential backoff to handle
-    DuckDuckGo rate limiting (HTTP 202 Ratelimit).
-
-    NOTE: agno registers ``web_search`` / ``search_news`` as the actual tool
-    functions (``duckduckgo_search`` / ``duckduckgo_news`` are only backward-
-    compat aliases assigned in ``__init__`` and are never registered). The
-    retry wrapper therefore MUST override ``web_search`` / ``search_news`` —
-    overriding the alias names has no effect.
+    Wraps agno's DuckDuckGoTools with multi-backend rotation, retry + exponential backoff,
+    and graceful degradation to prevent fatal stream crashes on rate limits (HTTP 202/403/429).
     """
 
     max_retries: int = 3
-    base_delay: float = 2.0  # seconds
+    base_delay: float = 1.5  # seconds
+    fallback_backends: list = ["html", "lite"]
 
     def web_search(self, query: str, max_results: int = 5) -> str:
         """Use this function to search the web for a query.
@@ -64,18 +59,45 @@ class DuckDuckGoWithRetry(DuckDuckGoTools):
             max_results (optional, default=5): The maximum number of results to return.
 
         Returns:
-            The search results from the web.
+            The search results from the web, or a graceful fallback message if unavailable.
         """
-        for attempt in range(self.max_retries):
-            try:
-                return super().web_search(query, max_results)
-            except Exception as e:
-                if "Ratelimit" in str(e) and attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
-                    logger.warning(f"DuckDuckGo search rate-limited, retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})")
-                    time.sleep(delay)
-                else:
-                    raise
+        import json
+        orig_backend = getattr(self, "backend", "auto")
+        backends_to_try = [orig_backend] + [b for b in self.fallback_backends if b != orig_backend]
+
+        last_error = None
+        for backend in backends_to_try:
+            self.backend = backend
+            for attempt in range(self.max_retries):
+                try:
+                    res = super().web_search(query, max_results)
+                    self.backend = orig_backend
+                    return res
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e).lower()
+                    if ("ratelimit" in err_str or "202" in err_str or "403" in err_str or "429" in err_str) and attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"DuckDuckGo search rate-limited on backend '{backend}', "
+                            f"retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})"
+                        )
+                        time.sleep(delay)
+                    else:
+                        break  # Fall back to next backend
+
+        self.backend = orig_backend
+        logger.warning(f"All DuckDuckGo search backends exhausted: {last_error}. Returning graceful degradation notice.")
+        return json.dumps([
+            {
+                "title": "Search Notice: Live Search Temporarily Unavailable",
+                "body": (
+                    "Web search is temporarily unavailable due to search engine rate limits. "
+                    "Proceed using your general knowledge and clearly note that live web search was rate-limited."
+                ),
+                "href": "",
+            }
+        ], ensure_ascii=False)
 
     def search_news(self, query: str, max_results: int = 5) -> str:
         """Use this function to get the latest news from the web.
@@ -85,18 +107,45 @@ class DuckDuckGoWithRetry(DuckDuckGoTools):
             max_results (optional, default=5): The maximum number of results to return.
 
         Returns:
-            The latest news from the web.
+            The latest news from the web, or a graceful fallback message if unavailable.
         """
-        for attempt in range(self.max_retries):
-            try:
-                return super().search_news(query, max_results)
-            except Exception as e:
-                if "Ratelimit" in str(e) and attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
-                    logger.warning(f"DuckDuckGo news rate-limited, retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})")
-                    time.sleep(delay)
-                else:
-                    raise
+        import json
+        orig_backend = getattr(self, "backend", "auto")
+        backends_to_try = [orig_backend] + [b for b in self.fallback_backends if b != orig_backend]
+
+        last_error = None
+        for backend in backends_to_try:
+            self.backend = backend
+            for attempt in range(self.max_retries):
+                try:
+                    res = super().search_news(query, max_results)
+                    self.backend = orig_backend
+                    return res
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e).lower()
+                    if ("ratelimit" in err_str or "202" in err_str or "403" in err_str or "429" in err_str) and attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"DuckDuckGo news rate-limited on backend '{backend}', "
+                            f"retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})"
+                        )
+                        time.sleep(delay)
+                    else:
+                        break  # Fall back to next backend
+
+        self.backend = orig_backend
+        logger.warning(f"All DuckDuckGo news backends exhausted: {last_error}. Returning graceful degradation notice.")
+        return json.dumps([
+            {
+                "title": "News Notice: Live News Temporarily Unavailable",
+                "body": (
+                    "Latest web news is temporarily unavailable due to search engine rate limits. "
+                    "Proceed using your general knowledge and clearly note that live news search was rate-limited."
+                ),
+                "href": "",
+            }
+        ], ensure_ascii=False)
 
 
 # ============================================
@@ -196,7 +245,13 @@ def get_model(
             return OpenAIChat(id=model_id, api_key=api_key)
         return OpenAIChat(id=model_id, api_key=api_key, temperature=temperature)
     if model_provider == 'claude':
-        return Claude(id=model_id, api_key=api_key, temperature=temperature)
+        return Claude(
+            id=model_id,
+            api_key=api_key,
+            temperature=temperature,
+            cache_system_prompt=True,
+            cache_tools=True,
+        )
     if model_provider == 'grok':
         return xAI(id=model_id, api_key=api_key, temperature=temperature)
     if model_provider == 'deepseek':
@@ -288,11 +343,66 @@ def create_web_read_tool(request_id: str = None):
                 logger.warning(f"{log_prefix}Blocked read_web_page for non-public host")
                 return "ERROR: that host is not publicly routable and cannot be read."
 
-            from agno.knowledge.reader.website_reader import WebsiteReader
+            import httpx
+            from bs4 import BeautifulSoup
+
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
 
             logger.info(f"{log_prefix}Reading page: {parsed.scheme}://{parsed.hostname}{parsed.path[:60]}")
-            docs = WebsiteReader(max_links=1, max_depth=1).read(url=url)
-            text = "\n\n".join((d.content or "") for d in docs).strip()
+            with httpx.Client(timeout=10.0, follow_redirects=True, headers=headers) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                html_content = resp.text
+
+            soup = BeautifulSoup(html_content, "html.parser")
+
+            # 1. Strip boilerplate and non-content elements
+            for unwanted in soup.find_all([
+                "script", "style", "nav", "header", "footer", "aside",
+                "noscript", "iframe", "svg", "button", "form", "dialog", "menu",
+            ]):
+                unwanted.decompose()
+
+            # 2. Convert HTML tables to Markdown tables to preserve tabular data
+            for table in soup.find_all("table"):
+                rows = []
+                for tr in table.find_all("tr"):
+                    cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+                    if cells:
+                        rows.append("| " + " | ".join(cells) + " |")
+                if rows:
+                    col_count = len(rows[0].split("|")) - 2
+                    if col_count > 0:
+                        separator = "| " + " | ".join(["---"] * col_count) + " |"
+                        md_table = "\n\n" + rows[0] + "\n" + separator + "\n" + "\n".join(rows[1:]) + "\n\n"
+                        table.replace_with(md_table)
+
+            # 3. Format headings and lists
+            for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+                level = int(h.name[1])
+                h_text = h.get_text(strip=True)
+                if h_text:
+                    h.replace_with(f"\n\n{'#' * level} {h_text}\n\n")
+
+            for li in soup.find_all("li"):
+                li_text = li.get_text(strip=True)
+                if li_text:
+                    li.replace_with(f"\n- {li_text}\n")
+
+            # 4. Extract content from main body or article container
+            content_container = soup.find(["article", "main"]) or soup.body or soup
+            text = content_container.get_text(separator="\n")
+
+            # 5. Normalize whitespace
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
             if not text:
                 return "ERROR: no readable text found at that URL (it may be JavaScript-rendered or blocking automated access). Say so rather than substituting remembered figures."
@@ -300,7 +410,7 @@ def create_web_read_tool(request_id: str = None):
                 text = text[:MAX_PAGE_CHARS] + "\n\n[truncated]"
             return text
         except Exception as e:
-            logger.warning(f"{log_prefix}read_web_page failed: {type(e).__name__}")
+            logger.warning(f"{log_prefix}read_web_page failed: {type(e).__name__} ({str(e)})")
             return (f"ERROR: could not read that page ({type(e).__name__}). "
                     "Try another source, or say the figure could not be verified.")
 
@@ -1013,21 +1123,21 @@ def create_agent(
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
-        # Tell the model what day it is. Without this (agno defaults it off) the
-        # model anchors relative dates to its training cutoff — "the last 5
-        # years" came back as 2020-2024 well into 2026, and "this year" was
-        # simply wrong. UTC keeps it unambiguous across our user base.
-        "add_datetime_to_context": True,
+        # Prefix cache alignment:
+        # Standard text editing agents (grammar, simplify, table, complete, etc.)
+        # do NOT need current time. Disabling datetime injection removes dynamic
+        # microsecond timestamps from the system message, ensuring 100% byte-identical
+        # static system prompts across all requests for maximum KV cache hits (OpenAI, Gemini, Claude).
+        # Only smart_global needs the date to anchor relative queries ('the last 5 years', 'this year'),
+        # and we format it as %Y-%m-%d to maintain day-long prefix stability.
+        "add_datetime_to_context": (agent_type == "smart_global"),
         "timezone_identifier": "Etc/UTC",
+        "datetime_format": "%Y-%m-%d",
     }
 
     # Add tools for smart_global agent
-    # Claude: tools currently disabled. This was originally a phidata limitation
-    #         (no streaming + tools for Claude; the non-streaming fallback was
-    #         ~18s and hurt UX). agno DOES support Claude streaming with tools,
-    #         so this exclusion can likely be lifted — verify latency with a live
-    #         key before enabling image/web-search tools for Claude.
-    if use_tools and model_provider != 'claude':
+    # Claude tools: streaming tool execution is fully supported in agno.
+    if use_tools:
         # backend="auto" lets ddgs rotate across multiple search engines
         # (Google/Bing/Brave/DuckDuckGo/...) instead of only DuckDuckGo. The
         # DuckDuckGo-only backend intermittently 403s from datacenter IPs
@@ -1042,21 +1152,23 @@ def create_agent(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
             ))
-            logger.info(f"{log_prefix}Added tools: GPT Image generation (async), DuckDuckGo search")
+            logger.info(f"{log_prefix}Added tools: GPT Image generation (async), DuckDuckGo search, Web reader")
         elif model_provider == 'grok':
             tools.insert(0, create_grok_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
             ))
-            logger.info(f"{log_prefix}Added tools: Grok Aurora image generation (async), DuckDuckGo search")
+            logger.info(f"{log_prefix}Added tools: Grok Aurora image generation (async), DuckDuckGo search, Web reader")
         elif model_provider == 'gemini':
             tools.insert(0, create_gemini_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
             ))
-            logger.info(f"{log_prefix}Added tools: Gemini image generation (async), DuckDuckGo search")
+            logger.info(f"{log_prefix}Added tools: Gemini image generation (async), DuckDuckGo search, Web reader")
+        elif model_provider == 'claude':
+            logger.info(f"{log_prefix}Added tools for Claude: DuckDuckGo search, Web reader (streaming enabled)")
         else:
-            logger.info(f"{log_prefix}Added tools: DuckDuckGo search")
+            logger.info(f"{log_prefix}Added tools: DuckDuckGo search, Web reader")
         agent_kwargs["tools"] = tools
 
         # DeepSeek tool calling is unstable and can loop indefinitely.
@@ -1064,8 +1176,6 @@ def create_agent(
         if model_provider == 'deepseek':
             agent_kwargs["tool_call_limit"] = 1
             logger.info(f"{log_prefix}Set tool_call_limit=1 for DeepSeek (prevents tool call loops)")
-    elif use_tools and model_provider == 'claude':
-        logger.info(f"{log_prefix}Tools skipped for Claude (streaming + tools not supported)")
 
     return Agent(**agent_kwargs)
 
@@ -1516,7 +1626,13 @@ def get_autocomplete_suggestion(
             client = _get_cached_anthropic_client(api_key)
             response = client.messages.create(
                 model=model_id,
-                system=AUTOCOMPLETE_SYSTEM_PROMPT,
+                system=[
+                    {
+                        "type": "text",
+                        "text": AUTOCOMPLETE_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 messages=[
                     {"role": "user", "content": user_prompt},
                 ],
