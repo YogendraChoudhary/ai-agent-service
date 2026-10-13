@@ -1,6 +1,7 @@
 # Core dependencies
 fastapi
 uvicorn[standard]
+pydantic-settings
 python-dotenv
 redis
 cryptography

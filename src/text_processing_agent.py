@@ -997,6 +997,40 @@ def create_agent(
 
     return Agent(**agent_kwargs)
 
+def determine_agent_type(query_lower: str) -> tuple[str, str]:
+    """
+    Determine which agent to use based on query keywords.
+    Single source of truth used by both streaming and non-streaming query execution (Bug #3 fix).
+    """
+    if "fix grammar" in query_lower or "correct grammar" in query_lower or "fix spelling" in query_lower:
+        return "grammar", "detected grammar/spelling fix keywords"
+    elif "simplify" in query_lower and "image" not in query_lower:
+        return "simplify", "detected 'simplify' keyword"
+    elif "complete" in query_lower and "image" not in query_lower:
+        return "completion", "detected 'complete' keyword"
+    elif "emojify" in query_lower or "add emoji" in query_lower:
+        return "emojify", "detected emoji-related keywords"
+    elif "translate" in query_lower and "image" not in query_lower:
+        return "translation", "detected 'translate' keyword"
+    elif "create table" in query_lower or "make table" in query_lower or "organize as table" in query_lower or "table format" in query_lower:
+        return "table", "detected table creation keywords"
+    elif ("create list" in query_lower or "make list" in query_lower or
+          "bullet points" in query_lower or "numbered list" in query_lower):
+        return "list", "detected list creation keywords"
+    elif "summarize" in query_lower or "summary" in query_lower or "tldr" in query_lower:
+        return "summarize", "detected summarization keywords"
+    elif "change tone" in query_lower or "change_tone" in query_lower:
+        return "tone", "detected tone change keywords"
+    elif "make longer" in query_lower or "expand" in query_lower or "elaborate" in query_lower:
+        return "make_longer", "detected 'make longer' keywords"
+    elif "make shorter" in query_lower or "condense" in query_lower or "shorten" in query_lower:
+        return "make_shorter", "detected 'make shorter' keywords"
+    elif "enhance" in query_lower or "improve" in query_lower or "polish" in query_lower:
+        return "enhance", "detected enhancement keywords"
+    else:
+        return "smart_global", "no specific keywords matched, using smart global agent"
+
+
 # ============================================
 # GLOBAL QUERY PROCESSING FUNCTION
 # ============================================
@@ -1042,42 +1076,12 @@ def process_user_query_stream(
 
     query_lower = query.lower()
 
-    def get_agent_type():
-        """Determine which agent to use based on query keywords"""
-        if "fix grammar" in query_lower or "correct grammar" in query_lower or "fix spelling" in query_lower:
-            return "grammar", "detected grammar/spelling fix keywords"
-        elif "simplify" in query_lower and "image" not in query_lower:
-            return "simplify", "detected 'simplify' keyword"
-        elif "complete" in query_lower and "image" not in query_lower:
-            return "completion", "detected 'complete' keyword"
-        elif "emojify" in query_lower or "add emoji" in query_lower:
-            return "emojify", "detected emoji-related keywords"
-        elif "translate" in query_lower and "image" not in query_lower:
-            return "translation", "detected 'translate' keyword"
-        elif "create table" in query_lower or "make table" in query_lower or "organize as table" in query_lower or "table format" in query_lower:
-            return "table", "detected table creation keywords"
-        elif ("create list" in query_lower or "make list" in query_lower or
-              "bullet points" in query_lower or "numbered list" in query_lower):
-            return "list", "detected list creation keywords"
-        elif "summarize" in query_lower or "summary" in query_lower or "tldr" in query_lower:
-            return "summarize", "detected summarization keywords"
-        elif "change tone" in query_lower or "change_tone" in query_lower:
-            return "tone", "detected tone change keywords"
-        elif "make longer" in query_lower or "expand" in query_lower or "elaborate" in query_lower:
-            return "make_longer", "detected 'make longer' keywords"
-        elif "make shorter" in query_lower or "condense" in query_lower or "shorten" in query_lower:
-            return "make_shorter", "detected 'make shorter' keywords"
-        elif "enhance" in query_lower or "improve" in query_lower or "polish" in query_lower:
-            return "enhance", "detected enhancement keywords"
-        else:
-            return "smart_global", "no specific keywords matched, using smart global agent"
-
     if force_agent_type:
         if force_agent_type not in AGENT_CONFIGS:
             raise ValueError(f"Unknown agent type: {force_agent_type}")
         agent_type, reason = force_agent_type, "explicitly requested by caller"
     else:
-        agent_type, reason = get_agent_type()
+        agent_type, reason = determine_agent_type(query_lower)
     logger.info(f"{log_prefix}Query routing: {reason} -> {agent_type} agent")
 
     # Reference images are vision input. Silently dropping them on a text-only
@@ -1151,7 +1155,13 @@ def process_user_query_stream(
         raise
 
 
-def process_user_query(query: str, model_provider: str = "openai", api_key: str = None, request_id: str = None) -> str:
+def process_user_query(
+    query: str,
+    model_provider: str = "openai",
+    api_key: str = None,
+    request_id: str = None,
+    force_agent_type: str = None,
+) -> str:
     """
     Global query processor for HTML editor integration.
     Routes queries to appropriate specialized agents or uses the smart global agent.
@@ -1176,6 +1186,7 @@ def process_user_query(query: str, model_provider: str = "openai", api_key: str 
         model_provider: The model provider ('openai', 'claude', 'grok')
         api_key: The API key for the model provider
         request_id: Request ID for logging
+        force_agent_type: Direct agent override
 
     Returns:
         HTML formatted response
@@ -1204,60 +1215,15 @@ def process_user_query(query: str, model_provider: str = "openai", api_key: str 
             logger.error(f"{log_prefix}Agent {agent_type} failed with error: {str(e)}")
             raise
 
-    # Route to specialized agents based on keywords
-
-    # 1. Grammar Correction
-    if "fix grammar" in query_lower or "correct grammar" in query_lower or "fix spelling" in query_lower:
-        return run_agent("grammar", "detected grammar/spelling fix keywords")
-
-    # 2. Simplification
-    elif "simplify" in query_lower and "image" not in query_lower:
-        return run_agent("simplify", "detected 'simplify' keyword")
-
-    # 3. Completion
-    elif "complete" in query_lower and "image" not in query_lower:
-        return run_agent("completion", "detected 'complete' keyword")
-
-    # 4. Emojify
-    elif "emojify" in query_lower or "add emoji" in query_lower:
-        return run_agent("emojify", "detected emoji-related keywords")
-
-    # 5. Translation
-    elif "translate" in query_lower and "image" not in query_lower:
-        return run_agent("translation", "detected 'translate' keyword")
-
-    # 6. Table Creation
-    elif "create table" in query_lower or "make table" in query_lower or "organize as table" in query_lower or "table format" in query_lower:
-        return run_agent("table", "detected table creation keywords")
-
-    # 7. List Creation
-    elif ("create list" in query_lower or "make list" in query_lower or
-          "bullet points" in query_lower or "numbered list" in query_lower):
-        return run_agent("list", "detected list creation keywords")
-
-    # 8. Summarization
-    elif "summarize" in query_lower or "summary" in query_lower or "tldr" in query_lower:
-        return run_agent("summarize", "detected summarization keywords")
-
-    # 9. Tone Change
-    elif "change tone" in query_lower or "change_tone" in query_lower:
-        return run_agent("tone", "detected tone change keywords")
-
-    # 10. Make Longer
-    elif "make longer" in query_lower or "expand" in query_lower or "elaborate" in query_lower:
-        return run_agent("make_longer", "detected 'make longer' keywords")
-
-    # 11. Make Shorter
-    elif "make shorter" in query_lower or "condense" in query_lower or "shorten" in query_lower:
-        return run_agent("make_shorter", "detected 'make shorter' keywords")
-
-    # 12. Enhance with AI
-    elif "enhance" in query_lower or "improve" in query_lower or "polish" in query_lower:
-        return run_agent("enhance", "detected enhancement keywords")
-
-    # 13. Smart Global Agent (for everything else)
+    # Route to specialized agents (fixes Bug #3: single source of truth via determine_agent_type)
+    if force_agent_type:
+        if force_agent_type not in AGENT_CONFIGS:
+            raise ValueError(f"Unknown agent type: {force_agent_type}")
+        agent_type, reason = force_agent_type, "explicitly requested by caller"
     else:
-        return run_agent("smart_global", "no specific keywords matched, using smart global agent")
+        agent_type, reason = determine_agent_type(query_lower)
+
+    return run_agent(agent_type, reason)
 
 
 # ============================================

@@ -8,7 +8,7 @@ import json
 import os
 import ssl
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import logging
 import certifi
@@ -359,7 +359,7 @@ class RedisManager:
             bool: True if successful, False otherwise
         """
         try:
-            now = datetime.utcnow().isoformat()
+            now = datetime.now(timezone.utc).isoformat()
             result = self.redis_client.hset(
                 f"license_key:{license_key}",
                 'last_heartbeat',

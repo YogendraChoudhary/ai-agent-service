@@ -28,6 +28,14 @@ REFUND_STORAGE_URL = f"{_webhook_base}/refund-storage" if _webhook_base else ""
 _s3_client = None
 
 
+class StorageQuotaExceededError(Exception):
+    """Raised when a user's storage quota would be exceeded by an AI image upload."""
+    # Defined here — ABOVE _check_storage_quota which raises it — so that
+    # static analysers and readers see the class before it is referenced.
+    # (Bug #5 fix: class was previously defined after its first use on line 82)
+    pass
+
+
 def _get_s3_client():
     """Get or create the singleton S3 client."""
     global _s3_client
@@ -77,11 +85,6 @@ def _check_storage_quota(user_id: str, file_size_bytes: int, request_id: str = N
     except Exception as e:
         # On network/parse error, log and allow the upload to proceed
         logger.warning(f"{log_prefix}Storage quota check failed (allowing upload): {e}")
-
-
-class StorageQuotaExceededError(Exception):
-    """Raised when a user's storage quota would be exceeded by an AI image upload."""
-    pass
 
 
 def _refund_storage(user_id: str, file_size_bytes: int, request_id: str = None) -> None:
