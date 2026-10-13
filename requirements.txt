@@ -32,5 +32,4 @@ beautifulsoup4
 # separate `xai`/`deepseek` packages are needed.
 openai
 anthropic
-google-generativeai  # legacy Gemini SDK — still used by the autocomplete path
-google-genai          # new Google GenAI SDK — used for Gemini image generation
+google-genai          # Google GenAI SDK — used for Gemini autocomplete and image generation

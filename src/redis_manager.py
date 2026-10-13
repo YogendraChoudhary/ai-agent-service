@@ -6,15 +6,51 @@ Handles all Redis operations for the AI agent API
 import redis
 import json
 import os
+import re
 import ssl
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import logging
 import certifi
+from dateutil import parser as dateutil_parser
 from .encryption import decrypt_api_key
 
 logger = logging.getLogger(__name__)
+
+
+def parse_expiry_date(date_str: Any) -> Optional[datetime]:
+    """
+    Parse an expiration date string into a datetime object.
+
+    Handles both formats found in the Redis license database:
+      1. ISO 8601 strings (e.g. '2026-12-18T11:17:57.387Z')
+      2. JavaScript Date.toString() strings (e.g. 'Thu Dec 10 2026 21:52:20 GMT+0530 (India Standard Time)')
+      3. Epoch timestamps (seconds)
+    """
+    if not date_str:
+        return None
+    date_str = str(date_str).strip()
+    try:
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        # Strip parenthesized timezone label: (India Standard Time)
+        cleaned = re.sub(r'\(.*?\)', '', date_str).strip()
+        # Normalize GMT+0530 / GMT-0500 to +0530 / -0500 for dateutil
+        cleaned = re.sub(r'GMT([+-]\d{4})', r'\1', cleaned)
+        return dateutil_parser.parse(cleaned)
+    except Exception:
+        pass
+
+    try:
+        return datetime.fromtimestamp(float(date_str), tz=timezone.utc)
+    except (ValueError, TypeError):
+        pass
+
+    return None
 
 
 class RedisManager:
@@ -117,11 +153,12 @@ class RedisManager:
             # Check if expired
             is_expired = False
             if expires_at:
-                try:
-                    expiry_date = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-                    is_expired = expiry_date < datetime.now(expiry_date.tzinfo or None)
-                except Exception as e:
-                    logger.warning(f"Failed to parse expiry date: {e}")
+                expiry_date = parse_expiry_date(expires_at)
+                if expiry_date:
+                    now = datetime.now(timezone.utc) if expiry_date.tzinfo else datetime.now()
+                    is_expired = expiry_date < now
+                else:
+                    logger.warning(f"Could not parse expiry date format: {expires_at}")
 
             # Validate license status
             if not is_valid:

@@ -1423,16 +1423,15 @@ def get_autocomplete_suggestion(
             suggestion = response.content[0].text if response.content else ""
 
         elif model_provider == 'gemini':
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
 
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(
-                model_id,
-                system_instruction=AUTOCOMPLETE_SYSTEM_PROMPT,
-            )
-            response = model.generate_content(
-                user_prompt,
-                generation_config=genai.types.GenerationConfig(
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model_id,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=AUTOCOMPLETE_SYSTEM_PROMPT,
                     max_output_tokens=100,
                     temperature=0.3,
                 ),

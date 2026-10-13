@@ -71,6 +71,12 @@ def fire_credit_deduction(
                 timeout=10,
             )
             logger.info(f"Credit deduction webhook sent for user={user_id}: status={resp.status_code}")
+        except requests.exceptions.ConnectionError:
+            logger.warning(
+                f"Backend webhook unreachable at {BACKEND_WEBHOOK_URL} "
+                f"(Connection refused — backend web app is not running on port 3000). "
+                f"Skipping credit deduction for user={user_id}."
+            )
         except Exception as e:
             logger.error(f"Credit deduction webhook failed for user={user_id}: {e}")
 
@@ -139,6 +145,12 @@ def fire_credit_deduction_and_release(
             logger.info(
                 f"Credit deduction webhook sent for user={user_id}: status={resp.status_code}"
             )
+        except requests.exceptions.ConnectionError:
+            logger.warning(
+                f"Backend webhook unreachable at {BACKEND_WEBHOOK_URL} "
+                f"(Connection refused — backend web app is not running on port 3000). "
+                f"Credit reservation will still be released for user={user_id}."
+            )
         except Exception as e:
             logger.error(f"Credit deduction webhook failed for user={user_id}: {e}")
         finally:
@@ -182,6 +194,12 @@ def fire_prompt_history_save(user_id: str, prompt: str):
                 timeout=10,
             )
             logger.info(f"Prompt history webhook sent for user={user_id}: status={resp.status_code}")
+        except requests.exceptions.ConnectionError:
+            logger.warning(
+                f"Backend webhook unreachable at {prompt_history_url} "
+                f"(Connection refused — backend web app is not running on port 3000). "
+                f"Skipping prompt history save for user={user_id}."
+            )
         except Exception as e:
             logger.error(f"Prompt history webhook failed for user={user_id}: {e}")
 
