@@ -144,7 +144,14 @@ def build_agno_images(image_urls, request_id: str = None):
 # MODEL FACTORY FUNCTION
 # ============================================
 
-def get_model(model_provider: str, api_key: str, use_advanced: bool = True, request_id: str = None, needs_tools: bool = False):
+def get_model(
+    model_provider: str,
+    api_key: str,
+    use_advanced: bool = True,
+    request_id: str = None,
+    needs_tools: bool = False,
+    temperature: float = 0.0,
+):
     """
     Factory function to create the appropriate model instance based on provider.
 
@@ -154,6 +161,7 @@ def get_model(model_provider: str, api_key: str, use_advanced: bool = True, requ
         use_advanced: Whether to use advanced/larger model (for complex tasks)
         request_id: Request ID for logging
         needs_tools: Whether this agent needs tool/function calling support
+        temperature: Sampling temperature for output determinism and creativity
 
     Returns:
         Model instance for agno Agent
@@ -175,20 +183,34 @@ def get_model(model_provider: str, api_key: str, use_advanced: bool = True, requ
             f"{log_prefix}Creating DeepSeek model: {DEEPSEEK_TOOL_MODEL_ID} "
             f"(downgraded from {model_id} - no tool support)"
         )
-        return DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key)
+        return DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature)
 
-    logger.info(f"{log_prefix}Creating {model_provider} model: {model_id} (advanced={use_advanced})")
+    logger.info(
+        f"{log_prefix}Creating {model_provider} model: {model_id} "
+        f"(advanced={use_advanced}, temp={temperature})"
+    )
 
     if model_provider == 'openai':
-        return OpenAIChat(id=model_id, api_key=api_key)
+        if model_id.startswith("gpt-5"):
+            # GPT-5 family models reject custom temperature ("Only the default (1) value is supported")
+            return OpenAIChat(id=model_id, api_key=api_key)
+        return OpenAIChat(id=model_id, api_key=api_key, temperature=temperature)
     if model_provider == 'claude':
-        return Claude(id=model_id, api_key=api_key)
+        return Claude(id=model_id, api_key=api_key, temperature=temperature)
     if model_provider == 'grok':
-        return xAI(id=model_id, api_key=api_key)
+        return xAI(id=model_id, api_key=api_key, temperature=temperature)
     if model_provider == 'deepseek':
-        return DeepSeek(id=model_id, api_key=api_key)
+        if model_id == 'deepseek-reasoner':
+            # deepseek-reasoner rejects custom temperature
+            return DeepSeek(id=model_id, api_key=api_key)
+        return DeepSeek(id=model_id, api_key=api_key, temperature=temperature)
     if model_provider == 'gemini':
-        return Gemini(id=model_id, api_key=api_key)
+        gemini_kwargs = {"id": model_id, "api_key": api_key, "temperature": temperature}
+        if model_id == "gemini-3.8-flash":
+            # gemini-3.8-flash spends 2.5-3.5s calculating reasoning tokens by default;
+            # disabling thinking budget drops TTFT significantly for responsive streaming.
+            gemini_kwargs["thinking_budget"] = 0
+        return Gemini(**gemini_kwargs)
 
     # Unreachable: the tier lookup above already rejects unknown providers.
     raise ValueError(f"Unsupported model provider: {model_provider}")
@@ -591,6 +613,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the corrected text. Do NOT include any headers, labels, or prefixes like 'Corrected Text:', 'Here is the corrected version:', etc. Just output the final corrected text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.0,
     },
     "simplify": {
         "name": "Text Simplifier",
@@ -604,6 +629,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the simplified text. Do NOT include any headers, labels, or prefixes like 'Simplified Text:', 'Here is the simplified version:', etc. Just output the final simplified text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.3,
     },
     "completion": {
         "name": "Text Completer",
@@ -617,6 +645,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the completed text (original + completion). Do NOT include any headers, labels, or prefixes like 'Completed Text:', 'Here is the completion:', etc. Just output the final text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.4,
     },
     "emojify": {
         "name": "Emoji Enhancer",
@@ -630,6 +661,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the text with emojis added. Do NOT include any headers, labels, or prefixes like 'Emojified Text:', 'Here is the text with emojis:', etc. Just output the final text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.5,
     },
     "translation": {
         "name": "Language Translator",
@@ -643,6 +677,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the translated text. Do NOT include any headers, labels, or prefixes like 'Translation:', 'Translated Text:', 'Here is the translation:', etc. Just output the final translated text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.1,
     },
     "table": {
         "name": "Table Creator",
@@ -657,6 +694,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the table. Do NOT include any headers, labels, or prefixes like 'Table:', 'Here is the table:', etc. Just output the Markdown table directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.0,
     },
     "list": {
         "name": "List Organizer",
@@ -670,6 +710,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the list. Do NOT include any headers, labels, or prefixes like 'List:', 'Here is the list:', etc. Just output the Markdown list directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.2,
     },
     "summarize": {
         "name": "Content Summarizer",
@@ -683,6 +726,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the summary. Do NOT include any headers, labels, or prefixes like 'Summary:', 'Here is the summary:', 'Key Points:', etc. Just output the final summary directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.3,
     },
     "tone": {
         "name": "Tone Adjuster",
@@ -696,6 +742,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the rewritten text in the new tone. Do NOT include any headers, labels, or prefixes like 'Professional Tone:', 'Casual Version:', 'Here is the text in a different tone:', etc. Just output the final text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.5,
     },
     "make_longer": {
         "name": "Text Expander",
@@ -710,6 +759,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the expanded text. Do NOT include any headers, labels, or prefixes like 'Expanded Text:', 'Longer Version:', 'Here is the expanded text:', etc. Just output the final expanded text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": True,
+        "temperature": 0.7,
     },
     "make_shorter": {
         "name": "Text Condenser",
@@ -724,6 +776,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the shortened text. Do NOT include any headers, labels, or prefixes like 'Shortened Text:', 'Condensed Version:', 'Here is the shorter text:', etc. Just output the final condensed text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.2,
     },
     "enhance": {
         "name": "AI Enhancer",
@@ -740,6 +795,9 @@ AGENT_CONFIGS = {
             "CRITICAL: Output ONLY the enhanced text. Do NOT include any headers, labels, or prefixes like 'Enhanced Text:', 'Improved Version:', 'Here is the enhanced text:', etc. Just output the final enhanced text directly.",
             markdown_conversion_instruction,
         ],
+        "use_tools": False,
+        "use_advanced": True,
+        "temperature": 0.7,
     },
     "smart_global": {
         "name": "Smart Content Assistant",
@@ -816,6 +874,7 @@ AGENT_CONFIGS = {
         ],
         "use_tools": True,
         "use_advanced": True,
+        "temperature": 0.7,
     },
     # Transcribes what is written in an attached image. Deliberately narrow:
     # it reports what it can see and nothing else, because the failure mode
@@ -842,6 +901,7 @@ AGENT_CONFIGS = {
         # image generation would only add latency and opportunities to drift.
         "use_tools": False,
         "use_advanced": True,
+        "temperature": 0.0,
     },
     # Email templates are the one agent that must NOT emit Markdown. Its output
     # goes straight into an HtmlCanvasNode (rendered in a sandboxed iframe via
@@ -885,6 +945,7 @@ AGENT_CONFIGS = {
         # same streaming path as every other provider (see create_agent).
         "use_tools": False,
         "use_advanced": True,
+        "temperature": 0.2,
     },
 }
 
@@ -926,11 +987,22 @@ def create_agent(
 
     config = AGENT_CONFIGS[agent_type]
     use_advanced = config.get("use_advanced", True)
-    use_tools = config.get("use_tools", True)
+    use_tools = config.get("use_tools", False)
+    temperature = config.get("temperature", 0.7)
 
-    logger.info(f"{log_prefix}Creating agent: {config['name']} (type={agent_type}, advanced={use_advanced}, tools={use_tools})")
+    logger.info(
+        f"{log_prefix}Creating agent: {config['name']} "
+        f"(type={agent_type}, advanced={use_advanced}, tools={use_tools}, temp={temperature})"
+    )
 
-    model = get_model(model_provider, api_key, use_advanced, request_id, needs_tools=use_tools)
+    model = get_model(
+        model_provider,
+        api_key,
+        use_advanced,
+        request_id,
+        needs_tools=use_tools,
+        temperature=temperature,
+    )
 
     agent_kwargs = {
         "name": config["name"],
@@ -1347,6 +1419,44 @@ def _postprocess_autocomplete(text_before: str, suggestion: str) -> str:
     return suggestion
 
 
+# Connection pool for autocomplete clients to avoid repeated TLS handshake overhead
+_client_cache = {}
+_client_lock = threading.Lock()
+
+
+def _get_cached_openai_client(api_key: str, base_url: str = None):
+    cache_key = ("openai", api_key, base_url)
+    if cache_key not in _client_cache:
+        with _client_lock:
+            if cache_key not in _client_cache:
+                from openai import OpenAI
+                kwargs = {"api_key": api_key}
+                if base_url:
+                    kwargs["base_url"] = base_url
+                _client_cache[cache_key] = OpenAI(**kwargs)
+    return _client_cache[cache_key]
+
+
+def _get_cached_anthropic_client(api_key: str):
+    cache_key = ("claude", api_key)
+    if cache_key not in _client_cache:
+        with _client_lock:
+            if cache_key not in _client_cache:
+                import anthropic
+                _client_cache[cache_key] = anthropic.Anthropic(api_key=api_key)
+    return _client_cache[cache_key]
+
+
+def _get_cached_gemini_client(api_key: str):
+    cache_key = ("gemini", api_key)
+    if cache_key not in _client_cache:
+        with _client_lock:
+            if cache_key not in _client_cache:
+                from google import genai
+                _client_cache[cache_key] = genai.Client(api_key=api_key)
+    return _client_cache[cache_key]
+
+
 def get_autocomplete_suggestion(
     text_before: str,
     text_after: str,
@@ -1389,13 +1499,8 @@ def get_autocomplete_suggestion(
 
         if model_provider == 'openai' or model_provider in OPENAI_COMPATIBLE_BASES:
             # OpenAI and OpenAI-compatible providers (Grok, DeepSeek)
-            from openai import OpenAI
-
-            client_kwargs = {"api_key": api_key}
-            if model_provider in OPENAI_COMPATIBLE_BASES:
-                client_kwargs["base_url"] = OPENAI_COMPATIBLE_BASES[model_provider]
-
-            client = OpenAI(**client_kwargs)
+            base_url = OPENAI_COMPATIBLE_BASES.get(model_provider)
+            client = _get_cached_openai_client(api_key, base_url)
             response = client.chat.completions.create(
                 model=model_id,
                 messages=[
@@ -1408,9 +1513,7 @@ def get_autocomplete_suggestion(
             suggestion = response.choices[0].message.content or ""
 
         elif model_provider == 'claude':
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=api_key)
+            client = _get_cached_anthropic_client(api_key)
             response = client.messages.create(
                 model=model_id,
                 system=AUTOCOMPLETE_SYSTEM_PROMPT,
@@ -1423,10 +1526,9 @@ def get_autocomplete_suggestion(
             suggestion = response.content[0].text if response.content else ""
 
         elif model_provider == 'gemini':
-            from google import genai
             from google.genai import types
 
-            client = genai.Client(api_key=api_key)
+            client = _get_cached_gemini_client(api_key)
             response = client.models.generate_content(
                 model=model_id,
                 contents=user_prompt,
