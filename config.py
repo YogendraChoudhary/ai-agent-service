@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     default_anthropic_api_key: Optional[str] = Field(None, alias="DEFAULT_ANTHROPIC_API_KEY")
     default_grok_api_key: Optional[str] = Field(None, alias="DEFAULT_GROK_API_KEY")
     default_gemini_api_key: Optional[str] = Field(None, alias="DEFAULT_GEMINI_API_KEY")
+    default_deepseek_api_key: Optional[str] = Field(None, alias="DEFAULT_DEEPSEEK_API_KEY")
 
     # ------------------------------------------------------------------
     # Credit system

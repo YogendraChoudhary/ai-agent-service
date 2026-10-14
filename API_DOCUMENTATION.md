@@ -639,11 +639,11 @@ For production, store API keys in environment variables:
 
 ```bash
 # .env file
-OPENAI_API_KEY=sk-your-openai-key
-ANTHROPIC_API_KEY=sk-ant-your-anthropic-key
-XAI_API_KEY=xai-your-grok-key
-DEEPSEEK_API_KEY=sk-your-deepseek-key
-GOOGLE_API_KEY=your-google-api-key
+DEFAULT_OPENAI_API_KEY=sk-your-openai-key
+DEFAULT_ANTHROPIC_API_KEY=sk-ant-your-anthropic-key
+DEFAULT_GROK_API_KEY=xai-your-grok-key
+DEFAULT_DEEPSEEK_API_KEY=sk-your-deepseek-key
+DEFAULT_GEMINI_API_KEY=your-google-api-key
 TEXT_AGENT_URL=http://localhost:5000
 ```
 

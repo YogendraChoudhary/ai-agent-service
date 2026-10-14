@@ -22,6 +22,7 @@ from .models import (
     supports_vision,
 )
 from .security_guardrails import sanitize_web_content
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 import os
 import logging
@@ -31,13 +32,22 @@ import threading
 import re
 import ipaddress
 import socket
+import http.cookiejar
+from collections import OrderedDict
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import httpcore
+import httpx
 
 load_dotenv()
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Shared module-level thread pool for parallel tool execution.
+# Eliminates per-call thread creation and teardown overhead across parallel tools.
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="agent_tool_worker")
 
 # ============================================
 # DUCKDUCKGO SEARCH WITH RETRY (handles rate limits)
@@ -326,8 +336,11 @@ def build_agno_images(image_urls, request_id: str = None):
 
 
 # ============================================
-# MODEL FACTORY FUNCTION
+# MODEL FACTORY FUNCTION & CACHE
 # ============================================
+
+_MODEL_CACHE: dict[tuple, Any] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
 
 def get_model(
     model_provider: str,
@@ -336,9 +349,11 @@ def get_model(
     request_id: str = None,
     needs_tools: bool = False,
     temperature: float = 0.0,
+    cache_model: bool = True,
 ):
     """
-    Factory function to create the appropriate model instance based on provider.
+    Factory function to get or create the appropriate model instance based on provider.
+    Caches SDK model instances to eliminate redundant instantiation and handshake setup per request.
 
     Args:
         model_provider: The model provider ('openai', 'claude', 'grok', 'deepseek', 'gemini')
@@ -361,6 +376,18 @@ def get_model(
         logger.error(f"{log_prefix}Unsupported model provider: {model_provider}")
         raise ValueError(f"Unsupported model provider: {model_provider}")
 
+    # Check cache first
+    cache_tools = needs_tools if model_provider == 'deepseek' else False
+    cache_temperature = round(float(temperature), 2)
+    if (model_provider == 'openai' and model_id.startswith('gpt-5')) or model_id == 'deepseek-reasoner':
+        cache_temperature = 0.0
+    cache_key = (model_provider, api_key, use_advanced, cache_tools, cache_temperature)
+    if cache_model:
+        with _MODEL_CACHE_LOCK:
+            if cache_key in _MODEL_CACHE:
+                logger.debug(f"{log_prefix}Reusing cached {model_provider} model ({model_id})")
+                return _MODEL_CACHE[cache_key]
+
     # deepseek-reasoner (R1) does NOT support function/tool calling, so any
     # agent that needs tools has to drop to deepseek-chat.
     if model_provider == 'deepseek' and needs_tools and model_id != DEEPSEEK_TOOL_MODEL_ID:
@@ -368,7 +395,11 @@ def get_model(
             f"{log_prefix}Creating DeepSeek model: {DEEPSEEK_TOOL_MODEL_ID} "
             f"(downgraded from {model_id} - no tool support)"
         )
-        return DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature)
+        model = DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature)
+        if cache_model:
+            with _MODEL_CACHE_LOCK:
+                _MODEL_CACHE[cache_key] = model
+        return model
 
     logger.info(
         f"{log_prefix}Creating {model_provider} model: {model_id} "
@@ -378,33 +409,90 @@ def get_model(
     if model_provider == 'openai':
         if model_id.startswith("gpt-5"):
             # GPT-5 family models reject custom temperature ("Only the default (1) value is supported")
-            return OpenAIChat(id=model_id, api_key=api_key)
-        return OpenAIChat(id=model_id, api_key=api_key, temperature=temperature)
-    if model_provider == 'claude':
-        return Claude(
+            model = OpenAIChat(id=model_id, api_key=api_key)
+        else:
+            model = OpenAIChat(id=model_id, api_key=api_key, temperature=temperature)
+    elif model_provider == 'claude':
+        model = Claude(
             id=model_id,
             api_key=api_key,
             temperature=temperature,
             cache_system_prompt=True,
             cache_tools=True,
         )
-    if model_provider == 'grok':
-        return xAI(id=model_id, api_key=api_key, temperature=temperature)
-    if model_provider == 'deepseek':
+    elif model_provider == 'grok':
+        model = xAI(id=model_id, api_key=api_key, temperature=temperature)
+    elif model_provider == 'deepseek':
         if model_id == 'deepseek-reasoner':
             # deepseek-reasoner rejects custom temperature
-            return DeepSeek(id=model_id, api_key=api_key)
-        return DeepSeek(id=model_id, api_key=api_key, temperature=temperature)
-    if model_provider == 'gemini':
+            model = DeepSeek(id=model_id, api_key=api_key)
+        else:
+            model = DeepSeek(id=model_id, api_key=api_key, temperature=temperature)
+    elif model_provider == 'gemini':
         gemini_kwargs = {"id": model_id, "api_key": api_key, "temperature": temperature}
         if model_id == "gemini-3.8-flash":
             # gemini-3.8-flash spends 2.5-3.5s calculating reasoning tokens by default;
             # disabling thinking budget drops TTFT significantly for responsive streaming.
             gemini_kwargs["thinking_budget"] = 0
-        return Gemini(**gemini_kwargs)
+        model = Gemini(**gemini_kwargs)
+    else:
+        # Unreachable: the tier lookup above already rejects unknown providers.
+        raise ValueError(f"Unsupported model provider: {model_provider}")
 
-    # Unreachable: the tier lookup above already rejects unknown providers.
-    raise ValueError(f"Unsupported model provider: {model_provider}")
+    if cache_model:
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE[cache_key] = model
+
+    return model
+
+
+def prewarm_models(default_keys: Optional[dict[str, str]] = None) -> int:
+    """
+    Pre-warm SDK model instances at application startup.
+    Eliminates SDK client construction and config overhead on first user requests.
+    """
+    if not default_keys:
+        return 0
+
+    with _MODEL_CACHE_LOCK:
+        initial_count = len(_MODEL_CACHE)
+    provider_keys = {
+        'openai': default_keys.get('openai_api_key') or default_keys.get('openai'),
+        'gemini': default_keys.get('gemini_api_key') or default_keys.get('gemini'),
+        'claude': default_keys.get('anthropic_api_key') or default_keys.get('claude') or default_keys.get('anthropic'),
+        'grok': default_keys.get('grok_api_key') or default_keys.get('grok'),
+        'deepseek': default_keys.get('deepseek_api_key') or default_keys.get('deepseek'),
+    }
+
+    logger.info("🔥 Pre-warming SDK model instances at startup...")
+    configurations = {
+        (
+            config.get("use_advanced", True),
+            config.get("use_tools", False),
+            config.get("temperature", 0.7),
+        )
+        for config in AGENT_CONFIGS.values()
+    }
+    for provider, key in provider_keys.items():
+        if not key:
+            continue
+        for use_adv, needs_tools, temp in configurations:
+            try:
+                get_model(
+                    model_provider=provider,
+                    api_key=key,
+                    use_advanced=use_adv,
+                    request_id="startup-prewarm",
+                    needs_tools=needs_tools,
+                    temperature=temp,
+                )
+            except Exception as e:
+                logger.debug(f"Pre-warm skipped for {provider} (adv={use_adv}, tools={needs_tools}): {e}")
+
+    with _MODEL_CACHE_LOCK:
+        count = len(_MODEL_CACHE) - initial_count
+    logger.info(f"✅ Pre-warmed {count} SDK model instances into memory cache")
+    return count
 
 # ============================================
 # CUSTOM TOOLS
@@ -414,34 +502,162 @@ def get_model(
 # for, small enough not to blow out the context window on a long article.
 MAX_PAGE_CHARS = 20000
 
+# ---------------------------------------------------------------------------
+# DNS CACHE
+# Eliminates redundant blocking socket.getaddrinfo calls (~50-300 ms saved per host)
+# ---------------------------------------------------------------------------
+_DNS_CACHE: dict[str, tuple[tuple[str, ...], float]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE_TTL = 300.0  # 5 minutes cache
+_DNS_CACHE_MAX_SIZE = 1024
 
-def _is_publicly_routable(hostname: str) -> bool:
-    """
-    Reject anything that resolves to a private, loopback, link-local or
-    otherwise reserved address.
 
-    The model chooses these URLs, and the fetch happens from our EC2 host, so an
-    unguarded fetcher is an SSRF primitive: http://169.254.169.254/ returns IAM
-    credentials, and the VPC's private ranges are reachable too. Resolution is
-    done here rather than trusting the hostname string, since a public-looking
-    name can resolve to a private address.
+def _resolve_public_addresses(hostname: str) -> tuple[str, ...]:
     """
+    Resolve a hostname once and return only public IPs that the HTTP transport
+    can connect to directly. An empty tuple means the host is unsafe or failed.
+    """
+    if not hostname:
+        return ()
+
+    if "://" in hostname:
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(hostname)
+            clean_host = (parsed.hostname or hostname).strip().lower().rstrip(".")
+        except Exception:
+            clean_host = hostname.strip().lower().rstrip(".")
+    else:
+        clean_host = hostname.strip().lower().rstrip(".")
+
+    now = time.time()
+
+    # 1. Fast cache lookup
+    with _DNS_CACHE_LOCK:
+        if clean_host in _DNS_CACHE:
+            addresses, expiry = _DNS_CACHE[clean_host]
+            if now < expiry:
+                return addresses
+
+    # 2. Blocking DNS resolution
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        infos = socket.getaddrinfo(clean_host, None, type=socket.SOCK_STREAM)
     except Exception:
-        return False
-    if not infos:
-        return False
+        infos = ()
+
+    addresses = []
     for info in infos:
         addr = info[4][0]
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
-            return False
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False
-    return True
+            addresses = []
+            break
+        if not ip.is_global:
+            addresses = []
+            break
+        if addr not in addresses:
+            addresses.append(addr)
+    resolved = tuple(addresses)
+
+    # 3. Store in bounded cache
+    with _DNS_CACHE_LOCK:
+        if len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
+            expired = [k for k, (_, exp) in _DNS_CACHE.items() if now >= exp]
+            if expired:
+                for k in expired:
+                    _DNS_CACHE.pop(k, None)
+            else:
+                for k in list(_DNS_CACHE.keys())[:200]:
+                    _DNS_CACHE.pop(k, None)
+        _DNS_CACHE[clean_host] = (resolved, now + _DNS_CACHE_TTL)
+
+    return resolved
+
+
+def _is_publicly_routable(hostname: str) -> bool:
+    return bool(_resolve_public_addresses(hostname))
+
+
+class _PinnedDNSBackend(httpcore.SyncBackend):
+    """Connect to the exact public IPs checked above, preventing DNS rebinding."""
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        addresses = _resolve_public_addresses(host)
+        if not addresses:
+            raise httpcore.ConnectError(f"Blocked non-public host: {host}")
+        last_error = None
+        for address in addresses:
+            try:
+                return super().connect_tcp(
+                    address, port, timeout, local_address, socket_options
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+        raise last_error or httpcore.ConnectError(f"Could not connect to {host}")
+
+
+class _NoCookieJar(http.cookiejar.CookieJar):
+    def set_cookie(self, cookie, *args, **kwargs):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# SHARED PERSISTENT HTTP CLIENT
+# Maintains persistent connection pool and keep-alive across page reads.
+# Reuses TCP+TLS connections (~70-300 ms saved per page read).
+# ---------------------------------------------------------------------------
+_SHARED_WEB_CLIENT = None
+_SHARED_WEB_CLIENT_LOCK = threading.Lock()
+
+
+def get_shared_web_client():
+    """
+    Get or create the singleton persistent httpx.Client with connection pooling.
+    Thread-safe and keeps sockets alive across requests.
+    """
+    global _SHARED_WEB_CLIENT
+    if _SHARED_WEB_CLIENT is None:
+        with _SHARED_WEB_CLIENT_LOCK:
+            if _SHARED_WEB_CLIENT is None:
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+                limits = httpx.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=50,
+                    keepalive_expiry=30.0,
+                )
+                transport = httpx.HTTPTransport(limits=limits, trust_env=False)
+                # shortcut: httpx has no public DNS-backend hook; keep 0.28.1 pinned while this assignment is used.
+                transport._pool._network_backend = _PinnedDNSBackend()
+                _SHARED_WEB_CLIENT = httpx.Client(
+                    timeout=10.0,
+                    follow_redirects=True,
+                    headers=headers,
+                    cookies=_NoCookieJar(),
+                    transport=transport,
+                    trust_env=False,
+                )
+    return _SHARED_WEB_CLIENT
+
+
+def close_shared_web_client() -> None:
+    """Close the shared HTTP client connections on shutdown."""
+    global _SHARED_WEB_CLIENT
+    with _SHARED_WEB_CLIENT_LOCK:
+        if _SHARED_WEB_CLIENT is not None:
+            try:
+                _SHARED_WEB_CLIENT.close()
+            except Exception:
+                pass
+            _SHARED_WEB_CLIENT = None
 
 
 def create_web_read_tool(request_id: str = None):
@@ -479,24 +695,13 @@ def create_web_read_tool(request_id: str = None):
                 logger.warning(f"{log_prefix}Blocked read_web_page for non-public host")
                 return "ERROR: that host is not publicly routable and cannot be read."
 
-            import httpx
             from bs4 import BeautifulSoup
 
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-
             logger.info(f"{log_prefix}Reading page: {parsed.scheme}://{parsed.hostname}{parsed.path[:60]}")
-            with httpx.Client(timeout=10.0, follow_redirects=True, headers=headers) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                html_content = resp.text
+            client = get_shared_web_client()
+            resp = client.get(url)
+            resp.raise_for_status()
+            html_content = resp.text
 
             soup = BeautifulSoup(html_content, "html.parser")
 
@@ -607,14 +812,13 @@ def create_parallel_search_tool(search_instance: DuckDuckGoWithRetry, request_id
                 fallback = search_instance.fallback_search(q, max_results=max_results)
                 return q, fallback
 
-        with ThreadPoolExecutor(max_workers=min(len(capped_queries), 5)) as executor:
-            futures = [executor.submit(_run_single, q) for q in capped_queries]
-            for future in as_completed(futures):
-                try:
-                    q, res = future.result()
-                    results_map[q] = res
-                except Exception as e:
-                    logger.error(f"{log_prefix}Worker error in parallel search: {e}")
+        futures = [_TOOL_EXECUTOR.submit(_run_single, q) for q in capped_queries]
+        for future in as_completed(futures):
+            try:
+                q, res = future.result()
+                results_map[q] = res
+            except Exception as e:
+                logger.error(f"{log_prefix}Worker error in parallel search: {e}")
 
         return json.dumps(results_map, indent=2, ensure_ascii=False)
 
@@ -624,7 +828,7 @@ def create_parallel_search_tool(search_instance: DuckDuckGoWithRetry, request_id
 def create_parallel_read_tool(reader_tool_fn, request_id: str = None):
     """
     Creates a parallel web page reading tool that reads multiple URLs
-    concurrently using a ThreadPoolExecutor.
+    concurrently using the shared _TOOL_EXECUTOR.
     """
     log_prefix = f"[{request_id}] " if request_id else ""
 
@@ -641,7 +845,6 @@ def create_parallel_read_tool(reader_tool_fn, request_id: str = None):
             JSON string mapping each URL to its extracted markdown text or error.
         """
         import json
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         if isinstance(urls, str):
             try:
@@ -669,14 +872,13 @@ def create_parallel_read_tool(reader_tool_fn, request_id: str = None):
                 logger.warning(f"{log_prefix}Parallel read worker failed for '{url}': {e}")
                 return url, f"ERROR: failed to read page ({type(e).__name__})"
 
-        with ThreadPoolExecutor(max_workers=min(len(capped_urls), 4)) as executor:
-            futures = [executor.submit(_read_single, u) for u in capped_urls]
-            for future in as_completed(futures):
-                try:
-                    url, content = future.result()
-                    results_map[url] = content
-                except Exception as e:
-                    logger.error(f"{log_prefix}Worker error in parallel read: {e}")
+        futures = [_TOOL_EXECUTOR.submit(_read_single, u) for u in capped_urls]
+        for future in as_completed(futures):
+            try:
+                url, content = future.result()
+                results_map[url] = content
+            except Exception as e:
+                logger.error(f"{log_prefix}Worker error in parallel read: {e}")
 
         return json.dumps(results_map, indent=2, ensure_ascii=False)
 
@@ -772,6 +974,11 @@ def create_image_tool(
                     logger.error(f"{log_prefix}Background image generation failed: {str(e)}")
                     pending_images[placeholder_id]["error"] = str(e)
                     pending_images[placeholder_id]["status"] = "failed"
+                finally:
+                    if pending_images is not None:
+                        notify = pending_images.get("__completion_callback__")
+                        if notify is not None:
+                            notify()
 
             thread = threading.Thread(target=_background_generate, daemon=True)
             thread.start()
@@ -856,6 +1063,11 @@ def create_grok_image_tool(
                     logger.error(f"{log_prefix}Background Grok image generation failed: {str(e)}")
                     pending_images[placeholder_id]["error"] = str(e)
                     pending_images[placeholder_id]["status"] = "failed"
+                finally:
+                    if pending_images is not None:
+                        notify = pending_images.get("__completion_callback__")
+                        if notify is not None:
+                            notify()
 
             thread = threading.Thread(target=_background_generate, daemon=True)
             thread.start()
@@ -963,6 +1175,11 @@ def create_gemini_image_tool(
                     logger.error(f"{log_prefix}Background Gemini image generation failed: {str(e)}")
                     pending_images[placeholder_id]["error"] = str(e)
                     pending_images[placeholder_id]["status"] = "failed"
+                finally:
+                    if pending_images is not None:
+                        notify = pending_images.get("__completion_callback__")
+                        if notify is not None:
+                            notify()
 
             thread = threading.Thread(target=_background_generate, daemon=True)
             thread.start()
@@ -994,7 +1211,6 @@ def create_multi_image_tool(single_image_tool_fn, request_id: str = None):
             String listing placeholder URLs for all requested images.
         """
         import json
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         if isinstance(prompts, str):
             try:
@@ -1022,11 +1238,10 @@ def create_multi_image_tool(single_image_tool_fn, request_id: str = None):
                 logger.error(f"{log_prefix}Failed to trigger image for '{p[:30]}': {e}")
                 return idx, p, f"ERROR: {str(e)}"
 
-        with ThreadPoolExecutor(max_workers=min(len(capped_prompts), 4)) as executor:
-            futures = [executor.submit(_gen_single, i, p) for i, p in enumerate(capped_prompts)]
-            for future in as_completed(futures):
-                idx, p, res = future.result()
-                placeholders[idx] = (p, res)
+        futures = [_TOOL_EXECUTOR.submit(_gen_single, i, p) for i, p in enumerate(capped_prompts)]
+        for future in as_completed(futures):
+            idx, p, res = future.result()
+            placeholders[idx] = (p, res)
 
         lines = ["Parallel Images Generated:"]
         for idx in sorted(placeholders.keys()):
@@ -1450,6 +1665,7 @@ def create_agent(
         request_id,
         needs_tools=use_tools,
         temperature=temperature,
+        cache_model=not is_byok,
     )
 
     agent_kwargs = {
@@ -1584,6 +1800,7 @@ def process_user_query_stream(
     is_byok: bool = False,
     image_urls=None,
     force_agent_type: str = None,
+    image_completion_callback=None,
 ):
     """
     Stream query processor for text editor integration.
@@ -1603,6 +1820,7 @@ def process_user_query_stream(
         force_agent_type: Skip keyword routing and use this agent type directly.
             Used by callers that already know the intent (e.g. the email
             template flow), where sniffing the query text would be unreliable.
+        image_completion_callback: Thread-safe callback invoked when an image finishes.
 
     Yields:
         Markdown content chunks as they are generated
@@ -1635,7 +1853,7 @@ def process_user_query_stream(
         images = build_agno_images(image_urls, request_id)
 
     # Shared dict for tracking async image generation
-    pending_images = {}
+    pending_images = {"__completion_callback__": image_completion_callback}
 
     try:
         agent = create_agent(
@@ -1684,9 +1902,10 @@ def process_user_query_stream(
             duration = time.time() - start_time
             logger.info(f"{log_prefix}Agent {agent_type} streaming completed in {duration:.2f}s (total chars: {total_chars})")
 
-        # Yield sentinel with pending images so the SSE endpoint can poll for them
-        if pending_images:
-            logger.info(f"{log_prefix}Pending background images: {len(pending_images)}")
+        # Yield sentinel with pending images so the SSE endpoint can wait for them
+        actual_pending = {k: v for k, v in pending_images.items() if k != "__completion_callback__"}
+        if actual_pending:
+            logger.info(f"{log_prefix}Pending background images: {len(actual_pending)}")
             yield {"__pending_images__": pending_images}
 
     except Exception as e:
@@ -1700,6 +1919,7 @@ def process_user_query(
     api_key: str = None,
     request_id: str = None,
     force_agent_type: str = None,
+    is_byok: bool = False,
 ) -> str:
     """
     Global query processor for HTML editor integration.
@@ -1726,6 +1946,7 @@ def process_user_query(
         api_key: The API key for the model provider
         request_id: Request ID for logging
         force_agent_type: Direct agent override
+        is_byok: Do not retain a user-owned credential in the global model cache.
 
     Returns:
         HTML formatted response
@@ -1742,7 +1963,9 @@ def process_user_query(
         """Helper function to run agent with logging"""
         logger.info(f"{log_prefix}Query routing: {reason} -> {agent_type} agent")
         try:
-            agent = create_agent(agent_type, model_provider, api_key, request_id)
+            agent = create_agent(
+                agent_type, model_provider, api_key, request_id, is_byok=is_byok
+            )
             logger.info(f"{log_prefix}Running agent: {agent_type}...")
             start_time = time.time()
             response = agent.run(query)
@@ -1887,41 +2110,50 @@ def _postprocess_autocomplete(text_before: str, suggestion: str) -> str:
 
 
 # Connection pool for autocomplete clients to avoid repeated TLS handshake overhead
-_client_cache = {}
+_client_cache = OrderedDict()
 _client_lock = threading.Lock()
+_CLIENT_CACHE_MAX_SIZE = 64
+
+
+def _get_cached_client(cache_key, factory):
+    evicted = None
+    with _client_lock:
+        client = _client_cache.get(cache_key)
+        if client is not None:
+            _client_cache.move_to_end(cache_key)
+            return client
+        client = factory()
+        if len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
+            _, evicted = _client_cache.popitem(last=False)
+        _client_cache[cache_key] = client
+    close = getattr(evicted, "close", None)
+    if close:
+        try:
+            close()
+        except Exception as exc:
+            logger.warning(f"Failed to close evicted autocomplete client: {exc}")
+    return client
 
 
 def _get_cached_openai_client(api_key: str, base_url: str = None):
     cache_key = ("openai", api_key, base_url)
-    if cache_key not in _client_cache:
-        with _client_lock:
-            if cache_key not in _client_cache:
-                from openai import OpenAI
-                kwargs = {"api_key": api_key}
-                if base_url:
-                    kwargs["base_url"] = base_url
-                _client_cache[cache_key] = OpenAI(**kwargs)
-    return _client_cache[cache_key]
+    from openai import OpenAI
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return _get_cached_client(cache_key, lambda: OpenAI(**kwargs))
 
 
 def _get_cached_anthropic_client(api_key: str):
     cache_key = ("claude", api_key)
-    if cache_key not in _client_cache:
-        with _client_lock:
-            if cache_key not in _client_cache:
-                import anthropic
-                _client_cache[cache_key] = anthropic.Anthropic(api_key=api_key)
-    return _client_cache[cache_key]
+    import anthropic
+    return _get_cached_client(cache_key, lambda: anthropic.Anthropic(api_key=api_key))
 
 
 def _get_cached_gemini_client(api_key: str):
     cache_key = ("gemini", api_key)
-    if cache_key not in _client_cache:
-        with _client_lock:
-            if cache_key not in _client_cache:
-                from google import genai
-                _client_cache[cache_key] = genai.Client(api_key=api_key)
-    return _client_cache[cache_key]
+    from google import genai
+    return _get_cached_client(cache_key, lambda: genai.Client(api_key=api_key))
 
 
 def get_autocomplete_suggestion(

@@ -23,6 +23,7 @@ DEFAULT_OPENAI_API_KEY=your_openai_api_key_here
 DEFAULT_ANTHROPIC_API_KEY=your_anthropic_api_key_here
 DEFAULT_GROK_API_KEY=your_grok_api_key_here
 DEFAULT_GEMINI_API_KEY=your_gemini_api_key_here
+DEFAULT_DEEPSEEK_API_KEY=your_deepseek_api_key_here
 
 # ==============================================================================
 # Backend Webhooks & Security

@@ -9,6 +9,7 @@ import os
 import re
 import ssl
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import logging
@@ -69,6 +70,11 @@ class RedisManager:
         if not self.redis_url:
             raise ValueError("REDIS_URL environment variable is required")
 
+        # Fast in-memory cache of license_key -> user_id to enable parallel
+        # license validation and user API key lookups via asyncio.gather().
+        self._license_user_cache: Dict[str, str] = {}
+        self._cache_lock = threading.Lock()
+
         # Parse Redis URL and connect with robust settings
         try:
             # For rediss:// (SSL) URLs, provide CA certs so verification works on macOS
@@ -92,8 +98,31 @@ class RedisManager:
             logger.error(f"❌ Failed to connect to Redis: {str(e)}")
             raise
 
+    def get_cached_user_id(self, license_key: str) -> Optional[str]:
+        """Get cached user_id for a license key if present."""
+        with self._cache_lock:
+            return self._license_user_cache.get(license_key)
+
+    def set_cached_user_id(self, license_key: str, user_id: str) -> None:
+        """Cache user_id for a license key with bounded capacity."""
+        if not license_key or not user_id:
+            return
+        with self._cache_lock:
+            if len(self._license_user_cache) > 2048:
+                for k in list(self._license_user_cache.keys())[:512]:
+                    self._license_user_cache.pop(k, None)
+            self._license_user_cache[license_key] = user_id
+
+    def evict_cached_user_id(self, license_key: str) -> None:
+        """Evict a license key from the in-memory cache."""
+        with self._cache_lock:
+            self._license_user_cache.pop(license_key, None)
+
     def _execute_with_retry(self, operation, max_retries: int = 3):
-        """Execute a Redis operation with retry logic and exponential backoff"""
+        """
+        Execute a Redis operation with retry logic and bounded backoff.
+        Keeps a short recovery window for transient connection failures.
+        """
         last_error = None
         for attempt in range(max_retries):
             try:
@@ -102,8 +131,7 @@ class RedisManager:
                 last_error = e
                 logger.warning(f"Redis operation failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
                 if attempt < max_retries - 1:
-                    # Exponential backoff: 0.5s, 1s, 2s...
-                    sleep_time = 0.5 * (2 ** attempt)
+                    sleep_time = 0.1 * (4 ** attempt)  # 100ms, then 400ms
                     time.sleep(sleep_time)
                     # Try to reconnect
                     try:
@@ -134,6 +162,7 @@ class RedisManager:
 
             if not license_data:
                 logger.warning(f"License key not found: {license_key[:20]}...")
+                self.evict_cached_user_id(license_key)
                 return {
                     'valid': False,
                     'user_id': None,
@@ -162,6 +191,7 @@ class RedisManager:
 
             # Validate license status
             if not is_valid:
+                self.evict_cached_user_id(license_key)
                 return {
                     'valid': False,
                     'user_id': None,
@@ -170,6 +200,7 @@ class RedisManager:
                 }
 
             if status != 'active':
+                self.evict_cached_user_id(license_key)
                 return {
                     'valid': False,
                     'user_id': None,
@@ -178,6 +209,7 @@ class RedisManager:
                 }
 
             if is_expired:
+                self.evict_cached_user_id(license_key)
                 return {
                     'valid': False,
                     'user_id': None,
@@ -189,6 +221,7 @@ class RedisManager:
             # Express backend, so this block has to be enforced here too — otherwise a
             # blocked user keeps burning platform-funded model credits.
             if editor_blocked:
+                self.evict_cached_user_id(license_key)
                 logger.warning(
                     f"Blocked editor access for license: {license_key[:20]}..."
                 )
@@ -213,6 +246,8 @@ class RedisManager:
                     logger.warning(f"Failed to parse customizations: {e}")
 
             user_id = license_data.get('user_id')
+            if user_id:
+                self.set_cached_user_id(license_key, user_id)
 
             logger.info(f"✅ License validated successfully for user: {user_id}")
 
@@ -242,6 +277,7 @@ class RedisManager:
                 'valid': False,
                 'user_id': None,
                 'license': None,
+                'code': 'LICENSE_SERVICE_UNAVAILABLE',
                 'error': 'Database error occurred'
             }
         except Exception as e:
@@ -267,6 +303,7 @@ class RedisManager:
                 - anthropic_api_key (str|None): Decrypted Anthropic key
                 - grok_api_key (str|None): Decrypted Grok key
                 - gemini_api_key (str|None): Decrypted Gemini key
+                - deepseek_api_key (str|None): Decrypted DeepSeek key
                 - assemblyai_api_key (str|None): Decrypted AssemblyAI key
         """
         try:
@@ -283,6 +320,7 @@ class RedisManager:
                     'anthropic_api_key': None,
                     'grok_api_key': None,
                     'gemini_api_key': None,
+                    'deepseek_api_key': None,
                     'assemblyai_api_key': None,
                 }
 
@@ -308,6 +346,7 @@ class RedisManager:
                 'anthropic_api_key': decrypt_key('anthropic_api_key'),
                 'grok_api_key': decrypt_key('grok_api_key'),
                 'gemini_api_key': decrypt_key('gemini_api_key'),
+                'deepseek_api_key': decrypt_key('deepseek_api_key'),
                 'assemblyai_api_key': decrypt_key('assemblyai_api_key'),
             }
 
@@ -323,7 +362,9 @@ class RedisManager:
                 'anthropic_api_key': None,
                 'grok_api_key': None,
                 'gemini_api_key': None,
+                'deepseek_api_key': None,
                 'assemblyai_api_key': None,
+                '_error_code': 'LICENSE_SERVICE_UNAVAILABLE',
             }
         except Exception as e:
             logger.error(f"Unexpected error while fetching API keys: {str(e)}")
@@ -333,47 +374,44 @@ class RedisManager:
                 'anthropic_api_key': None,
                 'grok_api_key': None,
                 'gemini_api_key': None,
+                'deepseek_api_key': None,
                 'assemblyai_api_key': None,
+                '_error_code': 'LICENSE_SERVICE_UNAVAILABLE',
             }
 
-    def get_api_key_for_model(
+    def resolve_api_key_from_user_keys(
         self,
-        user_id: str,
+        user_keys: Optional[Dict[str, Any]],
         model_provider: str,
-        default_keys: Optional[Dict[str, str]] = None
+        default_keys: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         """
-        Get the appropriate API key for a model provider
-        Uses user's key if available, otherwise falls back to default
+        Pure in-memory resolution of API key from already-fetched user_keys dict.
+        Eliminates duplicate Redis lookups when user_keys is already fetched.
 
         Args:
-            user_id: The user ID
+            user_keys: Dict of user keys from get_user_api_keys
             model_provider: Model provider (openai, claude, grok, gemini, deepseek)
             default_keys: Dictionary of default API keys from environment
 
         Returns:
             API key string or None if not found
         """
-        # Get user's API keys
-        user_keys = self.get_user_api_keys(user_id)
-
-        # Map model providers to key names
         key_mapping = {
             'openai': 'openai_api_key',
             'claude': 'anthropic_api_key',
             'grok': 'grok_api_key',
             'gemini': 'gemini_api_key',
-            'deepseek': 'openai_api_key',  # DeepSeek uses OpenAI-compatible API
+            'deepseek': 'deepseek_api_key',
         }
 
         key_field = key_mapping.get(model_provider.lower())
-
         if not key_field:
             logger.warning(f"Unknown model provider: {model_provider}")
             return None
 
         # Use user's key if they have one and use_own_keys is true
-        if user_keys['use_own_keys'] and user_keys.get(key_field):
+        if user_keys and user_keys.get('use_own_keys') and user_keys.get(key_field):
             logger.info(f"Using user's own API key for {model_provider}")
             return user_keys[key_field]
 
