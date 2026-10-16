@@ -65,17 +65,37 @@ AUTOCOMPLETE_MODEL_IDS = {
 DEEPSEEK_TOOL_MODEL_ID = "deepseek-chat"
 
 
+import os
+
 # ============================================
 # IMAGE GENERATION
 # ============================================
 
+# Environment-overridable model IDs so deprecation/rename does not require deployment.
+# Verified on 2026-10-16 via image_smoke_test.py.
 IMAGE_MODEL_IDS = {
-    "openai": "gpt-image-1",
-    "grok": "grok-imagine-image",
-    # Gemini has no GA image model yet; this preview ID is the current one.
-    # Re-check when Google promotes a stable replacement.
-    "gemini": "gemini-3.1-flash-image-preview",
+    "openai": os.getenv("IMAGE_MODEL_OPENAI", "gpt-image-1"),
+    "grok": os.getenv("IMAGE_MODEL_GROK", "grok-imagine-image-2.0"),
+    "gemini": os.getenv("IMAGE_MODEL_GEMINI", "gemini-3.1-flash-image"),
 }
+
+IMAGE_MODEL_FALLBACKS = {
+    "gemini": ["gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"],
+    "grok": ["grok-imagine-image"],
+    "openai": ["gpt-image-1"],
+}
+
+
+def get_image_model_id(provider: str) -> str:
+    """Get the active image generation model ID for a provider."""
+    provider_clean = (provider or "").lower().strip()
+    return IMAGE_MODEL_IDS.get(provider_clean, os.getenv("IMAGE_MODEL_DEFAULT", "gemini-3.1-flash-image"))
+
+
+def get_image_model_fallbacks(provider: str) -> list[str]:
+    """Get fallback model IDs in order of preference."""
+    provider_clean = (provider or "").lower().strip()
+    return list(IMAGE_MODEL_FALLBACKS.get(provider_clean, []))
 
 
 # ============================================

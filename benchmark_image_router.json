@@ -1,0 +1,51 @@
+{
+  "note": "Routing quality on a hand-written corpus. Excludes provider/LLM latency.",
+  "router": {
+    "corpus_size": 126,
+    "true_positives": 57,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "true_negatives": 69,
+    "precision": 1.0,
+    "recall": 1.0,
+    "by_group": {
+      "delta_with_prev": "9/9",
+      "edit_no_image_available": "3/3",
+      "edit_with_ref": "15/15",
+      "followup_no_prev": "7/7",
+      "generate": "26/26",
+      "redo_with_prev": "7/7",
+      "text_followup": "8/8",
+      "text_followup_no_prev": "4/4",
+      "text_payload": "6/6",
+      "text_request": "20/20",
+      "vision_text_no_ref": "9/9",
+      "vision_text_with_ref": "12/12"
+    },
+    "misroutes_to_image": [],
+    "missed_image_requests": [],
+    "legacy_keyword_router": {
+      "image_requests_without_prior_image": 41,
+      "sent_to_a_text_only_agent": 1
+    }
+  },
+  "params": {
+    "cases": 15,
+    "correct": 15,
+    "accuracy": 1.0,
+    "wrong": []
+  },
+  "router_decision_time": {
+    "median_microseconds_per_query": 7.5,
+    "repeats": 20
+  },
+  "image_ops": {
+    "image": "1024x1024 PNG",
+    "sniff_ms": 0.0001,
+    "png_to_jpeg_ms": 2.9,
+    "png_to_jpeg_bytes": 17013,
+    "png_to_webp_ms": 22.6,
+    "png_to_webp_bytes": 1946,
+    "png_bytes": 5338
+  }
+}

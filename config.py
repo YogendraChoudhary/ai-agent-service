@@ -60,9 +60,16 @@ class Settings(BaseSettings):
     max_reservation_per_request: int = Field(100, alias="MAX_RESERVATION_PER_REQUEST")
 
     # ------------------------------------------------------------------
-    # Image handling
+    # Image handling & adapter
     # ------------------------------------------------------------------
     max_reference_images: int = Field(3, alias="MAX_REFERENCE_IMAGES")
+    image_adapter_enabled: bool = Field(True, alias="IMAGE_ADAPTER_ENABLED")
+    image_router_regex_enabled: bool = Field(True, alias="IMAGE_ROUTER_REGEX_ENABLED")
+    image_router_shadow_mode: bool = Field(False, alias="IMAGE_ROUTER_SHADOW_MODE")
+    image_memory_enabled: bool = Field(True, alias="IMAGE_MEMORY_ENABLED")
+    image_default_format: str = Field("jpeg", alias="IMAGE_DEFAULT_FORMAT")
+    image_default_provider_fallback: str = Field("gemini", alias="IMAGE_DEFAULT_PROVIDER_FALLBACK")
+    image_memory_ttl_seconds: int = Field(3600, alias="IMAGE_MEMORY_TTL_SECONDS")
 
     # ------------------------------------------------------------------
     # Encryption

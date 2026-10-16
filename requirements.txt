@@ -35,3 +35,4 @@ beautifulsoup4
 openai
 anthropic
 google-genai          # Google GenAI SDK — used for Gemini autocomplete and image generation
+Pillow                # Image processing, dimension sniffing, and format conversion

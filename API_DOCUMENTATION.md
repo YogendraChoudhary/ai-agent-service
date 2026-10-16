@@ -633,6 +633,73 @@ rateLimitedFixGrammar('Their going to the store.')
 
 ---
 
+## Image Generation & Editing Flow
+
+`/agent/stream` can send simple image requests straight to the image adapter, skipping the agent's LLM turns.
+
+### 1. When a request goes straight to the image adapter
+Only when **all** of these hold:
+- the request `type` is `general` (text operations such as `fix_grammar`, `simplify`, `enhance_with_ai` are never routed to images, because the text they carry can mention images freely);
+- the query *starts* with an image request, e.g. *"draw a mosque at dusk"*, *"please generate an image of a red barn"*, *"remove background from this photo"* (with an attached image);
+- for edits and follow-ups, there is an image to work on: an attached `image_urls[0]`, or the user's previous generated image.
+
+Everything else, including *"write an article with 2 images"*, stays on the agent. Edits and follow-ups with no image available also stay on the agent.
+
+The response is a markdown placeholder `![alt](placeholder::<uuid>)` followed by an `image_ready` / `image_failed` event, the same contract the agent path uses.
+
+Providers: OpenAI, Gemini and Grok use the user's own key. Claude and DeepSeek have no image endpoint, so they use the platform's `DEFAULT_GEMINI_API_KEY`; if that is unset, or the user brings their own keys, the request stays on the agent path instead of failing.
+
+### 2. Settings and how they are chosen
+Precedence: **explicit `image_params` field > words in the prompt > previous image's settings (follow-ups) > default.**
+
+| Setting | Default | Prompt words that change it |
+|---|---|---|
+| `aspect_ratio` | `1:1` | `16:9`, `widescreen`, `banner`, `horizontal`, `in landscape`, `landscape image/photo/format…` → `16:9`; `9:16`, `vertical`, `instagram story`, `reel`, `tiktok`, `in portrait`, `portrait image/photo/format…` → `9:16`; `4:3`, `3:4`, `square` |
+| `quality` | `medium` | `draft`, `low quality` → `low`; `high quality`, `best quality`, `ultra-detailed`, `hq` → `high` |
+| `resolution` | `1K` | `2k`, `high-res` → `2K`; `4k`, `uhd` → `4K` (Gemini only; OpenAI uses fixed sizes, Grok ignores it) |
+| `format` | `jpeg` (`IMAGE_DEFAULT_FORMAT`) | `png`, `webp`, `jpeg`/`jpg`; `transparent background` forces `png` |
+
+Style words an LLM habitually writes ("cinematic", "detailed", "story", "wide-angle") do **not** change settings. Transparent output is requested natively only from OpenAI; Gemini and Grok return an opaque background.
+
+### 3. Request fields
+```json
+{
+  "type": "general",
+  "query": "draw a mosque at dusk",
+  "model": "gemini",
+  "api_key": "<licence key>",
+  "document_id": "doc-123",
+  "image_params": { "aspect_ratio": "16:9", "quality": "high", "format": "webp" }
+}
+```
+- `document_id` (optional, `[A-Za-z0-9_.:-]`, max 128): scopes the "previous image" memory. When sent, follow-ups only ever see images from that document.
+- `image_params` (optional): `aspect_ratio` (`1:1`, `16:9`, `9:16`, `4:3`, `3:4`), `quality` (`low`/`medium`/`high`), `resolution` (`1K`/`2K`/`4K`), `format` (`jpeg`/`png`/`webp`), `transparent_bg` (bool). Invalid keys or values return HTTP 422.
+
+### 4. Server-Sent Events
+`image_ready` carries dimension and format metadata (fields are omitted when the image could not be measured):
+
+```json
+data: {
+  "type": "image_ready",
+  "placeholder_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "url": "https://cdn.example.com/user_1/ai-images/3fa85f64.jpg",
+  "prompt": "draw a mosque at dusk",
+  "width": 1536,
+  "height": 1024,
+  "format": "jpg"
+}
+```
+`format` is the file extension of the stored image (`jpg`, `png`, `webp`).
+
+### 5. Follow-ups (Redis, 1 hour TTL)
+Each successful image is stored per user (and per `document_id` when sent). A follow-up only counts when a stored image exists:
+- **Redo** (*"regenerate"*, *"again"*, *"another version"*): same prompt and settings.
+- **Delta** (*"make it night"*, *"same but in autumn colors"*, *"change the mood to dramatic"*) and **edits of the last image** (*"refine the image with a Taj Mahal vibe"*): previous image sent as the reference, prompt = original prompt + the last 3 modifications, settings inherited unless the new prompt overrides them.
+
+Without a stored image these phrases are handled by the agent as ordinary text. An attached `image_urls[0]` always takes priority over the stored image.
+
+---
+
 ## Environment Variables
 
 For production, store API keys in environment variables:

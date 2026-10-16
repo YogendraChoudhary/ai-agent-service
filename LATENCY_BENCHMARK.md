@@ -246,5 +246,34 @@ Across all three major providers (Gemini, OpenAI, Grok), eliminating reasoning s
 - **Multi-page reading latency slashed by 59.4%** (2.05s $\rightarrow$ 0.83s), reading and converting 3 full articles into structured Markdown tables in under a second.
 - **Failover under search rate limits dropped to 0%**: When data center IP blocks occur, Wikipedia's direct API returns verified extracts with zero degradation.
 
+---
 
+## 🎨 Phase 5: Image Flow – Routing, Params, Format, Memory
 
+*Run date: October 16, 2026 · Python 3.12 · offline evaluation (no provider calls)*
+
+This phase changes routing and request shaping. It was **not** benchmarked end to end: provider and LLM latency need live keys (`scripts/image_smoke_test.py`), so no time-to-image claim is made here. An earlier revision of this section reported a "1,981x faster dispatch"; that compared a hardcoded 2,450 ms baseline against a microsecond regex call and has been removed.
+
+### What changed
+1. **Unified adapter (`src/image_gen.py`)**: env-overridable model IDs with fallback; `ImageParams` with precedence *explicit API field > prompt regex > inherited from previous image > default*; OpenAI gets `size`, `quality` (low/medium/high), `output_format`, `background`; Gemini gets `aspect_ratio` and `image_size`; Grok edits use xAI's JSON `/v1/images/edits` endpoint.
+2. **Regex router (`src/intent.py`)**: runs only for the free-form `general` type. Verbs are anchored to the start of the request; follow-ups and "refine the image" need a stored previous image or an attached one, otherwise the request stays on the agent path.
+3. **Format and size (`src/s3_service.py`)**: content type and extension come from the image bytes; Pillow transcodes when the provider ignored the requested format; `width`, `height`, `format` ride on `image_ready`; unreadable images report no dimensions instead of a guess.
+4. **Memory**: Redis, 1 h TTL, scoped per `document_id` when the client sends one (never falling back to another document), chained edits bounded to the last 3 modifications.
+
+### Router evaluation (`python scripts/benchmark_image_flow.py`)
+Hand-written corpus of 126 labelled queries (`image_intent_eval_cases.py`), including the text requests that earlier revisions misrouted to image generation. Passing it shows those regressions stay fixed; it does not prove real-world accuracy.
+
+| Measure | Result |
+|---|---|
+| False positives (text request routed to image) | **0 / 69** |
+| Missed image requests | **0 / 57** |
+| Parameter extraction (15 labelled prompts) | **15 / 15** |
+| Legacy keyword router: image requests sent to a text-only agent | 1 / 41 |
+| Regex decision time (median) | ~8 µs per query |
+| PNG → JPEG / WebP transcode (1024², synthetic) | ~3 ms / ~24 ms |
+
+Because the legacy router already sent almost all image requests to `smart_global`, the router's benefit is skipping the agent's LLM turns, not rescuing misrouted requests. How much time that saves depends on the model and tool use and should be measured with live keys.
+
+### Not verified
+- Live behaviour of the Grok JSON edit call, Gemini `image_size`, and OpenAI `input_fidelity` / `output_format` (covered only by mocked-SDK tests).
+- Whether the editor swaps the direct route's `![alt](placeholder::id)` the same way as the agent's output.

@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Third-party
@@ -35,6 +35,7 @@ from src.credit_manager import (
     text_credits_scaled,
 )
 from src.redis_manager import get_redis_manager
+from src.image_gen import sanitize_image_params
 from src.text_processing_agent import (
     VISION_CAPABLE_PROVIDERS,
     get_autocomplete_suggestion,
@@ -288,6 +289,20 @@ class StreamRequest(BaseModel):
     secondary_prompt: Optional[str] = ""
     original_prompt: Optional[str] = ""
     image_urls: Optional[List[str]] = None
+    # Scopes the "previous image" memory so a follow-up in one document never picks up
+    # an image generated in another.
+    document_id: Optional[str] = Field(None, max_length=128, pattern=r'^[A-Za-z0-9_.:-]+$')
+    # Explicit image settings; they outrank anything inferred from the prompt text.
+    # Keys: aspect_ratio, quality, resolution, format, transparent_bg.
+    image_params: Optional[Dict[str, Any]] = None
+
+    @field_validator('image_params')
+    @classmethod
+    def validate_image_params(cls, v):
+        try:
+            return sanitize_image_params(v) or None
+        except ValueError as e:
+            raise ValueError(str(e))
 
     @field_validator('type')
     @classmethod
@@ -748,6 +763,11 @@ async def stream_text(
                     image_urls=image_urls,
                     force_agent_type=forced_agent_types.get(agent_type),
                     image_completion_callback=notify_image_completion,
+                    # Only free-form chat may be routed to image generation by regex;
+                    # text operations carry user text that can mention images freely.
+                    image_routing=(agent_type == 'general'),
+                    document_id=request_data.document_id,
+                    image_params=request_data.image_params,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
@@ -815,8 +835,23 @@ async def stream_text(
                             if info["status"] == "done":
                                 resolved.add(pid)
                                 resolved_image_count += 1
-                                logger.info(f"[{request_id}] Image ready: {pid} -> {info['cdn_url']}")
-                                yield f"data: {json.dumps({'type': 'image_ready', 'placeholder_id': pid, 'url': info['cdn_url'], 'prompt': info.get('prompt', '')})}\n\n"
+                                logger.info(
+                                    f"[{request_id}] Image ready: {pid} -> {info['cdn_url']} "
+                                    f"({info.get('width', '?')}x{info.get('height', '?')}, {info.get('format', '?')})"
+                                )
+                                ready_payload = {
+                                    'type': 'image_ready',
+                                    'placeholder_id': pid,
+                                    'url': info['cdn_url'],
+                                    'prompt': info.get('prompt', ''),
+                                }
+                                if info.get('width'):
+                                    ready_payload['width'] = info['width']
+                                if info.get('height'):
+                                    ready_payload['height'] = info['height']
+                                if info.get('format'):
+                                    ready_payload['format'] = info['format']
+                                yield f"data: {json.dumps(ready_payload)}\n\n"
                             elif info["status"] == "failed":
                                 resolved.add(pid)
                                 logger.error(f"[{request_id}] Image failed: {pid} -> {info['error']}")

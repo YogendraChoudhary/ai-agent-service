@@ -886,6 +886,13 @@ def create_parallel_read_tool(reader_tool_fn, request_id: str = None):
 
 
 
+def _merge_image_params(image_ctx, extra=None):
+    """Request-level image params (from the API) merged under any per-call extras."""
+    merged = dict((image_ctx or {}).get("explicit_params") or {})
+    merged.update(extra or {})
+    return merged or None
+
+
 def create_image_tool(
     api_key: str,
     pending_images: dict = None,
@@ -893,6 +900,7 @@ def create_image_tool(
     user_id: str = None,
     credit_manager=None,
     is_byok: bool = False,
+    image_ctx: dict = None,
 ):
     """
     Create an async image generation tool with the provided API key.
@@ -942,33 +950,55 @@ def create_image_tool(
                 "cdn_url": None,
                 "error": None,
                 "prompt": prompt,
+                "width": None,
+                "height": None,
+                "format": None,
             }
 
             def _background_generate():
                 try:
-                    import base64
-                    from openai import OpenAI
-                    from src.s3_service import upload_image_from_bytes
+                    from config import settings
+                    if getattr(settings, "image_adapter_enabled", True):
+                        from src.image_gen import generate_image_unified
+                        res = generate_image_unified(
+                            prompt=prompt,
+                            model_provider="openai",
+                            api_key=api_key,
+                            explicit_params=_merge_image_params(image_ctx, {"size": size} if size else None),
+                            user_id=user_id,
+                            request_id=request_id,
+                            document_id=(image_ctx or {}).get("document_id"),
+                        )
+                        pending_images[placeholder_id]["cdn_url"] = res["cdn_url"]
+                        pending_images[placeholder_id]["width"] = res.get("width")
+                        pending_images[placeholder_id]["height"] = res.get("height")
+                        pending_images[placeholder_id]["format"] = res.get("format")
+                        pending_images[placeholder_id]["status"] = "done"
+                        logger.info(f"{log_prefix}Background unified image complete: {res['cdn_url']}")
+                    else:
+                        import base64
+                        from openai import OpenAI
+                        from src.s3_service import upload_image_from_bytes
 
-                    logger.info(f"{log_prefix}Background image generation started for placeholder {placeholder_id}")
+                        logger.info(f"{log_prefix}Background image generation started for placeholder {placeholder_id}")
 
-                    client = OpenAI(api_key=api_key)
-                    response = client.images.generate(
-                        model=IMAGE_MODEL_IDS["openai"],
-                        prompt=prompt,
-                        size=size,
-                        quality="auto",
-                        n=1,
-                    )
+                        client = OpenAI(api_key=api_key)
+                        response = client.images.generate(
+                            model=IMAGE_MODEL_IDS["openai"],
+                            prompt=prompt,
+                            size=size,
+                            quality="auto",
+                            n=1,
+                        )
 
-                    image_bytes = base64.b64decode(response.data[0].b64_json)
-                    logger.info(f"{log_prefix}GPT Image generated, uploading to S3...")
+                        image_bytes = base64.b64decode(response.data[0].b64_json)
+                        logger.info(f"{log_prefix}GPT Image generated, uploading to S3...")
 
-                    cdn_url = upload_image_from_bytes(image_bytes, content_type="image/png", user_id=user_id, request_id=request_id)
+                        cdn_url = upload_image_from_bytes(image_bytes, content_type="image/png", user_id=user_id, request_id=request_id)
 
-                    pending_images[placeholder_id]["cdn_url"] = cdn_url
-                    pending_images[placeholder_id]["status"] = "done"
-                    logger.info(f"{log_prefix}Background image complete: {cdn_url}")
+                        pending_images[placeholder_id]["cdn_url"] = cdn_url
+                        pending_images[placeholder_id]["status"] = "done"
+                        logger.info(f"{log_prefix}Background image complete: {cdn_url}")
 
                 except Exception as e:
                     logger.error(f"{log_prefix}Background image generation failed: {str(e)}")
@@ -995,6 +1025,7 @@ def create_grok_image_tool(
     user_id: str = None,
     credit_manager=None,
     is_byok: bool = False,
+    image_ctx: dict = None,
 ):
     """
     Create an async image generation tool using xAI's Grok (Aurora) model.
@@ -1031,33 +1062,55 @@ def create_grok_image_tool(
                 "cdn_url": None,
                 "error": None,
                 "prompt": prompt,
+                "width": None,
+                "height": None,
+                "format": None,
             }
 
             def _background_generate():
                 try:
-                    from openai import OpenAI
-                    from src.s3_service import upload_image_from_url
+                    from config import settings
+                    if getattr(settings, "image_adapter_enabled", True):
+                        from src.image_gen import generate_image_unified
+                        res = generate_image_unified(
+                            prompt=prompt,
+                            model_provider="grok",
+                            api_key=api_key,
+                            explicit_params=_merge_image_params(image_ctx),
+                            user_id=user_id,
+                            request_id=request_id,
+                            document_id=(image_ctx or {}).get("document_id"),
+                        )
+                        pending_images[placeholder_id]["cdn_url"] = res["cdn_url"]
+                        pending_images[placeholder_id]["width"] = res.get("width")
+                        pending_images[placeholder_id]["height"] = res.get("height")
+                        pending_images[placeholder_id]["format"] = res.get("format")
+                        pending_images[placeholder_id]["status"] = "done"
+                        logger.info(f"{log_prefix}Background unified Grok image complete: {res['cdn_url']}")
+                    else:
+                        from openai import OpenAI
+                        from src.s3_service import upload_image_from_url
 
-                    logger.info(f"{log_prefix}Background Grok image generation started for placeholder {placeholder_id}")
+                        logger.info(f"{log_prefix}Background Grok image generation started for placeholder {placeholder_id}")
 
-                    client = OpenAI(
-                        base_url="https://api.x.ai/v1",
-                        api_key=api_key,
-                    )
-                    response = client.images.generate(
-                        model=IMAGE_MODEL_IDS["grok"],
-                        prompt=prompt,
-                        n=1,
-                    )
+                        client = OpenAI(
+                            base_url="https://api.x.ai/v1",
+                            api_key=api_key,
+                        )
+                        response = client.images.generate(
+                            model=IMAGE_MODEL_IDS["grok"],
+                            prompt=prompt,
+                            n=1,
+                        )
 
-                    grok_url = response.data[0].url
-                    logger.info(f"{log_prefix}Grok image generated, uploading to S3...")
+                        grok_url = response.data[0].url
+                        logger.info(f"{log_prefix}Grok image generated, uploading to S3...")
 
-                    cdn_url = upload_image_from_url(grok_url, user_id=user_id, request_id=request_id)
+                        cdn_url = upload_image_from_url(grok_url, user_id=user_id, request_id=request_id)
 
-                    pending_images[placeholder_id]["cdn_url"] = cdn_url
-                    pending_images[placeholder_id]["status"] = "done"
-                    logger.info(f"{log_prefix}Background Grok image complete: {cdn_url}")
+                        pending_images[placeholder_id]["cdn_url"] = cdn_url
+                        pending_images[placeholder_id]["status"] = "done"
+                        logger.info(f"{log_prefix}Background Grok image complete: {cdn_url}")
 
                 except Exception as e:
                     logger.error(f"{log_prefix}Background Grok image generation failed: {str(e)}")
@@ -1084,6 +1137,7 @@ def create_gemini_image_tool(
     user_id: str = None,
     credit_manager=None,
     is_byok: bool = False,
+    image_ctx: dict = None,
 ):
     """
     Create an async image generation tool using Google Gemini's native image generation.
@@ -1120,56 +1174,78 @@ def create_gemini_image_tool(
                 "cdn_url": None,
                 "error": None,
                 "prompt": prompt,
+                "width": None,
+                "height": None,
+                "format": None,
             }
 
             def _background_generate():
                 try:
-                    from google import genai
-                    from google.genai import types
-                    from src.s3_service import upload_image_from_bytes
+                    from config import settings
+                    if getattr(settings, "image_adapter_enabled", True):
+                        from src.image_gen import generate_image_unified
+                        res = generate_image_unified(
+                            prompt=prompt,
+                            model_provider="gemini",
+                            api_key=api_key,
+                            explicit_params=_merge_image_params(image_ctx),
+                            user_id=user_id,
+                            request_id=request_id,
+                            document_id=(image_ctx or {}).get("document_id"),
+                        )
+                        pending_images[placeholder_id]["cdn_url"] = res["cdn_url"]
+                        pending_images[placeholder_id]["width"] = res.get("width")
+                        pending_images[placeholder_id]["height"] = res.get("height")
+                        pending_images[placeholder_id]["format"] = res.get("format")
+                        pending_images[placeholder_id]["status"] = "done"
+                        logger.info(f"{log_prefix}Background unified Gemini image complete: {res['cdn_url']}")
+                    else:
+                        from google import genai
+                        from google.genai import types
+                        from src.s3_service import upload_image_from_bytes
 
-                    logger.info(f"{log_prefix}Background Gemini image generation started for placeholder {placeholder_id}")
+                        logger.info(f"{log_prefix}Background Gemini image generation started for placeholder {placeholder_id}")
 
-                    client = genai.Client(api_key=api_key)
-                    response = client.models.generate_content(
-                        model=IMAGE_MODEL_IDS["gemini"],
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_modalities=["IMAGE"],
-                        ),
-                    )
+                        client = genai.Client(api_key=api_key)
+                        response = client.models.generate_content(
+                            model=IMAGE_MODEL_IDS["gemini"],
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                response_modalities=["IMAGE"],
+                            ),
+                        )
 
-                    # Validate response structure
-                    if not response.candidates:
-                        block_reason = getattr(response, 'prompt_feedback', None)
-                        raise Exception(f"Gemini image generation blocked by safety filters: {block_reason}")
+                        # Validate response structure
+                        if not response.candidates:
+                            block_reason = getattr(response, 'prompt_feedback', None)
+                            raise Exception(f"Gemini image generation blocked by safety filters: {block_reason}")
 
-                    candidate = response.candidates[0]
-                    if not candidate.content or not candidate.content.parts:
-                        finish_reason = getattr(candidate, 'finish_reason', 'unknown')
-                        raise Exception(f"Gemini returned no image data (finish_reason: {finish_reason}). The prompt may have been blocked by safety filters.")
+                        candidate = response.candidates[0]
+                        if not candidate.content or not candidate.content.parts:
+                            finish_reason = getattr(candidate, 'finish_reason', 'unknown')
+                            raise Exception(f"Gemini returned no image data (finish_reason: {finish_reason}). The prompt may have been blocked by safety filters.")
 
-                    # Extract image bytes from response parts
-                    image_uploaded = False
-                    for part in candidate.content.parts:
-                        if part.inline_data:
-                            image_bytes = part.inline_data.data
-                            mime_type = part.inline_data.mime_type or "image/png"
-                            logger.info(f"{log_prefix}Gemini image generated ({mime_type}), uploading to S3...")
+                        # Extract image bytes from response parts
+                        image_uploaded = False
+                        for part in candidate.content.parts:
+                            if part.inline_data:
+                                image_bytes = part.inline_data.data
+                                mime_type = part.inline_data.mime_type or "image/png"
+                                logger.info(f"{log_prefix}Gemini image generated ({mime_type}), uploading to S3...")
 
-                            cdn_url = upload_image_from_bytes(
-                                image_bytes, content_type=mime_type,
-                                user_id=user_id, request_id=request_id,
-                            )
+                                cdn_url = upload_image_from_bytes(
+                                    image_bytes, content_type=mime_type,
+                                    user_id=user_id, request_id=request_id,
+                                )
 
-                            pending_images[placeholder_id]["cdn_url"] = cdn_url
-                            pending_images[placeholder_id]["status"] = "done"
-                            logger.info(f"{log_prefix}Background Gemini image complete: {cdn_url}")
-                            image_uploaded = True
-                            break
+                                pending_images[placeholder_id]["cdn_url"] = cdn_url
+                                pending_images[placeholder_id]["status"] = "done"
+                                logger.info(f"{log_prefix}Background Gemini image complete: {cdn_url}")
+                                image_uploaded = True
+                                break
 
-                    if not image_uploaded:
-                        raise Exception("Gemini response did not contain image data")
+                        if not image_uploaded:
+                            raise Exception("Gemini response did not contain image data")
 
                 except Exception as e:
                     logger.error(f"{log_prefix}Background Gemini image generation failed: {str(e)}")
@@ -1232,7 +1308,12 @@ def create_multi_image_tool(single_image_tool_fn, request_id: str = None):
 
         def _gen_single(idx: int, p: str):
             try:
-                res = single_image_tool_fn(p)
+                import inspect
+                sig = inspect.signature(single_image_tool_fn)
+                if "size" in sig.parameters:
+                    res = single_image_tool_fn(p, size=size)
+                else:
+                    res = single_image_tool_fn(p)
                 return idx, p, res
             except Exception as e:
                 logger.error(f"{log_prefix}Failed to trigger image for '{p[:30]}': {e}")
@@ -1625,6 +1706,7 @@ def create_agent(
     user_id: str = None,
     credit_manager=None,
     is_byok: bool = False,
+    image_ctx: dict = None,
 ):
     """
     Factory function to create an agent with the specified model.
@@ -1716,6 +1798,7 @@ def create_agent(
             img_tool = create_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
+                image_ctx=image_ctx,
             )
             multi_img_tool = create_multi_image_tool(img_tool, request_id)
             tools = [img_tool, multi_img_tool] + research_tools
@@ -1724,6 +1807,7 @@ def create_agent(
             img_tool = create_grok_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
+                image_ctx=image_ctx,
             )
             multi_img_tool = create_multi_image_tool(img_tool, request_id)
             tools = [img_tool, multi_img_tool] + research_tools
@@ -1732,6 +1816,7 @@ def create_agent(
             img_tool = create_gemini_image_tool(
                 api_key, pending_images, request_id, user_id,
                 credit_manager=credit_manager, is_byok=is_byok,
+                image_ctx=image_ctx,
             )
             multi_img_tool = create_multi_image_tool(img_tool, request_id)
             tools = [img_tool, multi_img_tool] + research_tools
@@ -1776,11 +1861,11 @@ def determine_agent_type(query_lower: str) -> tuple[str, str]:
         return "summarize", "detected summarization keywords"
     elif "change tone" in query_lower or "change_tone" in query_lower:
         return "tone", "detected tone change keywords"
-    elif "make longer" in query_lower or "expand" in query_lower or "elaborate" in query_lower:
+    elif ("make longer" in query_lower or "expand" in query_lower or "elaborate" in query_lower) and "image" not in query_lower and "canvas" not in query_lower and "photo" not in query_lower:
         return "make_longer", "detected 'make longer' keywords"
     elif "make shorter" in query_lower or "condense" in query_lower or "shorten" in query_lower:
         return "make_shorter", "detected 'make shorter' keywords"
-    elif "enhance" in query_lower or "improve" in query_lower or "polish" in query_lower:
+    elif ("enhance" in query_lower or "improve" in query_lower or "polish" in query_lower) and "image" not in query_lower and "picture" not in query_lower and "photo" not in query_lower and "illustration" not in query_lower:
         return "enhance", "detected enhancement keywords"
     else:
         return "smart_global", "no specific keywords matched, using smart global agent"
@@ -1789,6 +1874,53 @@ def determine_agent_type(query_lower: str) -> tuple[str, str]:
 # ============================================
 # GLOBAL QUERY PROCESSING FUNCTION
 # ============================================
+
+_MAX_REFERENCE_BYTES = 15 * 1024 * 1024
+
+
+def _fetch_reference_bytes(url: str, request_id: str = None) -> bytes:
+    """Download a reference image (CDN-hosted, validated upstream) with a size cap."""
+    import requests
+
+    r = requests.get(url, timeout=15, stream=True)
+    r.raise_for_status()
+    chunks, total = [], 0
+    for chunk in r.iter_content(chunk_size=64 * 1024):
+        total += len(chunk)
+        if total > _MAX_REFERENCE_BYTES:
+            raise ValueError("Reference image is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _classify_image_request(
+    query: str,
+    has_reference: bool,
+    user_id: str = None,
+    document_id: str = None,
+    request_id: str = None,
+):
+    """
+    Regex intent, plus a single Redis lookup only when the phrasing needs a previous image
+    ("make it night", "refine the image") and the user attached none.
+    Returns (intent, previous_context_or_None).
+    """
+    from src.intent import detect_image_intent
+
+    intent = detect_image_intent(query, has_reference=has_reference, request_id=request_id)
+    prev_ctx = None
+    if intent["requires_context"] and not has_reference and user_id:
+        from src.image_gen import get_previous_image_context
+
+        prev_ctx = get_previous_image_context(user_id, document_id, request_id)
+        if prev_ctx:
+            intent = detect_image_intent(
+                query, has_reference=False, has_previous_image=True, request_id=request_id
+            )
+        else:
+            prev_ctx = None
+    return intent, prev_ctx
+
 
 def process_user_query_stream(
     query: str,
@@ -1801,6 +1933,9 @@ def process_user_query_stream(
     image_urls=None,
     force_agent_type: str = None,
     image_completion_callback=None,
+    image_routing: bool = False,
+    document_id: str = None,
+    image_params: dict = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -1821,6 +1956,11 @@ def process_user_query_stream(
             Used by callers that already know the intent (e.g. the email
             template flow), where sniffing the query text would be unreliable.
         image_completion_callback: Thread-safe callback invoked when an image finishes.
+        image_routing: Allow the regex image router to send this request straight to the
+            image adapter. Only the free-form "general" chat may set this: text operations
+            (fix grammar, simplify, ...) carry user text that can mention images freely.
+        document_id: Optional editor document id; scopes the "previous image" memory.
+        image_params: Validated explicit image parameters from the API (highest precedence).
 
     Yields:
         Markdown content chunks as they are generated
@@ -1831,14 +1971,135 @@ def process_user_query_stream(
         logger.error(f"{log_prefix}API key is required but not provided")
         raise ValueError("API key is required")
 
-    query_lower = query.lower()
+    from config import settings
 
+    query_lower = query.lower()
+    legacy_agent_type, legacy_reason = determine_agent_type(query_lower)
+    image_ctx = {"document_id": document_id, "explicit_params": image_params}
+
+    # Regex image routing (general chat only)
+    image_intent, prev_ctx = None, None
+    if image_routing and not force_agent_type and getattr(settings, "image_router_regex_enabled", True):
+        image_intent, prev_ctx = _classify_image_request(
+            query, bool(image_urls), user_id, document_id, request_id
+        )
+        if getattr(settings, "image_router_shadow_mode", False):
+            logger.info(
+                f"{log_prefix}[ROUTER SHADOW] Regex intent: {image_intent['kind']} "
+                f"(rule: {image_intent['rule']}) vs Legacy agent: {legacy_agent_type} ({legacy_reason})"
+            )
+
+    from src.image_gen import image_route_available
+
+    is_direct_image = (
+        image_intent is not None
+        and image_intent["kind"] in ("generate", "edit")
+        and image_route_available(model_provider, api_key, is_byok)
+    )
+
+    if is_direct_image:
+        logger.info(
+            f"{log_prefix}Direct Image Route activated via rule: {image_intent['rule']} "
+            f"(intent: {image_intent['kind']})"
+        )
+
+        # Credit gate (skipped for BYOK users)
+        if credit_manager is not None and not is_byok and user_id:
+            from src.credit_manager import IMAGE_CREDITS_SCALED
+            ok, _ = credit_manager.reserve(user_id, IMAGE_CREDITS_SCALED)
+            if not ok:
+                logger.warning(f"{log_prefix}Direct image generation skipped — insufficient credits (user={user_id})")
+                yield "Image generation skipped: insufficient credits"
+                return
+
+        # Prompt, inherited params and reference image for follow-ups
+        final_prompt = query
+        base_prompt, modifications, inherited = None, None, None
+        mode = image_intent.get("followup_mode") or ("delta" if image_intent.get("uses_previous_image") else None)
+        if prev_ctx and mode:
+            from src.image_gen import compose_followup_prompt
+            final_prompt, base_prompt, modifications = compose_followup_prompt(prev_ctx, query, mode)
+            inherited = prev_ctx.get("params")
+            logger.info(f"{log_prefix}Follow-up ({mode}): reusing previous prompt context")
+
+        reference_url = None
+        if image_urls:
+            reference_url = image_urls[0]
+        elif prev_ctx and image_intent.get("uses_previous_image") and prev_ctx.get("cdn_url"):
+            reference_url = prev_ctx["cdn_url"]
+        reference_required = image_intent["kind"] == "edit"
+
+        placeholder_id = str(uuid.uuid4())
+        pending_images = {
+            placeholder_id: {
+                "status": "generating",
+                "cdn_url": None,
+                "error": None,
+                "prompt": final_prompt,
+                "width": None,
+                "height": None,
+                "format": None,
+            },
+            "__completion_callback__": image_completion_callback,
+        }
+
+        def _direct_bg_generate():
+            try:
+                from src.image_gen import generate_image_unified
+
+                ref_bytes = None
+                if reference_url:
+                    try:
+                        ref_bytes = _fetch_reference_bytes(reference_url, request_id)
+                    except Exception as fetch_err:
+                        if reference_required:
+                            raise ValueError(f"Could not load the reference image: {fetch_err}") from fetch_err
+                        logger.warning(f"{log_prefix}Reference image unavailable, generating without it: {fetch_err}")
+
+                res = generate_image_unified(
+                    prompt=final_prompt,
+                    model_provider=model_provider,
+                    api_key=api_key,
+                    explicit_params=image_params,
+                    reference_image_bytes=ref_bytes,
+                    user_id=user_id,
+                    request_id=request_id,
+                    document_id=document_id,
+                    inherited_params=inherited,
+                    context_extra={"base_prompt": base_prompt, "modifications": modifications},
+                    is_byok=is_byok,
+                )
+                entry = pending_images[placeholder_id]
+                entry["cdn_url"] = res["cdn_url"]
+                entry["width"] = res.get("width")
+                entry["height"] = res.get("height")
+                entry["format"] = res.get("format")
+                entry["status"] = "done"
+                logger.info(f"{log_prefix}Direct image generation complete: {res['cdn_url']}")
+            except Exception as err:
+                logger.error(f"{log_prefix}Direct image generation failed: {err}")
+                pending_images[placeholder_id]["error"] = str(err)
+                pending_images[placeholder_id]["status"] = "failed"
+            finally:
+                notify = pending_images.get("__completion_callback__")
+                if notify:
+                    notify()
+
+        threading.Thread(target=_direct_bg_generate, daemon=True).start()
+
+        # Same markdown contract the agent path uses, so the editor swaps it on image_ready.
+        alt = re.sub(r"[\[\]()\r\n]+", " ", final_prompt).strip()[:80] or "Generated image"
+        yield f"![{alt}](placeholder::{placeholder_id})"
+        yield {"__pending_images__": pending_images}
+        return
+
+    # Standard agent routing path
     if force_agent_type:
         if force_agent_type not in AGENT_CONFIGS:
             raise ValueError(f"Unknown agent type: {force_agent_type}")
         agent_type, reason = force_agent_type, "explicitly requested by caller"
     else:
-        agent_type, reason = determine_agent_type(query_lower)
+        agent_type, reason = legacy_agent_type, legacy_reason
     logger.info(f"{log_prefix}Query routing: {reason} -> {agent_type} agent")
 
     # Reference images are vision input. Silently dropping them on a text-only
@@ -1860,6 +2121,7 @@ def process_user_query_stream(
             agent_type, model_provider, api_key, request_id,
             pending_images=pending_images, user_id=user_id,
             credit_manager=credit_manager, is_byok=is_byok,
+            image_ctx=image_ctx,
         )
         start_time = time.time()
 
