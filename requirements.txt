@@ -33,6 +33,6 @@ beautifulsoup4
 # NOTE: agno reaches Grok (xAI) and DeepSeek through the openai client, so no
 # separate `xai`/`deepseek` packages are needed.
 openai
-anthropic
+anthropic<1.0  # 1.x removed `temperature` from Messages.stream(), which agno 2.8.5 sends: every Claude call fails
 google-genai          # Google GenAI SDK — used for Gemini autocomplete and image generation
 Pillow                # Image processing, dimension sniffing, and format conversion

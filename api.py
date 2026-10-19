@@ -38,10 +38,20 @@ from src.redis_manager import get_redis_manager
 from src.image_gen import sanitize_image_params
 from src.text_processing_agent import (
     VISION_CAPABLE_PROVIDERS,
+    agent_for_request_type,
     get_autocomplete_suggestion,
     process_user_query,
+    process_user_query_with_images,
     process_user_query_stream,
     supports_vision,
+)
+from src.observability import (
+    finish_trace,
+    log_request_body,
+    log_response_body,
+    start_trace,
+    summarize_images,
+    trace_mark,
 )
 from src.webhook import (
     fire_credit_deduction,
@@ -225,9 +235,12 @@ app.add_middleware(
 async def add_request_id_header(request: Request, call_next):
     """Ensure every response carries an X-Request-ID header."""
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
+    t0 = time.perf_counter()
     response = await call_next(request)
     if "X-Request-ID" not in response.headers:
         response.headers["X-Request-ID"] = request_id
+    # For streams this is time until the response headers are ready (time-to-first-byte), not the whole stream.
+    response.headers["X-Response-Time-Ms"] = str(int((time.perf_counter() - t0) * 1000))
     return response
 
 
@@ -417,6 +430,60 @@ TYPE_PREFIX_MAP: dict[str, str] = {
 }
 
 
+def image_billing(pending_images: Optional[dict]) -> tuple[int, list]:
+    """
+    (credits reserved for ALL images started, details of the images that finished).
+    Every reservation is released at settlement, so a failed image no longer holds credits until the
+    reservation key expires. details = [{"provider", "model", "credits_scaled"}] for the webhook.
+    """
+    entries = [v for k, v in (pending_images or {}).items() if not str(k).startswith("__") and isinstance(v, dict)]
+    reserved = sum(int(e.get("reserved_scaled") or 0) for e in entries)
+    done = [
+        {"provider": e.get("provider"), "model": e.get("model"), "credits_scaled": int(e.get("credits_scaled") or 0)}
+        for e in entries if e.get("status") == "done"
+    ]
+    return reserved, done
+
+
+def billed_provider_model(model_provider: str, op_type: str, details: list) -> tuple[str, Optional[str]]:
+    """Image-only requests are attributed to the image model that ran, not the (unused) chat model."""
+    if op_type == 'image' and details and len({(d["provider"], d["model"]) for d in details}) == 1:
+        return details[0]["provider"] or model_provider, details[0]["model"]
+    return model_provider, None
+
+
+def resolve_request_image_params(request_data, agent_type: str, model_provider: str, license_meta: dict, is_byok: bool):
+    """
+    Image params for a request, identical on /agent/stream and /agent/process:
+    explicit API fields win; otherwise a model named in the user's own words ("using grok", regex only,
+    never the LLM); and the matching user key is looked up when that provider is not the chat provider.
+    """
+    merged = dict(request_data.image_params or {})
+    if request_data.image_provider:
+        merged["provider"] = request_data.image_provider
+    if request_data.image_model:
+        merged["model"] = request_data.image_model
+
+    if agent_type == 'general' and not merged.get("provider"):
+        from src.image_gen import detect_image_model_request
+        cue_provider, cue_model = detect_image_model_request(request_data.query)
+        if cue_provider:
+            merged["provider"] = cue_provider
+            if cue_model and not merged.get("model"):
+                merged["model"] = cue_model
+
+    target = merged.get("provider")
+    if target and target != model_provider and "api_key" not in merged:
+        resolved_key = redis_manager.resolve_api_key_from_user_keys(
+            user_keys=license_meta.get("user_keys"),
+            model_provider=target,
+            default_keys=None if is_byok else DEFAULT_API_KEYS,
+        )
+        if resolved_key:
+            merged["api_key"] = resolved_key
+    return merged
+
+
 def build_full_query(agent_type: str, user_query: str, secondary_prompt: str) -> str:
     """Build the full prompt string sent to the AI model."""
     if agent_type == 'enhance_with_ai' and secondary_prompt:
@@ -587,6 +654,11 @@ async def process_text(
     """
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
+    start_trace(
+        request_id, '/agent/process', type=request_data.type, chat_model=request_data.model,
+        query_chars=len(request_data.query),
+    )
+    log_request_body(request_id, '/agent/process', request_data.model_dump())
 
     logger.info(f"[{request_id}] ========== NEW REQUEST ==========")
 
@@ -608,29 +680,58 @@ async def process_text(
         api_key, license_meta = await async_validate_and_get_api_key(
             license_key, model_provider, request_id, background_tasks,
         )
+        trace_mark(request_id, 'auth_done', user=license_meta['user_id'])
 
         full_query = build_full_query(
             agent_type, request_data.query, request_data.secondary_prompt or ""
         )
 
-        forced_agent_types = {
-            'generate_email_template': 'email_template',
-            'extract_image_text':      'text_extraction',
-        }
-
         logger.info(f"[{request_id}] Processing: agent={agent_type}, model={model_provider}")
 
+        user_id = license_meta['user_id']
+        is_byok = license_meta['requires_user_api_keys']
+        merged_image_params = resolve_request_image_params(
+            request_data, agent_type, model_provider, license_meta, is_byok
+        )
+
         ai_start = time.time()
-        response = await run_in_threadpool(
-            process_user_query,
+        # Same routing, planner, direct image route and model selection as /agent/stream; images are
+        # awaited and their URLs written into the text, so there are never dead placeholders.
+        response, pending_images = await run_in_threadpool(
+            process_user_query_with_images,
             full_query,
             model_provider=model_provider,
             api_key=api_key,
             request_id=request_id,
-            force_agent_type=forced_agent_types.get(agent_type),
-            is_byok=license_meta['requires_user_api_keys'],
+            force_agent_type=agent_for_request_type(agent_type),
+            is_byok=is_byok,
+            user_id=user_id,
+            credit_manager=credit_manager if CREDIT_PRECHECK_ENABLED else None,
+            image_routing=(agent_type == 'general'),
+            image_params=merged_image_params or None,
         )
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
+        trace_mark(request_id, 'pipeline_done')
+
+        # Images are the only thing this endpoint meters (text is not metered here, as before).
+        image_reserved_scaled, image_details = image_billing(pending_images)
+        if not is_byok and (image_details or image_reserved_scaled):
+            bill_provider, bill_model = billed_provider_model(model_provider, 'image', image_details)
+            duration_ms = int((time.time() - start_time) * 1000)
+            if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
+                fire_credit_deduction_and_release(
+                    user_id=user_id, input_chars=0, output_chars=0, operation_type='image',
+                    image_count=len(image_details), reserved_scaled=image_reserved_scaled,
+                    credit_manager=credit_manager, settle_delay_seconds=CREDIT_SETTLE_DELAY_SECONDS,
+                    provider=bill_provider, model=bill_model, duration_ms=duration_ms,
+                    success=True, images=image_details,
+                )
+            elif image_details:
+                fire_credit_deduction(
+                    user_id, 0, 0, 'image', len(image_details),
+                    provider=bill_provider, model=bill_model, duration_ms=duration_ms,
+                    success=True, images=image_details,
+                )
 
         # Strip markdown code-fence wrappers the model sometimes emits
         if response.startswith('```markdown\n'):
@@ -645,6 +746,8 @@ async def process_text(
         total_duration = time.time() - start_time
         logger.info(f"[{request_id}] SUCCESS — {total_duration:.2f}s")
         logger.info(f"[{request_id}] ================================")
+        log_response_body(request_id, '/agent/process', {'markdown_response': response, 'images': summarize_images(pending_images)})
+        finish_trace(request_id, 'ok', images=summarize_images(pending_images), http_status=200)
 
         return JSONResponse(
             status_code=200,
@@ -656,9 +759,11 @@ async def process_text(
             headers={"X-Request-ID": request_id},
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        finish_trace(request_id, 'rejected', error=str(exc.detail), http_status=exc.status_code)
         raise  # let FastAPI's exception handler format the response
     except Exception as e:
+        finish_trace(request_id, 'error', error=str(e), http_status=500)
         total_duration = time.time() - start_time
         logger.error(f"[{request_id}] FAILED — {e} ({total_duration:.2f}s)")
         logger.info(f"[{request_id}] ================================")
@@ -682,6 +787,11 @@ async def stream_text(
     """
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
+    start_trace(
+        request_id, '/agent/stream', type=request_data.type, chat_model=request_data.model,
+        query_chars=len(request_data.query),
+    )
+    log_request_body(request_id, '/agent/stream', request_data.model_dump())
 
     logger.info(f"[{request_id}] ========== NEW STREAM REQUEST ==========")
 
@@ -703,6 +813,7 @@ async def stream_text(
         api_key, license_meta = await async_validate_and_get_api_key(
             license_key, model_provider, request_id, background_tasks,
         )
+        trace_mark(request_id, 'auth_done', user=license_meta['user_id'])
 
         user_id = license_meta['user_id']
         is_byok = license_meta['requires_user_api_keys']
@@ -723,11 +834,6 @@ async def stream_text(
                 },
             )
 
-        forced_agent_types = {
-            'generate_email_template': 'email_template',
-            'extract_image_text':      'text_extraction',
-        }
-
         full_query = build_full_query(
             agent_type, request_data.query, request_data.secondary_prompt or ""
         )
@@ -745,6 +851,7 @@ async def stream_text(
                     f"[{request_id}] Insufficient credits: "
                     f"needed={upfront_reserved_scaled} available={available_scaled}"
                 )
+                finish_trace(request_id, 'rejected', error='insufficient credits', http_status=402)
                 return JSONResponse(
                     status_code=402,
                     content={
@@ -775,39 +882,18 @@ async def stream_text(
                 except RuntimeError:
                     pass
 
+            trace_status = 'ok'
+            trace_error = None
+            out_preview: list[str] = []
+            out_preview_len = 0
             try:
                 yield f"data: {json.dumps({'type': 'start', 'request_id': request_id})}\n\n"
 
                 next_reserve_threshold = (upfront_reserved_scaled // CREDIT_SCALE) * 1000
 
-                # Merge top-level image_provider and image_model into image_params if given
-                merged_image_params = dict(request_data.image_params or {})
-                if request_data.image_provider:
-                    merged_image_params["provider"] = request_data.image_provider
-                if request_data.image_model:
-                    merged_image_params["model"] = request_data.image_model
-
-                # Model named in the user's own words ("using grok"): regex only, never the LLM.
-                # An explicit API field wins. Resolved here so the matching user key is looked up.
-                if agent_type == 'general' and not merged_image_params.get("provider"):
-                    from src.image_gen import detect_image_model_request
-                    cue_provider, cue_model = detect_image_model_request(request_data.query)
-                    if cue_provider:
-                        merged_image_params["provider"] = cue_provider
-                        if cue_model and not merged_image_params.get("model"):
-                            merged_image_params["model"] = cue_model
-
-                # Resolve provider-specific API key if image provider differs from chat model
-                target_img_provider = merged_image_params.get("provider")
-                if target_img_provider and target_img_provider != model_provider and "api_key" not in merged_image_params:
-                    user_keys = license_meta.get("user_keys")
-                    resolved_img_key = redis_manager.resolve_api_key_from_user_keys(
-                        user_keys=user_keys,
-                        model_provider=target_img_provider,
-                        default_keys=None if is_byok else DEFAULT_API_KEYS,
-                    )
-                    if resolved_img_key:
-                        merged_image_params["api_key"] = resolved_img_key
+                merged_image_params = resolve_request_image_params(
+                    request_data, agent_type, model_provider, license_meta, is_byok
+                )
 
                 async for chunk in iterate_in_threadpool(process_user_query_stream(
                     full_query,
@@ -818,7 +904,7 @@ async def stream_text(
                     credit_manager=credit_manager if CREDIT_PRECHECK_ENABLED else None,
                     is_byok=is_byok,
                     image_urls=image_urls,
-                    force_agent_type=forced_agent_types.get(agent_type),
+                    force_agent_type=agent_for_request_type(agent_type),
                     image_completion_callback=notify_image_completion,
                     # Only free-form chat may be routed to image generation by regex;
                     # text operations carry user text that can mention images freely.
@@ -838,7 +924,12 @@ async def stream_text(
                         pending_images = chunk["__pending_images__"]
                         continue
 
+                    if output_chars == 0 and chunk:
+                        trace_mark(request_id, 'first_token')
                     output_chars += len(chunk)
+                    if out_preview_len < 20000:
+                        out_preview.append(chunk)
+                        out_preview_len += len(chunk)
 
                     # Per-1000-char incremental reservation (non-BYOK only)
                     if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
@@ -861,6 +952,8 @@ async def stream_text(
                             break
 
                     yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+
+                trace_mark(request_id, 'text_done')
 
                 # Done event
                 total_duration = time.time() - start_time
@@ -939,15 +1032,18 @@ async def stream_text(
                             logger.error(f"[{request_id}] Image timed out: {pid}")
                             yield f"data: {json.dumps({'type': 'image_failed', 'placeholder_id': pid, 'error': 'Image generation timed out'})}\n\n"
 
+                    trace_mark(request_id, 'images_done')
                     yield f"data: {json.dumps({'type': 'stream_end'})}\n\n"
 
             except Exception as e:
                 had_error = True
+                trace_status, trace_error = 'error', str(e)
                 error_code = type(e).__name__
                 logger.error(f"[{request_id}] STREAM FAILED — {e}")
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
             except GeneratorExit:
+                trace_status = 'aborted'
                 unregister_cancellation_event(request_id)
                 logger.info(
                     f"[{request_id}] Generator closed by client disconnect "
@@ -957,6 +1053,14 @@ async def stream_text(
             finally:
                 unregister_cancellation_event(request_id)
                 duration_ms = int((time.time() - start_time) * 1000)
+                log_response_body(request_id, '/agent/stream', {
+                    'text': ''.join(out_preview), 'output_chars': output_chars,
+                    'images': summarize_images(pending_images),
+                })
+                finish_trace(
+                    request_id, trace_status, error=trace_error,
+                    images=summarize_images(pending_images), http_status=200,
+                )
 
                 if not had_error and not is_byok:
                     if resolved_image_count > 0 and output_chars > 0:
@@ -966,11 +1070,13 @@ async def stream_text(
                     else:
                         op_type = 'text'
 
+                    image_reserved_scaled, image_details = image_billing(pending_images)
+                    bill_provider, bill_model = billed_provider_model(model_provider, op_type, image_details)
                     if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
                         total_reserved_scaled = (
                             upfront_reserved_scaled
                             + extra_reserved_scaled
-                            + resolved_image_count * IMAGE_CREDITS_SCALED
+                            + image_reserved_scaled
                         )
                         fire_credit_deduction_and_release(
                             user_id=user_id,
@@ -981,17 +1087,19 @@ async def stream_text(
                             reserved_scaled=total_reserved_scaled,
                             credit_manager=credit_manager,
                             settle_delay_seconds=CREDIT_SETTLE_DELAY_SECONDS,
-                            provider=model_provider,
-                            model=None,
+                            provider=bill_provider,
+                            model=bill_model,
                             duration_ms=duration_ms,
                             success=True,
+                            images=image_details,
                         )
                     else:
                         fire_credit_deduction(
                             user_id, input_chars, output_chars, op_type,
                             resolved_image_count,
-                            provider=model_provider, model=None,
+                            provider=bill_provider, model=bill_model,
                             duration_ms=duration_ms, success=True,
+                            images=image_details,
                         )
 
                 elif had_error and not is_byok:
@@ -999,7 +1107,7 @@ async def stream_text(
                         total_reserved_scaled = (
                             upfront_reserved_scaled
                             + extra_reserved_scaled
-                            + resolved_image_count * IMAGE_CREDITS_SCALED
+                            + image_billing(pending_images)[0]
                         )
                         credit_manager.schedule_release(
                             user_id, total_reserved_scaled, delay_seconds=0,
@@ -1025,9 +1133,11 @@ async def stream_text(
             },
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        finish_trace(request_id, 'rejected', error=str(exc.detail), http_status=exc.status_code)
         raise
     except Exception as e:
+        finish_trace(request_id, 'error', error=str(e), http_status=500)
         total_duration = time.time() - start_time
         logger.error(f"[{request_id}] STREAM FAILED — {e} ({total_duration:.2f}s)")
         logger.info(f"[{request_id}] ================================")
@@ -1190,6 +1300,15 @@ async def autocomplete_text(
             content={'error': str(e)},
             headers={"X-Request-ID": request_id},
         )
+
+
+@app.get('/agent/metrics')
+async def metrics(limit: int = 50) -> JSONResponse:
+    """Recent request summaries + latency percentiles. Off unless METRICS_ENDPOINT_ENABLED=true (local/dev)."""
+    if not settings.metrics_endpoint_enabled:
+        raise HTTPException(status_code=404, detail='Not found')
+    from src.observability import latency_stats, recent_summaries
+    return JSONResponse(content={'stats': latency_stats(), 'recent': recent_summaries(min(max(limit, 1), 200))})
 
 
 @app.post('/agent/abort', response_model=AbortResponse)

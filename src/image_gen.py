@@ -26,6 +26,8 @@ from src.models import (
     IMAGE_MODEL_FALLBACKS,
     get_image_model_id,
     get_image_model_fallbacks,
+    gemini_effective_resolution,
+    gemini_model_for_resolution,
 )
 from src.s3_service import (
     sniff_image_bytes,
@@ -69,6 +71,7 @@ _TRAIL_MODEL = r"[\s-]+(?:image[\s-]+)?(?:model|engine)\b"
 _MODEL_CUES = [
     ("gemini", "gemini-2.5-flash-image", r"gemini[\s-]*2[\s.-]*5(?:[\s-]*flash)?(?:[\s-]*image)?", False),
     ("gemini", "gemini-2.5-flash-image", r"nano[\s-]*banana(?![\s-]*(?:pro|2))", False),
+    ("gemini", "gemini-3.1-flash-lite-image", r"gemini[\s-]*(?:3[\s.-]*1[\s-]*)?(?:flash[\s-]*)?lite(?:[\s-]*image)?", False),
     ("gemini", "gemini-3.1-flash-image", r"gemini[\s-]*3[\s.-]*1(?:[\s-]*flash)?(?:[\s-]*image)?", False),
     ("grok", "grok-imagine-image-2.0", r"grok[\s-]*(?:imagine[\s-]*(?:image[\s-]*)?)?2(?:\.0)?\b", False),
     ("grok", "grok-imagine-image", r"grok[\s-]*imagine(?:[\s-]*image)?", False),
@@ -220,13 +223,16 @@ class ImageParams:
         Derive parameters. Only phrases that clearly ask for a setting count; style words an
         LLM habitually writes into prompts ("cinematic", "detailed", "story") do not.
 
-        selection_text is the text searched for a provider/model request. Pass the user's own
-        words. None means "use prompt"; an empty string means "do not look" (used when the
-        prompt was written by an LLM, which must never pick the model).
+        selection_text is the text searched for provider/model and picture-setting cues. Pass the
+        user's own words. None means "use prompt"; an empty string means "do not look" (used when the
+        prompt was written by an LLM, which must never pick the model or the picture settings).
         """
         explicit = explicit_params or {}
         inherited = inherited_params or {}
-        p_lower = (prompt or "").lower()
+        # Every cue (model, shape, quality, resolution, format, transparency) is read from the user's
+        # words, never from a prompt an LLM wrote for them. None = the prompt IS the user's words.
+        user_text = prompt if selection_text is None else selection_text
+        p_lower = (user_text or "").lower()
 
         # 1. Defaults, then values inherited from the previous image
         aspect = inherited.get("aspect_ratio") or "1:1"
@@ -277,7 +283,7 @@ class ImageParams:
             fmt = "jpeg"
 
         # Provider / model: only from the user's own words (regex), never from LLM output
-        cue_provider, cue_model = detect_image_model_request(prompt if selection_text is None else selection_text)
+        cue_provider, cue_model = detect_image_model_request(user_text)
         if cue_provider:
             if cue_provider != provider:
                 model = None  # an inherited model belongs to the old provider
@@ -348,6 +354,21 @@ def _is_model_not_found_error(err: Exception) -> bool:
         t in msg
         for t in ("not found", "does not exist", "404", "deprecated", "no longer available", "decommissioned")
     )
+
+
+def _is_model_unavailable_error(err: Exception) -> bool:
+    """
+    True when another model should be tried: the model is gone (see above) or temporarily unavailable
+    (HTTP 503 / overloaded, 429 / quota exhausted). Not for safety blocks or bad parameters: a different
+    model would not fix those, and falling back would only add cost and latency.
+    """
+    if _is_model_not_found_error(err):
+        return True
+    msg = str(err).lower()
+    return any(t in msg for t in (
+        "503", "unavailable", "overloaded", "try again later",
+        "429", "resource_exhausted", "resource exhausted", "quota", "rate limit",
+    ))
 
 
 _OPTIONAL_PARAM_NAMES = ("output_format", "background", "input_fidelity", "output_compression", "quality")
@@ -586,26 +607,30 @@ def _call_gemini_with_fallback(
     from google import genai
     from google.genai import types
 
-    primary_model = model_id or get_image_model_id("gemini")
-    fallback_models = get_image_model_fallbacks("gemini")
-    models_to_try = [primary_model] + [m for m in fallback_models if m != primary_model]
+    primary_model = gemini_model_for_resolution(model_id, params.resolution)
+    fallback_models = [
+        m for m in get_image_model_fallbacks("gemini")
+        if m != primary_model
+        and gemini_effective_resolution(m, params.resolution) == params.resolution  # a fallback must not downgrade the size
+    ]
+    models_to_try = [primary_model] + fallback_models
 
     client = genai.Client(api_key=api_key)
 
-    img_config = None
-    try:
-        img_config = types.ImageConfig(
-            aspect_ratio=params.aspect_ratio,
-            image_size=params.resolution,
-        )
-    except Exception as e:
-        logger.debug(f"{log_prefix}types.ImageConfig not supported, omitting: {e}")
-
-    gen_config_kwargs = {"response_modalities": ["IMAGE"]}
-    if img_config:
-        gen_config_kwargs["image_config"] = img_config
-
-    config = types.GenerateContentConfig(**gen_config_kwargs)
+    def _config_for(target: str, with_size: bool = True):
+        """Per-model config: only sizes the model really supports are sent (an unsupported size is a 400)."""
+        kwargs = {"response_modalities": ["IMAGE"]}
+        try:
+            size = gemini_effective_resolution(target, params.resolution)
+            if size != params.resolution:
+                logger.info(f"{log_prefix}{target} supports {size} only; requested {params.resolution}")
+            kwargs["image_config"] = (
+                types.ImageConfig(aspect_ratio=params.aspect_ratio, image_size=size) if with_size
+                else types.ImageConfig(aspect_ratio=params.aspect_ratio)
+            )
+        except Exception as e:
+            logger.debug(f"{log_prefix}types.ImageConfig not supported, omitting: {e}")
+        return types.GenerateContentConfig(**kwargs)
 
     if reference_image_bytes:
         ref_mime, _ = sniff_image_bytes(reference_image_bytes)
@@ -618,12 +643,18 @@ def _call_gemini_with_fallback(
         try:
             logger.info(f"{log_prefix}Calling Gemini image generation (model={target_model})...")
             try:
-                response = client.models.generate_content(model=target_model, contents=contents, config=config)
+                response = client.models.generate_content(model=target_model, contents=contents, config=_config_for(target_model))
             except Exception as gen_err:
-                if img_config is not None and any(w in str(gen_err).lower() for w in ("image_config", "image_size", "unsupported", "invalid argument", "extra inputs")):
-                    logger.warning(f"{log_prefix}Gemini rejected image_config ({gen_err}); retrying without image_config")
-                    basic_config = types.GenerateContentConfig(response_modalities=["IMAGE"])
-                    response = client.models.generate_content(model=target_model, contents=contents, config=basic_config)
+                msg = str(gen_err).lower()
+                # Only genuine size/config rejections are retried on the same model; a generic 400 is not
+                if not _is_model_unavailable_error(gen_err) and any(
+                    w in msg for w in ("image_config", "image_size", "image size", "not supported", "unsupported", "extra inputs")
+                ):
+                    # Keep the aspect ratio, drop only the size
+                    logger.warning(f"{log_prefix}Gemini rejected the image size ({gen_err}); retrying with the aspect ratio only")
+                    response = client.models.generate_content(
+                        model=target_model, contents=contents, config=_config_for(target_model, with_size=False)
+                    )
                 else:
                     raise gen_err
 
@@ -645,9 +676,9 @@ def _call_gemini_with_fallback(
 
         except Exception as e:
             last_error = e
-            if _is_model_not_found_error(e) and idx < len(models_to_try) - 1:
+            if _is_model_unavailable_error(e) and idx < len(models_to_try) - 1:
                 logger.warning(
-                    f"{log_prefix}Gemini model '{target_model}' failed ({e}). "
+                    f"{log_prefix}Gemini model '{target_model}' unavailable ({e}). "
                     f"Retrying with fallback model '{models_to_try[idx + 1]}'..."
                 )
                 continue
@@ -867,6 +898,65 @@ def _call_grok_with_fallback(
 # UNIFIED ADAPTER ENTRY POINT
 # ======================================================================
 
+def _resolve_target(
+    params: "ImageParams",
+    model_provider: str,
+    api_key: Optional[str],
+    is_byok: bool,
+    explicit_api_key: Optional[str],
+    model_id: Optional[str],
+    log_prefix: str = "",
+) -> Tuple[str, str, Optional[str]]:
+    """(provider, api_key, model override or None). Raises ValueError when no key can serve the request."""
+    target_model = model_id or params.model
+
+    resolved = resolve_image_provider(
+        model_provider,
+        api_key,
+        is_byok,
+        requested_provider=params.provider,
+        image_api_key=explicit_api_key,
+    )
+    if not resolved:
+        wanted = params.provider or _default_image_provider()
+        if is_byok:
+            raise ValueError(
+                f"No API key provided for image provider '{wanted}' (BYOK account cannot use platform keys)"
+            )
+        raise ValueError(f"No platform API key available for image provider '{wanted}'")
+    provider, eff_api_key = resolved
+    if provider != (model_provider or "").lower().strip():
+        logger.info(f"{log_prefix}Image provider '{provider}' differs from chat provider '{model_provider}'")
+    if target_model and _infer_provider_from_model(target_model) not in (None, provider):
+        target_model = None  # a model that belongs to another provider is never sent to this one
+    return provider, eff_api_key, target_model
+
+
+def plan_image_target(
+    model_provider: str,
+    api_key: Optional[str],
+    is_byok: bool = False,
+    explicit_params: Optional[Dict[str, Any]] = None,
+    inherited_params: Optional[Dict[str, Any]] = None,
+    selection_text: Optional[str] = None,
+    prompt: str = "",
+) -> Optional[Tuple[str, str]]:
+    """
+    The (provider, model) generate_image_unified would use for this request, or None if no key can serve it.
+    Pure: no network. Used to price and reserve credits for the model that will actually run.
+    """
+    params = ImageParams.from_prompt_and_overrides(prompt, explicit_params, inherited_params, selection_text)
+    try:
+        provider, _key, model = _resolve_target(
+            params, model_provider, api_key, is_byok, (explicit_params or {}).get("api_key"), None
+        )
+    except ValueError:
+        return None
+    if provider == "gemini":
+        return provider, gemini_model_for_resolution(model, params.resolution)
+    return provider, (model or get_image_model_id(provider))
+
+
 def generate_image_unified(
     prompt: str,
     model_provider: str = "openai",
@@ -907,27 +997,9 @@ def generate_image_unified(
     )
 
     explicit_api_key = (explicit_params or {}).get("api_key")
-    target_model = model_id or params.model
-
-    resolved = resolve_image_provider(
-        model_provider,
-        api_key,
-        is_byok,
-        requested_provider=params.provider,
-        image_api_key=explicit_api_key,
+    provider, eff_api_key, target_model = _resolve_target(
+        params, model_provider, api_key, is_byok, explicit_api_key, model_id, log_prefix
     )
-    if not resolved:
-        wanted = params.provider or _default_image_provider()
-        if is_byok:
-            raise ValueError(
-                f"No API key provided for image provider '{wanted}' (BYOK account cannot use platform keys)"
-            )
-        raise ValueError(f"No platform API key available for image provider '{wanted}'")
-    provider, eff_api_key = resolved
-    if provider != (model_provider or "").lower().strip():
-        logger.info(f"{log_prefix}Image provider '{provider}' differs from chat provider '{model_provider}'")
-    if target_model and _infer_provider_from_model(target_model) not in (None, provider):
-        target_model = None  # a model that belongs to another provider is never sent to this one
 
     adapter_t0 = time.time()
     result = None

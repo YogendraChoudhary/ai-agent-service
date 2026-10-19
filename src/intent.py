@@ -177,9 +177,12 @@ DRAW_START = re.compile(
 
 # Words between the verb and noun that show the output is text ("make a list of icons").
 _TEXT_ARTIFACT = re.compile(
-    r"\b(?:list|table|summary|outline|plan|script|description|caption|article|post|email|ideas?|"
+    r"\b(?:list|summary|outline|plan|script|description|caption|article|post|email|ideas?|"
     r"names?|titles?|checklist|bullet|paragraph|essay|prompts?|markdown|html|csv|json|code|"
-    r"template|page|document|spreadsheet)\b",
+    r"template|page|document|spreadsheet)\b"
+    # "table" is text only as a document table ("a table of results", "create a table"), not "a wooden table"
+    r"|\btable\s+(?:of|with|showing|comparing|listing|format)\b"
+    r"|\b(?:create|make|build|generate|add|insert)\s+(?:an?\s+|the\s+)?(?:\w+\s+){0,2}table\b",
     re.I,
 )
 

@@ -73,25 +73,57 @@ import os
 
 # Environment-overridable model IDs so deprecation/rename does not require deployment.
 # Verified on 2026-10-16 via image_smoke_test.py.
-# Gemini default is 2.5: in the 2026-10-19 live benchmark it had a ~9.5s median (7/7 runs under
-# 10s) against ~12s for gemini-3.1-flash-image (0/7 under 10s).
+# Gemini default is gemini-3.1-flash-lite-image (2026-10-19 live benchmark, same prompts side by side):
+# 3.5-4.7s vs 8.4-10.2s for gemini-2.5-flash-image, image quality equal or better, $0.0336/image vs $0.039.
+# Google marks gemini-2.5-flash-image deprecated and recommends the lite model. Lite only does 1K, so
+# 2K/4K requests are routed to GEMINI_HIRES_MODEL (see gemini_model_for_resolution).
 IMAGE_MODEL_IDS = {
     "openai": os.getenv("IMAGE_MODEL_OPENAI", "gpt-image-1"),
     "grok": os.getenv("IMAGE_MODEL_GROK", "grok-imagine-image-2.0"),
-    "gemini": os.getenv("IMAGE_MODEL_GEMINI", "gemini-2.5-flash-image"),
+    "gemini": os.getenv("IMAGE_MODEL_GEMINI", "gemini-3.1-flash-lite-image"),
 }
 
 IMAGE_MODEL_FALLBACKS = {
-    "gemini": ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview"],
+    "gemini": ["gemini-2.5-flash-image", "gemini-3.1-flash-image", "gemini-3.1-flash-image-preview"],
     "grok": ["grok-imagine-image"],
     "openai": ["gpt-image-1"],
 }
+
+GEMINI_HIRES_MODEL = os.getenv("IMAGE_MODEL_GEMINI_HIRES", "gemini-3.1-flash-image")
+
+# Sizes each Gemini image model really delivers (probed live 2026-10-19). Unknown models are not listed
+# and are passed through unchanged. gemini-2.5-flash-image accepts "2K"/"4K" but returns 1024x1024, so it is
+# listed as 1K only; the lite model rejects anything but 1K with a 400.
+GEMINI_IMAGE_SIZES = {
+    "gemini-3.1-flash-lite-image": ("1K",),
+    "gemini-2.5-flash-image": ("1K",),
+    "gemini-3.1-flash-image": ("512", "1K", "2K", "4K"),
+}
+
+
+def gemini_model_for_resolution(model_override, resolution: str) -> str:
+    """
+    The Gemini model that will draw this request. With no model named by the user, a 2K/4K request goes to
+    GEMINI_HIRES_MODEL (the default lite model only does 1K). A model the user named is kept as is.
+    """
+    model = model_override or IMAGE_MODEL_IDS["gemini"]
+    sizes = GEMINI_IMAGE_SIZES.get(model)
+    if model_override or sizes is None or resolution in sizes:
+        return model
+    hires_sizes = GEMINI_IMAGE_SIZES.get(GEMINI_HIRES_MODEL)
+    return GEMINI_HIRES_MODEL if hires_sizes is None or resolution in hires_sizes else model
+
+
+def gemini_effective_resolution(model: str, resolution: str) -> str:
+    """The size to send for this model: the requested one if it is supported, else 1K (never a 400)."""
+    sizes = GEMINI_IMAGE_SIZES.get(model)
+    return resolution if sizes is None or resolution in sizes else "1K"
 
 
 def get_image_model_id(provider: str) -> str:
     """Get the active image generation model ID for a provider."""
     provider_clean = (provider or "").lower().strip()
-    return IMAGE_MODEL_IDS.get(provider_clean, os.getenv("IMAGE_MODEL_DEFAULT", "gemini-2.5-flash-image"))
+    return IMAGE_MODEL_IDS.get(provider_clean, os.getenv("IMAGE_MODEL_DEFAULT", "gemini-3.1-flash-lite-image"))
 
 
 def get_image_model_fallbacks(provider: str) -> list[str]:

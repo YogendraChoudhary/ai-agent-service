@@ -26,9 +26,37 @@ CHARS_PER_CREDIT = 1000
 IMAGE_CREDITS_SCALED = 50            # 5 credits per image
 AUTOCOMPLETE_CREDITS_SCALED = 2      # 0.2 credits per acceptance
 
+# Per-model image prices in scaled units, keyed "provider/model" or just "provider". Empty on purpose:
+# every model costs the flat IMAGE_CREDITS_SCALED until a price is set here or through the
+# IMAGE_CREDITS_BY_MODEL env var (JSON, e.g. {"openai/gpt-image-1": 80}). The backend still computes the
+# charge from image_count; these numbers drive the agent-side reservation and are sent in the webhook.
+IMAGE_CREDITS_BY_MODEL: dict = {}
+
 # Reservation key auto-expires so an agent crash cannot permanently lock
 # credits. 600s gives plenty of slack for slow image generation jobs.
 RESERVATION_TTL_SECONDS = 600
+
+
+def image_credits_scaled(provider: str | None, model: str | None) -> int:
+    """Scaled credits for one image from this provider/model: exact model, then provider, then the flat default."""
+    import json
+
+    table = dict(IMAGE_CREDITS_BY_MODEL)
+    try:
+        from config import settings
+        raw = getattr(settings, "image_credits_by_model", "") or ""
+        if raw.strip():
+            table.update(json.loads(raw))
+    except Exception as exc:  # a bad override must never block image generation
+        logger.warning("Ignoring invalid IMAGE_CREDITS_BY_MODEL: %s", exc)
+    p, m = (provider or "").lower(), (model or "").lower()
+    for key in (f"{p}/{m}", p):
+        if key in table:
+            try:
+                return max(0, int(table[key]))
+            except (TypeError, ValueError):
+                break
+    return IMAGE_CREDITS_SCALED
 
 
 def text_credits_scaled(input_chars: int, output_chars: int) -> int:

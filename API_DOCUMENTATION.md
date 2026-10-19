@@ -647,7 +647,7 @@ Everything else, including *"write an article with 2 images"*, stays on the agen
 
 The response is a markdown placeholder `![alt](placeholder::<uuid>)` followed by an `image_ready` / `image_failed` event, the same contract the agent path uses.
 
-Providers: OpenAI, Gemini and Grok use the user's own key. Claude and DeepSeek have no image endpoint, so they use the platform's `DEFAULT_GEMINI_API_KEY`; if that is unset, or the user brings their own keys, the request stays on the agent path instead of failing.
+Providers: with no model named, images are drawn by **Gemini (`gemini-3.1-flash-lite-image`) whatever the chat model is**, using the platform Gemini key. Accounts that bring their own keys (BYOK) never use platform keys: they stay on their own provider's key when it has an image endpoint (OpenAI, Gemini, Grok), otherwise the request stays on the agent path. The user can pick another model in the prompt ("using grok", "with gpt", "gemini 3.1") or with `image_provider` / `image_model` (see "Request fields"). The prompt wording is matched by regex; the chat LLM never chooses the image model.
 
 ### 2. Settings and how they are chosen
 Precedence: **explicit `image_params` field > words in the prompt > previous image's settings (follow-ups) > default.**
@@ -656,7 +656,7 @@ Precedence: **explicit `image_params` field > words in the prompt > previous ima
 |---|---|---|
 | `aspect_ratio` | `1:1` | `16:9`, `widescreen`, `banner`, `horizontal`, `in landscape`, `landscape image/photo/format…` → `16:9`; `9:16`, `vertical`, `instagram story`, `reel`, `tiktok`, `in portrait`, `portrait image/photo/format…` → `9:16`; `4:3`, `3:4`, `square` |
 | `quality` | `medium` | `draft`, `low quality` → `low`; `high quality`, `best quality`, `ultra-detailed`, `hq` → `high` |
-| `resolution` | `1K` | `2k`, `high-res` → `2K`; `4k`, `uhd` → `4K` (Gemini only; OpenAI uses fixed sizes, Grok ignores it) |
+| `resolution` | `1K` | `2k`, `high-res` → `2K`; `4k`, `uhd` → `4K` (Gemini only; OpenAI uses fixed sizes, Grok ignores it). The default Gemini model only draws 1K, so 2K/4K requests are drawn by `gemini-3.1-flash-image` (about 18s / 26s) |
 | `format` | `jpeg` (`IMAGE_DEFAULT_FORMAT`) | `png`, `webp`, `jpeg`/`jpg`; `transparent background` forces `png` |
 
 Style words an LLM habitually writes ("cinematic", "detailed", "story", "wide-angle") do **not** change settings. Transparent output is requested natively only from OpenAI; Gemini and Grok return an opaque background.
@@ -673,7 +673,8 @@ Style words an LLM habitually writes ("cinematic", "detailed", "story", "wide-an
 }
 ```
 - `document_id` (optional, `[A-Za-z0-9_.:-]`, max 128): scopes the "previous image" memory. When sent, follow-ups only ever see images from that document.
-- `image_params` (optional): `aspect_ratio` (`1:1`, `16:9`, `9:16`, `4:3`, `3:4`), `quality` (`low`/`medium`/`high`), `resolution` (`1K`/`2K`/`4K`), `format` (`jpeg`/`png`/`webp`), `transparent_bg` (bool). Invalid keys or values return HTTP 422.
+- `image_params` (optional): `aspect_ratio` (`1:1`, `16:9`, `9:16`, `4:3`, `3:4`), `quality` (`low`/`medium`/`high`), `resolution` (`1K`/`2K`/`4K`), `format` (`jpeg`/`png`/`webp`), `transparent_bg` (bool), `provider` (`gemini`/`openai`/`grok`), `model` (a model id of that provider). Invalid keys or values return **HTTP 400** `{"error": "image_params: ..."}` (earlier versions of this document said 422; the server has always answered 400). A `model` that does not belong to the given `provider` (for example `provider: gemini`, `model: gpt-image-1`) is also a 400.
+- `image_provider`, `image_model` (optional, top level, on both `/agent/stream` and `/agent/process`): same as `image_params.provider` / `.model`. Unlike the `image_params` form, a mismatched pair here is not rejected: the model that does not belong to the provider is ignored and that provider's default is used.
 
 ### 4. Server-Sent Events
 `image_ready` carries dimension and format metadata (fields are omitted when the image could not be measured):
@@ -697,6 +698,32 @@ Each successful image is stored per user (and per `document_id` when sent). A fo
 - **Delta** (*"make it night"*, *"same but in autumn colors"*, *"change the mood to dramatic"*) and **edits of the last image** (*"refine the image with a Taj Mahal vibe"*): previous image sent as the reference, prompt = original prompt + the last 3 modifications, settings inherited unless the new prompt overrides them.
 
 Without a stored image these phrases are handled by the agent as ordinary text. An attached `image_urls[0]` always takes priority over the stored image.
+
+---
+
+## Changes for API consumers (2026-10-19)
+
+**No breaking change.** Request fields, response fields, status codes and Server-Sent Events are the same.
+Nothing has to change in a client that works today; the items below are behaviour changes it should know about.
+
+**Unchanged**
+- Request bodies of `/agent/process`, `/agent/stream`, `/agent/autocomplete`, `/agent/abort`.
+- Stream events: `start`, `content`, `done`, `image_ready`, `image_failed`, `stream_end`, `credit_limit_reached`, `error`, with the same fields.
+- `/agent/process` response shape: `{ success, markdown_response, html_response }`.
+
+**Additive**
+- Every response carries `X-Response-Time-Ms` (next to `X-Request-ID`). For a stream it is the time until the headers were sent, not the whole stream.
+- `GET /agent/metrics` exists but answers 404 unless the server sets `METRICS_ENDPOINT_ENABLED=true` (local/staging only).
+- `image_params` accepts `provider` and `model` (see "Request fields").
+
+**Behaviour changes a client may notice**
+1. **The `type` field decides the agent.** `fix_grammar`, `simplify`, `translate`, ... always run their own agent, whatever words the text contains. `type: "general"` always runs the free-form agent: tables, lists and summaries requested through `general` are written by that agent. If the editor sends `type: "general"` for operations that have their own `type`, send the specific `type`.
+2. **`/agent/process` now returns finished images.** It waits (up to 120s, `IMAGE_WAIT_SECONDS`) and puts the real image URLs in `markdown_response` / `html_response`. Before, it returned `placeholder::<uuid>` links that never resolved. An image that fails or times out is replaced by the text `*(image could not be generated)*`. **Set the HTTP client timeout for this endpoint above 2 minutes** (a 4K image alone takes about 25s).
+3. **Model failures are now visible.** If the AI provider rejects the call (bad key, quota, outage) the server returns HTTP 500 `{"error": "<provider> request failed: ..."}` on `/agent/process`, and a `{"type": "error", "error": "..."}` event on `/agent/stream` (no `done` follows). Before, these came back as an empty, successful response. An empty model answer with no images is also an error now. Make sure both the 500 and the `error` event are shown to the user.
+4. **Image defaults.** Default model `gemini-3.1-flash-lite-image` (about 3.5s per image), whatever the chat model. Claude and DeepSeek chats can now produce images too.
+5. **Images inside written content ("write a post with 2 images").** The number of images comes from the user's words ("2 images", "a hero image", "with images" = 2), capped at 4 per request, and only when the request asks for them. The model can no longer add extra images. The placeholder markdown and `image_ready` events are the same as before.
+6. **Model cue is removed from the picture prompt.** "draw a cat using grok" draws "draw a cat"; the `prompt` in `image_ready` and the alt text do not contain "using grok".
+7. **Web access** is only granted when the request needs fresh or sourced facts (words such as "latest", a year, "research", a URL). Other requests are answered from the model's own knowledge.
 
 ---
 

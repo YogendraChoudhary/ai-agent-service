@@ -171,6 +171,27 @@ sudo journalctl -u agent -f
 
 ---
 
+## 7a. Which agent handles a request
+
+The declared `type` field decides the agent, through the fixed table `AGENT_FOR_REQUEST_TYPE`
+(`src/text_processing_agent.py`). Nothing is inferred from the user's text: a `simplify` request that
+contains the words "fix grammar" still runs the simplify agent.
+
+| `type` | Agent | | `type` | Agent |
+|---|---|---|---|---|
+| `fix_grammar` | `grammar` | | `make_shorter` | `make_shorter` |
+| `simplify` | `simplify` | | `enhance_with_ai` | `enhance` |
+| `complete` | `completion` | | `change_tone` | `tone` |
+| `emojify` | `emojify` | | `generate_email_template` | `email_template` |
+| `translate` | `translation` | | `extract_image_text` | `text_extraction` |
+| `make_longer` | `make_longer` | | **`general`** | **`smart_global`** (always) |
+
+`general` always goes to the free-form agent, which plans its own tools from the user's words
+(`src/request_plan.py`: image count, web access, model tier) and may take the direct image route.
+Tables, lists and summaries requested through `general` are handled by that agent; the dedicated `table`,
+`list` and `summarize` agents have no API `type` and are no longer reachable through the API.
+`determine_agent_type` (keyword matching) remains only for callers that name no agent.
+
 ## 7. Model Routing Architecture
 
 The agent automatically routes operations across two model tiers to minimize latency and token cost without sacrificing quality:

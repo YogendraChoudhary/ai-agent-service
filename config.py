@@ -74,6 +74,30 @@ class Settings(BaseSettings):
     image_memory_ttl_seconds: int = Field(3600, alias="IMAGE_MEMORY_TTL_SECONDS")
 
     # ------------------------------------------------------------------
+    # Deterministic request planning (src/request_plan.py): the code, not the LLM, decides how many
+    # images to make, whether web tools exist, and which model tier answers.
+    # ------------------------------------------------------------------
+    image_max_per_request: int = Field(4, alias="IMAGE_MAX_PER_REQUEST")
+    image_default_plural_count: int = Field(2, alias="IMAGE_DEFAULT_PLURAL_COUNT")  # "with images" and no number
+    web_tools_gate_enabled: bool = Field(True, alias="WEB_TOOLS_GATE_ENABLED")      # False = always attach web tools
+    web_search_call_limit: int = Field(6, alias="WEB_SEARCH_CALL_LIMIT")
+    web_read_call_limit: int = Field(8, alias="WEB_READ_CALL_LIMIT")
+    model_tier_routing_enabled: bool = Field(True, alias="MODEL_TIER_ROUTING_ENABLED")  # False = always advanced
+    tier_long_query_chars: int = Field(1500, alias="TIER_LONG_QUERY_CHARS")
+    image_wait_seconds: int = Field(120, alias="IMAGE_WAIT_SECONDS")                # /agent/process waits this long
+    # JSON object of per-image credit overrides in scaled units, e.g. {"openai/gpt-image-1": 80}
+    image_credits_by_model: str = Field("", alias="IMAGE_CREDITS_BY_MODEL")
+
+    # ------------------------------------------------------------------
+    # Observability (src/observability.py). Bodies contain user text, so they are OFF by default.
+    # ------------------------------------------------------------------
+    request_log_file: str = Field("", alias="REQUEST_LOG_FILE")                  # JSONL, one summary per request
+    log_request_bodies: bool = Field(False, alias="LOG_REQUEST_BODIES")          # log request + response text (api keys always redacted)
+    log_body_max_chars: int = Field(2000, alias="LOG_BODY_MAX_CHARS")
+    metrics_endpoint_enabled: bool = Field(False, alias="METRICS_ENDPOINT_ENABLED")  # GET /agent/metrics (local/dev only)
+    trace_ring_size: int = Field(500, alias="TRACE_RING_SIZE")
+
+    # ------------------------------------------------------------------
     # Encryption
     # ------------------------------------------------------------------
     api_key_encryption_secret: str = Field(
