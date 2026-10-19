@@ -1,6 +1,7 @@
 # Core dependencies
 fastapi
 uvicorn[standard]
+gunicorn  # flaskagent.service runs gunicorn with uvicorn.workers.UvicornWorker
 pydantic-settings
 python-dotenv
 redis

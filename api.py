@@ -638,17 +638,17 @@ async def health_check() -> HealthResponse:
 
 
 @app.post('/agent/process', response_model=ProcessResponse)
-async def process_text(
-    request_data: ProcessRequest,
-    background_tasks: BackgroundTasks,
-) -> JSONResponse:
+async def process_text(request_data: ProcessRequest) -> JSONResponse:
     """
     Non-streaming text processing endpoint.
 
+    Called server-to-server by the backend (apps/backend agentService.ts),
+    which resolves the provider key itself (user BYOK or platform key) and
+    deducts credits after the call. So api_key here is the PROVIDER key, not
+    a licence key — validating it as a licence would 403 every backend call,
+    and the agent must not reserve credits on top of the backend's deduction.
+
     Fixes applied vs. original implementation:
-      - Bug #1: api_key field is now treated as a LICENCE key; licence
-        validation + API-key lookup run before any AI call.
-      - Licence validation and API-key lookup stay off the event loop.
       - Bug #9: TYPE_PREFIX_MAP now covers all valid agent types.
       - Enhancement #2: returns X-Request-ID header.
     """
@@ -673,14 +673,13 @@ async def process_text(
 
         agent_type = request_data.type
         model_provider = request_data.model
-        license_key = request_data.api_key
+        api_key = request_data.api_key
 
-        # Validate licence and resolve the actual AI provider API key.
-        # Uses async_validate_and_get_api_key to run Redis calls concurrently via asyncio.gather.
-        api_key, license_meta = await async_validate_and_get_api_key(
-            license_key, model_provider, request_id, background_tasks,
-        )
-        trace_mark(request_id, 'auth_done', user=license_meta['user_id'])
+        # Backend contract (see docstring): api_key is the provider key the backend
+        # already resolved, and the backend bills the call. Treat it as BYOK so the
+        # agent never attaches platform keys (DEFAULT_API_KEYS) or reserves credits.
+        license_meta = {'user_id': None, 'requires_user_api_keys': True, 'user_keys': None}
+        trace_mark(request_id, 'auth_done', user='backend')
 
         full_query = build_full_query(
             agent_type, request_data.query, request_data.secondary_prompt or ""
@@ -704,9 +703,10 @@ async def process_text(
             api_key=api_key,
             request_id=request_id,
             force_agent_type=agent_for_request_type(agent_type),
-            is_byok=is_byok,
-            user_id=user_id,
-            credit_manager=credit_manager if CREDIT_PRECHECK_ENABLED else None,
+            # Backend bills this call; also keeps caller keys out of the model cache.
+            is_byok=True,
+            user_id=None,
+            credit_manager=None,
             image_routing=(agent_type == 'general'),
             image_params=merged_image_params or None,
         )

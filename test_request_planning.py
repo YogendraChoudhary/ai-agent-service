@@ -442,42 +442,52 @@ class TestBillingHelpersAndEndpoint(unittest.TestCase):
         self.assertEqual(api.billed_provider_model("claude", "mixed", d), ("claude", None))
         self.assertEqual(api.billed_provider_model("claude", "image", []), ("claude", None))
 
-    def test_process_endpoint_runs_the_shared_pipeline_and_bills_images(self):
+    def test_process_endpoint_runs_the_shared_pipeline_without_agent_billing(self):
+        # /agent/process is called by the backend (apps/backend agentService.ts) with the
+        # provider key it already resolved; the backend then bills text AND images by
+        # counting them in the returned HTML (creditDeductionService.ts). So the agent must
+        # not validate a licence, attach platform keys, or deduct credits itself.
         import api
         from fastapi.testclient import TestClient
 
         pending = {"__completion_callback__": None,
                    "a": {"status": "done", "provider": "gemini", "model": "gemini-2.5-flash-image",
                          "credits_scaled": 50, "reserved_scaled": 50}}
-        meta = {"user_id": "u1", "requires_user_api_keys": False, "user_keys": {}}
         captured = {}
 
         def fake_pipeline(query, **kw):
             captured.update(kw, query=query)
             return "![x](https://cdn/a.jpg)", pending
 
-        with patch.object(api, "async_validate_and_get_api_key", AsyncMock(return_value=("k", meta))), \
+        # Mirrors the real resolver: with no user keys, only default_keys could yield a key.
+        def resolve(**k):
+            return "PLATFORM-KEY" if k.get("default_keys") else None
+
+        validate = AsyncMock()
+        with patch.object(api, "async_validate_and_get_api_key", validate), \
                 patch.object(api, "process_user_query_with_images", fake_pipeline), \
                 patch.object(api, "fire_credit_deduction") as fire, \
-                patch.object(api, "redis_manager", MagicMock(resolve_api_key_from_user_keys=lambda **k: "user-grok-key")), \
-                patch.object(api, "CREDIT_PRECHECK_ENABLED", False):
+                patch.object(api, "fire_credit_deduction_and_release") as fire_release, \
+                patch.object(api, "redis_manager", MagicMock(resolve_api_key_from_user_keys=resolve)):
             client = TestClient(api.app, raise_server_exceptions=False)
             r = client.post("/agent/process", json={
-                "type": "general", "query": "draw a cat using grok", "model": "claude", "api_key": "lic",
+                "type": "general", "query": "draw a cat using grok", "model": "claude", "api_key": "sk-provider",
                 "image_params": {"quality": "high"},
             })
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["markdown_response"], "![x](https://cdn/a.jpg)")
+        validate.assert_not_called()
+        self.assertEqual(captured["api_key"], "sk-provider")
         # same routing inputs as /agent/stream: direct image route on for general chat, regex-chosen provider passed
         self.assertTrue(captured["image_routing"])
         self.assertEqual(captured["image_params"]["provider"], "grok")
         self.assertEqual(captured["image_params"]["quality"], "high")
-        self.assertEqual(captured["image_params"]["api_key"], "user-grok-key")   # the matching user key is resolved
-        self.assertEqual(captured["user_id"], "u1")
-        args, kwargs = fire.call_args
-        self.assertEqual(args[:5], ("u1", 0, 0, "image", 1))
-        self.assertEqual((kwargs["provider"], kwargs["model"]), ("gemini", "gemini-2.5-flash-image"))
-        self.assertEqual(kwargs["images"], [{"provider": "gemini", "model": "gemini-2.5-flash-image", "credits_scaled": 50}])
+        self.assertNotIn("api_key", captured["image_params"])   # never a platform key
+        self.assertTrue(captured["is_byok"])
+        self.assertIsNone(captured["user_id"])
+        self.assertIsNone(captured["credit_manager"])
+        fire.assert_not_called()
+        fire_release.assert_not_called()
 
 
 if __name__ == "__main__":
