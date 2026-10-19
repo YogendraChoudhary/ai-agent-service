@@ -968,6 +968,9 @@ def create_image_tool(
                             user_id=user_id,
                             request_id=request_id,
                             document_id=(image_ctx or {}).get("document_id"),
+                            is_byok=is_byok,
+                            # The LLM wrote `prompt`; only the user's own words may pick the model.
+                            selection_text=(image_ctx or {}).get("user_query", ""),
                         )
                         pending_images[placeholder_id]["cdn_url"] = res["cdn_url"]
                         pending_images[placeholder_id]["width"] = res.get("width")
@@ -1080,6 +1083,9 @@ def create_grok_image_tool(
                             user_id=user_id,
                             request_id=request_id,
                             document_id=(image_ctx or {}).get("document_id"),
+                            is_byok=is_byok,
+                            # The LLM wrote `prompt`; only the user's own words may pick the model.
+                            selection_text=(image_ctx or {}).get("user_query", ""),
                         )
                         pending_images[placeholder_id]["cdn_url"] = res["cdn_url"]
                         pending_images[placeholder_id]["width"] = res.get("width")
@@ -1192,6 +1198,9 @@ def create_gemini_image_tool(
                             user_id=user_id,
                             request_id=request_id,
                             document_id=(image_ctx or {}).get("document_id"),
+                            is_byok=is_byok,
+                            # The LLM wrote `prompt`; only the user's own words may pick the model.
+                            selection_text=(image_ctx or {}).get("user_query", ""),
                         )
                         pending_images[placeholder_id]["cdn_url"] = res["cdn_url"]
                         pending_images[placeholder_id]["width"] = res.get("width")
@@ -1975,7 +1984,7 @@ def process_user_query_stream(
 
     query_lower = query.lower()
     legacy_agent_type, legacy_reason = determine_agent_type(query_lower)
-    image_ctx = {"document_id": document_id, "explicit_params": image_params}
+    image_ctx = {"document_id": document_id, "explicit_params": image_params, "user_query": query}
 
     # Regex image routing (general chat only)
     image_intent, prev_ctx = None, None
@@ -1989,12 +1998,21 @@ def process_user_query_stream(
                 f"(rule: {image_intent['rule']}) vs Legacy agent: {legacy_agent_type} ({legacy_reason})"
             )
 
-    from src.image_gen import image_route_available
+    from src.image_gen import image_route_available, detect_image_model_request, strip_image_model_cue
+
+    # Image model: explicit API field, else the user's own words (regex). The LLM never chooses it.
+    req_provider = (image_params or {}).get("provider") or detect_image_model_request(query)[0]
 
     is_direct_image = (
         image_intent is not None
         and image_intent["kind"] in ("generate", "edit")
-        and image_route_available(model_provider, api_key, is_byok)
+        and image_route_available(
+            model_provider,
+            api_key,
+            is_byok,
+            requested_provider=req_provider,
+            image_api_key=(image_params or {}).get("api_key"),
+        )
     )
 
     if is_direct_image:
@@ -2012,13 +2030,15 @@ def process_user_query_stream(
                 yield "Image generation skipped: insufficient credits"
                 return
 
-        # Prompt, inherited params and reference image for follow-ups
-        final_prompt = query
+        # Prompt, inherited params and reference image for follow-ups.
+        # "using grok" is an instruction for us, not part of the picture, so it is dropped here.
+        picture_query = strip_image_model_cue(query)
+        final_prompt = picture_query
         base_prompt, modifications, inherited = None, None, None
         mode = image_intent.get("followup_mode") or ("delta" if image_intent.get("uses_previous_image") else None)
         if prev_ctx and mode:
             from src.image_gen import compose_followup_prompt
-            final_prompt, base_prompt, modifications = compose_followup_prompt(prev_ctx, query, mode)
+            final_prompt, base_prompt, modifications = compose_followup_prompt(prev_ctx, picture_query, mode)
             inherited = prev_ctx.get("params")
             logger.info(f"{log_prefix}Follow-up ({mode}): reusing previous prompt context")
 
@@ -2061,6 +2081,7 @@ def process_user_query_stream(
                     model_provider=model_provider,
                     api_key=api_key,
                     explicit_params=image_params,
+                    selection_text=query,
                     reference_image_bytes=ref_bytes,
                     user_id=user_id,
                     request_id=request_id,

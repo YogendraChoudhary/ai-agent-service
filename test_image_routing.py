@@ -86,7 +86,10 @@ class TestGating(RouteTestCase):
 
     def test_agent_path_receives_document_and_params(self):
         kw = self.assertAgentPath("write about cats", document_id="docA", image_params={"quality": "high"})
-        self.assertEqual(kw["image_ctx"], {"document_id": "docA", "explicit_params": {"quality": "high"}})
+        self.assertEqual(
+            kw["image_ctx"],
+            {"document_id": "docA", "explicit_params": {"quality": "high"}, "user_query": "write about cats"},
+        )
 
     def test_force_agent_type_bypasses_image_routing(self):
         with self.assertRaises(Exception):

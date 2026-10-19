@@ -73,14 +73,16 @@ import os
 
 # Environment-overridable model IDs so deprecation/rename does not require deployment.
 # Verified on 2026-10-16 via image_smoke_test.py.
+# Gemini default is 2.5: in the 2026-10-19 live benchmark it had a ~9.5s median (7/7 runs under
+# 10s) against ~12s for gemini-3.1-flash-image (0/7 under 10s).
 IMAGE_MODEL_IDS = {
     "openai": os.getenv("IMAGE_MODEL_OPENAI", "gpt-image-1"),
     "grok": os.getenv("IMAGE_MODEL_GROK", "grok-imagine-image-2.0"),
-    "gemini": os.getenv("IMAGE_MODEL_GEMINI", "gemini-3.1-flash-image"),
+    "gemini": os.getenv("IMAGE_MODEL_GEMINI", "gemini-2.5-flash-image"),
 }
 
 IMAGE_MODEL_FALLBACKS = {
-    "gemini": ["gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"],
+    "gemini": ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview"],
     "grok": ["grok-imagine-image"],
     "openai": ["gpt-image-1"],
 }
@@ -89,7 +91,7 @@ IMAGE_MODEL_FALLBACKS = {
 def get_image_model_id(provider: str) -> str:
     """Get the active image generation model ID for a provider."""
     provider_clean = (provider or "").lower().strip()
-    return IMAGE_MODEL_IDS.get(provider_clean, os.getenv("IMAGE_MODEL_DEFAULT", "gemini-3.1-flash-image"))
+    return IMAGE_MODEL_IDS.get(provider_clean, os.getenv("IMAGE_MODEL_DEFAULT", "gemini-2.5-flash-image"))
 
 
 def get_image_model_fallbacks(provider: str) -> list[str]:

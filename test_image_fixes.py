@@ -233,8 +233,20 @@ class TestGeminiPayload(unittest.TestCase):
 class TestProviderResolution(unittest.TestCase):
 
     def test_native_providers_need_a_key(self):
-        self.assertEqual(resolve_image_provider("openai", "k"), ("openai", "k"))
-        self.assertIsNone(resolve_image_provider("gemini", None))
+        # With no platform key the chat provider's own key is used (BYOK / no platform key)
+        with patch.object(ig.settings, "default_gemini_api_key", None):
+            self.assertEqual(resolve_image_provider("openai", "k"), ("openai", "k"))
+            self.assertIsNone(resolve_image_provider("gemini", None))
+
+    def test_default_image_provider_is_gemini_whatever_the_chat_model(self):
+        with patch.object(ig.settings, "default_gemini_api_key", "plat"):
+            self.assertEqual(resolve_image_provider("openai", "user-key"), ("gemini", "plat"))
+            self.assertEqual(resolve_image_provider("grok", "user-key"), ("gemini", "plat"))
+            self.assertEqual(resolve_image_provider("gemini", "user-key"), ("gemini", "user-key"))
+
+    def test_byok_never_uses_platform_key_for_the_default(self):
+        with patch.object(ig.settings, "default_gemini_api_key", "plat"):
+            self.assertEqual(resolve_image_provider("openai", "user-key", is_byok=True), ("openai", "user-key"))
 
     def test_claude_and_deepseek_use_platform_fallback_only_without_byok(self):
         with patch.object(ig.settings, "default_gemini_api_key", "plat"):

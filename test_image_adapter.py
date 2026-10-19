@@ -232,6 +232,81 @@ class TestImageAdapterAndS3(unittest.TestCase):
             self.assertEqual(model, "grok-imagine-image")
             self.assertEqual(mock_client.images.generate.call_count, 2)
 
+    # -------------------------------------------------------------
+    # 4. Multi-Model and Cross-Provider Routing Tests
+    # -------------------------------------------------------------
+    def test_image_params_provider_and_model_extraction(self):
+        # 1. Prompt cue for Grok
+        p_grok = ImageParams.from_prompt_and_overrides("A futuristic skyline using grok")
+        self.assertEqual(p_grok.provider, "grok")
+
+        # 2. Prompt cue for Gemini 2.5
+        p_gem25 = ImageParams.from_prompt_and_overrides("A photorealistic portrait using gemini 2.5")
+        self.assertEqual(p_gem25.provider, "gemini")
+        self.assertEqual(p_gem25.model, "gemini-2.5-flash-image")
+
+        # 3. Prompt cue for OpenAI / GPT image
+        p_openai = ImageParams.from_prompt_and_overrides("A vintage oil painting with openai")
+        self.assertEqual(p_openai.provider, "openai")
+
+        # 4. Explicit override beats prompt cue
+        p_explicit = ImageParams.from_prompt_and_overrides(
+            "A cyberpunk street using grok",
+            explicit_params={"provider": "gemini", "model": "gemini-2.5-flash-image"},
+        )
+        self.assertEqual(p_explicit.provider, "gemini")
+        self.assertEqual(p_explicit.model, "gemini-2.5-flash-image")
+
+    @patch("src.image_gen._call_grok_with_fallback")
+    @patch("src.image_gen.upload_image_from_bytes_detailed")
+    @patch("config.settings.default_grok_api_key", "mock-grok-platform-key")
+    def test_cross_provider_routing_gemini_to_grok(self, mock_upload, mock_call_grok):
+        mock_call_grok.return_value = (self._create_test_image_bytes("JPEG"), "image/jpeg", "grok-imagine-image-2.0")
+        mock_upload.return_value = {
+            "cdn_url": "https://cdn.example.com/test.jpg",
+            "width": 1280,
+            "height": 720,
+            "format": "jpg",
+            "content_type": "image/jpeg",
+        }
+
+        # Chat model is Gemini, but image prompt / params request Grok
+        res = generate_image_unified(
+            prompt="A sleek concept sports car",
+            model_provider="gemini",
+            api_key="gemini-key",
+            explicit_params={"provider": "grok"},
+            is_byok=False,
+        )
+
+        mock_call_grok.assert_called_once()
+        self.assertEqual(mock_call_grok.call_args[0][0], "mock-grok-platform-key")
+        self.assertEqual(res["provider"], "grok")
+        self.assertEqual(res["model"], "grok-imagine-image-2.0")
+
+    @patch("google.genai.Client")
+    def test_gemini_model_id_override(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_candidate = MagicMock()
+        mock_part = MagicMock()
+        mock_part.inline_data.data = self._create_test_image_bytes("PNG")
+        mock_part.inline_data.mime_type = "image/png"
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        params = ImageParams()
+        raw, mime, model = _call_gemini_with_fallback(
+            api_key="fake-gemini-key",
+            prompt="test prompt",
+            params=params,
+            model_id="gemini-2.5-flash-image",
+        )
+        self.assertEqual(model, "gemini-2.5-flash-image")
+        self.assertEqual(mock_client.models.generate_content.call_args[1]["model"], "gemini-2.5-flash-image")
+
 
 if __name__ == "__main__":
     unittest.main()

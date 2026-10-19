@@ -42,7 +42,99 @@ _VALID_ASPECTS = ("1:1", "16:9", "9:16", "4:3", "3:4")
 _VALID_QUALITIES = ("low", "medium", "high")
 _VALID_RESOLUTIONS = ("1K", "2K", "4K")
 _VALID_FORMATS = ("jpeg", "png", "webp")
-ALLOWED_PARAM_KEYS = ("aspect_ratio", "quality", "resolution", "format", "transparent_bg", "size")
+_VALID_PROVIDERS = ("gemini", "openai", "grok")
+ALLOWED_PARAM_KEYS = (
+    "aspect_ratio", "quality", "resolution", "format", "transparent_bg", "size",
+    "provider", "model", "api_key"
+)
+
+
+# ======================================================================
+# MODEL SELECTION FROM THE USER'S WORDS (regex only; no LLM involved)
+# ======================================================================
+# The image model is chosen from the user's own request text, never by the chat LLM. The LLM only
+# writes the picture prompt. Callers must pass the raw user query (not LLM output) as the text.
+#
+# A bare brand word ("gemini", "grok", "gpt", "openai", "xai") only counts with a lead-in
+# ("using grok", "with gpt", "via openai") or a trailing "model"; this keeps "a poster with the
+# Gemini zodiac sign" or "a robot called Grok" from switching models. Specific model names
+# ("gemini 2.5", "nano banana", "grok imagine", "gpt-image-1", "dall-e") are distinctive enough to
+# count on their own.
+
+_LEAD = r"(?:(?:using|use|with|via|through|by|from|on)\s+(?:the\s+)?(?:(?:latest|new|newest)\s+)?)"
+_NOT_NAMESAKE = r"(?![\s-]*(?:zodiac|twins?|constellation|sign|horoscope|tattoos?|season|star))"
+_TRAIL_MODEL = r"[\s-]+(?:image[\s-]+)?(?:model|engine)\b"
+
+# (provider, model or None for "that provider's configured default", pattern, needs_lead_in)
+_MODEL_CUES = [
+    ("gemini", "gemini-2.5-flash-image", r"gemini[\s-]*2[\s.-]*5(?:[\s-]*flash)?(?:[\s-]*image)?", False),
+    ("gemini", "gemini-2.5-flash-image", r"nano[\s-]*banana(?![\s-]*(?:pro|2))", False),
+    ("gemini", "gemini-3.1-flash-image", r"gemini[\s-]*3[\s.-]*1(?:[\s-]*flash)?(?:[\s-]*image)?", False),
+    ("grok", "grok-imagine-image-2.0", r"grok[\s-]*(?:imagine[\s-]*(?:image[\s-]*)?)?2(?:\.0)?\b", False),
+    ("grok", "grok-imagine-image", r"grok[\s-]*imagine(?:[\s-]*image)?", False),
+    ("openai", "gpt-image-1-mini", r"gpt[\s-]*image[\s-]*1[\s-]*mini", False),
+    ("openai", "gpt-image-1", r"gpt[\s-]*image[\s-]*1", False),
+    ("openai", None, r"dall[\s-]*e(?:[\s-]*\d)?", False),
+    ("gemini", None, r"gemini" + _NOT_NAMESAKE, True),
+    ("grok", None, r"grok", True),
+    ("grok", None, r"x\.?ai", True),
+    ("openai", None, r"(?:chat)?gpt(?:[\s-]*(?:image|4o))?", True),
+    ("openai", None, r"openai", True),
+]
+
+def _compile_cue(pat: str, needs_lead: bool) -> "re.Pattern[str]":
+    if needs_lead:  # brand word: lead-in before it, or "model"/"engine" after it
+        return re.compile(rf"\b(?:(?:{_LEAD}|in\s+)?{pat}{_TRAIL_MODEL}|{_LEAD}{pat}\b)", re.IGNORECASE)
+    return re.compile(rf"\b(?:{_LEAD})?{pat}\b", re.IGNORECASE)  # specific model name
+
+
+_MODEL_CUE_REGEXES = [(prov, model, _compile_cue(pat, lead)) for prov, model, pat, lead in _MODEL_CUES]
+
+
+def _find_model_cue(text: str) -> Optional[Tuple[str, Optional[str], Tuple[int, int]]]:
+    """Earliest (then longest) model mention in the text, or None."""
+    best = None
+    for prov, model, rx in _MODEL_CUE_REGEXES:
+        m = rx.search(text or "")
+        if m:
+            key = (m.start(), -(m.end() - m.start()))
+            if best is None or key < best[0]:
+                best = (key, prov, model, m.span())
+    return None if best is None else (best[1], best[2], best[3])
+
+
+def detect_image_model_request(text: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    (provider, model) the user asked for in their own words, else (None, None).
+    model is None when only a provider was named ("using grok"): the provider's default applies.
+    """
+    hit = _find_model_cue(text or "")
+    return (hit[0], hit[1]) if hit else (None, None)
+
+
+def strip_image_model_cue(text: str) -> str:
+    """Remove the model mention ("... using grok") so it is not drawn into the picture prompt."""
+    hit = _find_model_cue(text or "")
+    if not hit:
+        return text
+    a, b = hit[2]
+    # Only a phrase ("using grok", "gemini model") is removed; a bare model name stays in the text.
+    span = text[a:b]
+    if not (re.match(_LEAD, span, re.IGNORECASE) or re.search(rf"{_TRAIL_MODEL}$", span, re.IGNORECASE)):
+        return text
+    cleaned = re.sub(r"\s{2,}", " ", f"{text[:a]} {text[b:]}").strip(" ,;:-")
+    return cleaned if len(cleaned) >= 3 else text
+
+
+def _infer_provider_from_model(model: Optional[str]) -> Optional[str]:
+    m = (model or "").lower()
+    if m.startswith("gemini"):
+        return "gemini"
+    if m.startswith(("gpt-image", "dall-e")):
+        return "openai"
+    if m.startswith("grok"):
+        return "grok"
+    return None
 
 
 def sanitize_image_params(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -80,6 +172,18 @@ def sanitize_image_params(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if v not in _VALID_FORMATS:
             raise ValueError(f"format must be one of {', '.join(_VALID_FORMATS)}")
         out["format"] = v
+    if raw.get("provider") is not None:
+        v = str(raw["provider"]).lower().strip()
+        if v not in _VALID_PROVIDERS:
+            raise ValueError(f"provider must be one of {', '.join(_VALID_PROVIDERS)}")
+        out["provider"] = v
+    if raw.get("model") is not None:
+        out["model"] = str(raw["model"]).strip()[:64]
+        owner = _infer_provider_from_model(out["model"])
+        if owner and out.get("provider") and owner != out["provider"]:
+            raise ValueError(f"model '{out['model']}' does not belong to provider '{out['provider']}'")
+    if raw.get("api_key") is not None:
+        out["api_key"] = str(raw["api_key"]).strip()
     if raw.get("transparent_bg") is not None:
         out["transparent_bg"] = bool(raw["transparent_bg"])
     if raw.get("size") is not None:
@@ -98,6 +202,8 @@ class ImageParams:
     resolution: str = "1K"           # "1K", "2K", "4K"
     format: str = "jpeg"             # "jpeg", "png", "webp"
     transparent_bg: bool = False
+    provider: Optional[str] = None   # "gemini", "openai", "grok"
+    model: Optional[str] = None      # Specific model ID override
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -108,10 +214,15 @@ class ImageParams:
         prompt: str = "",
         explicit_params: Optional[Dict[str, Any]] = None,
         inherited_params: Optional[Dict[str, Any]] = None,
+        selection_text: Optional[str] = None,
     ) -> "ImageParams":
         """
         Derive parameters. Only phrases that clearly ask for a setting count; style words an
         LLM habitually writes into prompts ("cinematic", "detailed", "story") do not.
+
+        selection_text is the text searched for a provider/model request. Pass the user's own
+        words. None means "use prompt"; an empty string means "do not look" (used when the
+        prompt was written by an LLM, which must never pick the model).
         """
         explicit = explicit_params or {}
         inherited = inherited_params or {}
@@ -123,6 +234,8 @@ class ImageParams:
         resolution = inherited.get("resolution") or "1K"
         fmt = inherited.get("format") or getattr(settings, "image_default_format", "jpeg").lower()
         transparent = bool(inherited.get("transparent_bg", False))
+        provider = inherited.get("provider")
+        model = inherited.get("model")
 
         # 2. Prompt triggers
         if re.search(r"\b(16:9|widescreen|wide[- ](?:format|screen)|banner|horizontal|"
@@ -163,6 +276,15 @@ class ImageParams:
         elif re.search(r"\b(jpeg|jpg)\b", p_lower):
             fmt = "jpeg"
 
+        # Provider / model: only from the user's own words (regex), never from LLM output
+        cue_provider, cue_model = detect_image_model_request(prompt if selection_text is None else selection_text)
+        if cue_provider:
+            if cue_provider != provider:
+                model = None  # an inherited model belongs to the old provider
+            provider = cue_provider
+            if cue_model:
+                model = cue_model
+
         # 3. Explicit overrides (highest precedence)
         if "size" in explicit:
             s = str(explicit["size"]).lower()
@@ -181,6 +303,14 @@ class ImageParams:
             resolution = str(explicit["resolution"]).upper()
         if explicit.get("format"):
             fmt = str(explicit["format"]).lower().replace("jpg", "jpeg")
+        if explicit.get("provider"):
+            new_provider = str(explicit["provider"]).lower().strip()
+            if new_provider != provider and not explicit.get("model"):
+                model = None
+            provider = new_provider
+        if explicit.get("model"):
+            model = str(explicit["model"]).strip()
+            provider = provider or _infer_provider_from_model(model)
         if "transparent_bg" in explicit and explicit["transparent_bg"] is not None:
             transparent = bool(explicit["transparent_bg"])
         if transparent:
@@ -192,6 +322,8 @@ class ImageParams:
             resolution=resolution,
             format=fmt,
             transparent_bg=transparent,
+            provider=provider,
+            model=model,
         )
 
     def to_openai_size(self) -> str:
@@ -236,33 +368,71 @@ def _is_optional_param_error(err: Exception) -> bool:
 # PROVIDER SELECTION
 # ======================================================================
 
+def _default_image_provider() -> str:
+    p = str(getattr(settings, "image_default_provider", "gemini")).lower().strip()
+    return p if p in _VALID_PROVIDERS else "gemini"
+
+
 def resolve_image_provider(
     model_provider: str,
     api_key: Optional[str],
     is_byok: bool = False,
+    requested_provider: Optional[str] = None,
+    image_api_key: Optional[str] = None,
 ) -> Optional[Tuple[str, str]]:
     """
-    Map the chat provider to (image_provider, api_key), or None if images cannot be
+    Map the chat provider and requested provider to (image_provider, api_key), or None if images cannot be
     generated for this request.
 
     Claude and DeepSeek have no image endpoint, so they use the platform's fallback
     provider key. That key is never used for bring-your-own-key users, whose requests
     must not be billed to the platform.
     """
-    provider = (model_provider or "").lower().strip()
-    if provider in ("claude", "deepseek"):
-        if is_byok:
-            return None
+    req = (requested_provider or "").lower().strip()
+    if req in _VALID_PROVIDERS:
+        if image_api_key:
+            return (req, image_api_key)
+        if req == (model_provider or "").lower().strip() and api_key:
+            return (req, api_key)
+        if not is_byok:
+            key = getattr(settings, f"default_{req}_api_key", None)
+            if key:
+                return (req, key)
+        return None
+
+    chat = (model_provider or "").lower().strip()
+
+    # Nothing requested: the configured default image provider (gemini) is used whichever chat model
+    # is active. Bring-your-own-key users never touch platform keys, so they stay on their own
+    # provider's key when it has an image endpoint.
+    if image_api_key:
+        return (chat if chat in _VALID_PROVIDERS else _default_image_provider(), image_api_key)
+    preferred = _default_image_provider()
+    if chat == preferred and api_key:
+        return (preferred, api_key)
+    if not is_byok:
+        key = getattr(settings, f"default_{preferred}_api_key", None)
+        if key:
+            return (preferred, key)
+    if chat in _VALID_PROVIDERS and api_key:
+        return (chat, api_key)
+    if chat in ("claude", "deepseek") and not is_byok:
         fallback = getattr(settings, "image_default_provider_fallback", "gemini").lower()
         key = getattr(settings, f"default_{fallback}_api_key", None)
         return (fallback, key) if key else None
-    if provider in ("openai", "gemini", "grok"):
-        return (provider, api_key) if api_key else None
     return None
 
 
-def image_route_available(model_provider: str, api_key: Optional[str], is_byok: bool = False) -> bool:
-    return resolve_image_provider(model_provider, api_key, is_byok) is not None
+def image_route_available(
+    model_provider: str,
+    api_key: Optional[str],
+    is_byok: bool = False,
+    requested_provider: Optional[str] = None,
+    image_api_key: Optional[str] = None,
+) -> bool:
+    return resolve_image_provider(
+        model_provider, api_key, is_byok, requested_provider, image_api_key
+    ) is not None
 
 
 # ======================================================================
@@ -406,6 +576,7 @@ def _call_gemini_with_fallback(
     params: ImageParams,
     reference_image_bytes: Optional[bytes] = None,
     request_id: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> Tuple[bytes, str, str]:
     """
     Call Google Gemini GenAI SDK with retry on fallback models.
@@ -415,7 +586,7 @@ def _call_gemini_with_fallback(
     from google import genai
     from google.genai import types
 
-    primary_model = get_image_model_id("gemini")
+    primary_model = model_id or get_image_model_id("gemini")
     fallback_models = get_image_model_fallbacks("gemini")
     models_to_try = [primary_model] + [m for m in fallback_models if m != primary_model]
 
@@ -443,10 +614,18 @@ def _call_gemini_with_fallback(
         contents = prompt
 
     last_error = None
-    for idx, model_id in enumerate(models_to_try):
+    for idx, target_model in enumerate(models_to_try):
         try:
-            logger.info(f"{log_prefix}Calling Gemini image generation (model={model_id})...")
-            response = client.models.generate_content(model=model_id, contents=contents, config=config)
+            logger.info(f"{log_prefix}Calling Gemini image generation (model={target_model})...")
+            try:
+                response = client.models.generate_content(model=target_model, contents=contents, config=config)
+            except Exception as gen_err:
+                if img_config is not None and any(w in str(gen_err).lower() for w in ("image_config", "image_size", "unsupported", "invalid argument", "extra inputs")):
+                    logger.warning(f"{log_prefix}Gemini rejected image_config ({gen_err}); retrying without image_config")
+                    basic_config = types.GenerateContentConfig(response_modalities=["IMAGE"])
+                    response = client.models.generate_content(model=target_model, contents=contents, config=basic_config)
+                else:
+                    raise gen_err
 
             if not response.candidates:
                 block_reason = getattr(response, "prompt_feedback", None)
@@ -460,7 +639,7 @@ def _call_gemini_with_fallback(
             for part in candidate.content.parts:
                 if getattr(part, "inline_data", None) and part.inline_data.data:
                     mime = part.inline_data.mime_type or "image/png"
-                    return part.inline_data.data, mime, model_id
+                    return part.inline_data.data, mime, target_model
 
             raise Exception("No inline image bytes in Gemini response candidate parts")
 
@@ -468,7 +647,7 @@ def _call_gemini_with_fallback(
             last_error = e
             if _is_model_not_found_error(e) and idx < len(models_to_try) - 1:
                 logger.warning(
-                    f"{log_prefix}Gemini model '{model_id}' failed ({e}). "
+                    f"{log_prefix}Gemini model '{target_model}' failed ({e}). "
                     f"Retrying with fallback model '{models_to_try[idx + 1]}'..."
                 )
                 continue
@@ -483,6 +662,7 @@ def _call_openai_with_fallback(
     params: ImageParams,
     reference_image_bytes: Optional[bytes] = None,
     request_id: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> Tuple[bytes, str, str]:
     """
     Call OpenAI SDK with retry on fallback models.
@@ -493,7 +673,7 @@ def _call_openai_with_fallback(
     log_prefix = f"[{request_id}] " if request_id else ""
     from openai import OpenAI
 
-    primary_model = get_image_model_id("openai")
+    primary_model = model_id or get_image_model_id("openai")
     fallback_models = get_image_model_fallbacks("openai")
     models_to_try = [primary_model] + [m for m in fallback_models if m != primary_model]
 
@@ -506,32 +686,32 @@ def _call_openai_with_fallback(
     if params.transparent_bg:
         extras["background"] = "transparent"
 
-    def _request(model_id: str, tuning: Dict[str, Any], first_attempt: bool):
+    def _request(target_m: str, tuning: Dict[str, Any], first_attempt: bool):
         if reference_image_bytes:
             _, ref_ext = sniff_image_bytes(reference_image_bytes)
             buf = io.BytesIO(reference_image_bytes)
             buf.name = f"edit_input.{ref_ext or 'png'}"
-            kwargs: Dict[str, Any] = dict(model=model_id, image=buf, prompt=prompt, size=size, n=1, **tuning)
+            kwargs: Dict[str, Any] = dict(model=target_m, image=buf, prompt=prompt, size=size, n=1, **tuning)
             if first_attempt and tuning:
                 kwargs["input_fidelity"] = "high"  # keep the user's subject recognisable
             return client.images.edit(**kwargs)
-        return client.images.generate(model=model_id, prompt=prompt, size=size, n=1, **tuning)
+        return client.images.generate(model=target_m, prompt=prompt, size=size, n=1, **tuning)
 
     last_error = None
-    for idx, model_id in enumerate(models_to_try):
+    for idx, target_model in enumerate(models_to_try):
         try:
             logger.info(
                 f"{log_prefix}Calling OpenAI image {'edit' if reference_image_bytes else 'generation'} "
-                f"(model={model_id}, size={size}, quality={extras['quality']}, format={params.format})..."
+                f"(model={target_model}, size={size}, quality={extras['quality']}, format={params.format})..."
             )
             try:
-                resp = _request(model_id, extras, True)
+                resp = _request(target_model, extras, True)
                 used_format = params.format
             except Exception as param_err:
                 if not _is_optional_param_error(param_err):
                     raise
                 logger.warning(f"{log_prefix}OpenAI rejected tuning params ({param_err}); retrying bare request")
-                resp = _request(model_id, {}, False)
+                resp = _request(target_model, {}, False)
                 used_format = "png"
 
             data_obj = resp.data[0]
@@ -539,11 +719,11 @@ def _call_openai_with_fallback(
             url = getattr(data_obj, "url", None)
 
             if b64_json:
-                return base64.b64decode(b64_json), f"image/{used_format}", model_id
+                return base64.b64decode(b64_json), f"image/{used_format}", target_model
             if url:
                 r = requests.get(url, timeout=45)
                 r.raise_for_status()
-                return r.content, r.headers.get("Content-Type", "image/png"), model_id
+                return r.content, r.headers.get("Content-Type", "image/png"), target_model
 
             raise Exception("OpenAI returned neither b64_json nor url")
 
@@ -551,7 +731,7 @@ def _call_openai_with_fallback(
             last_error = e
             if _is_model_not_found_error(e) and idx < len(models_to_try) - 1:
                 logger.warning(
-                    f"{log_prefix}OpenAI model '{model_id}' failed ({e}). "
+                    f"{log_prefix}OpenAI model '{target_model}' failed ({e}). "
                     f"Retrying with fallback '{models_to_try[idx + 1]}'..."
                 )
                 continue
@@ -642,6 +822,7 @@ def _call_grok_with_fallback(
     params: ImageParams,
     reference_image_bytes: Optional[bytes] = None,
     request_id: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> Tuple[bytes, str, str]:
     """
     xAI generation (OpenAI-compatible) or edit (JSON endpoint) with model fallback.
@@ -651,7 +832,7 @@ def _call_grok_with_fallback(
     """
     log_prefix = f"[{request_id}] " if request_id else ""
 
-    primary_model = get_image_model_id("grok")
+    primary_model = model_id or get_image_model_id("grok")
     fallback_models = get_image_model_fallbacks("grok")
     models_to_try = [primary_model] + [m for m in fallback_models if m != primary_model]
 
@@ -662,18 +843,18 @@ def _call_grok_with_fallback(
     client = OpenAI(base_url="https://api.x.ai/v1", api_key=api_key)
 
     last_error = None
-    for idx, model_id in enumerate(models_to_try):
+    for idx, target_model in enumerate(models_to_try):
         try:
-            logger.info(f"{log_prefix}Calling Grok image generation (model={model_id})...")
-            resp = client.images.generate(model=model_id, prompt=prompt, n=1)
+            logger.info(f"{log_prefix}Calling Grok image generation (model={target_model})...")
+            resp = client.images.generate(model=target_model, prompt=prompt, n=1)
             content, mime = _grok_download(resp.data[0].url)
-            return content, mime, model_id
+            return content, mime, target_model
 
         except Exception as e:
             last_error = e
             if _is_model_not_found_error(e) and idx < len(models_to_try) - 1:
                 logger.warning(
-                    f"{log_prefix}Grok model '{model_id}' failed ({e}). "
+                    f"{log_prefix}Grok model '{target_model}' failed ({e}). "
                     f"Retrying with fallback '{models_to_try[idx + 1]}'..."
                 )
                 continue
@@ -698,60 +879,84 @@ def generate_image_unified(
     inherited_params: Optional[Dict[str, Any]] = None,
     context_extra: Optional[Dict[str, Any]] = None,
     is_byok: bool = False,
+    model_id: Optional[str] = None,
+    selection_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Unified entry point for image generation & editing across all providers.
 
-    1. Resolves the image provider (Claude/DeepSeek use the platform fallback, never for BYOK)
-    2. Parses ImageParams (explicit > prompt regex > inherited > default)
-    3. Runs the provider call with model fallback
-    4. A Grok edit that fails falls back to Gemini when a platform key exists; otherwise it
+    1. Resolves ImageParams (explicit > user-text regex > inherited > default). The provider/model
+       regex runs on selection_text (the user's own words); pass "" when the prompt was written by
+       an LLM so that the LLM can never pick the model. None falls back to the prompt itself.
+    2. Identifies effective provider & model override
+    3. Resolves provider API key (handles cross-provider requests and fallback keys)
+    4. Runs the provider call with model fallback
+    5. A Grok edit that fails falls back to Gemini when a platform key exists; otherwise it
        raises. The reference image is never silently dropped.
-    5. Sniffs real bytes, converts format if needed, uploads, measures dimensions
-    6. Stores context for follow-ups (scoped to document_id when given)
+    6. Sniffs real bytes, converts format if needed, uploads to S3/CDN, measures dimensions
+    7. Stores context for follow-ups (scoped to document_id when given)
     """
     start_time = time.time()
     log_prefix = f"[{request_id}] " if request_id else ""
-    provider = (model_provider or "openai").lower().strip()
 
-    if provider in ("claude", "deepseek"):
-        resolved = resolve_image_provider(provider, api_key, is_byok)
-        if not resolved:
-            raise ValueError(
-                f"Provider '{provider}' has no image endpoint and no platform fallback key is available"
-            )
-        logger.info(f"{log_prefix}Provider '{provider}' has no image endpoint; routing to '{resolved[0]}'")
-        provider, api_key = resolved
-
-    if not api_key:
-        raise ValueError(f"No API key available for image provider '{provider}'")
-
-    params = ImageParams.from_prompt_and_overrides(prompt, explicit_params, inherited_params)
+    params = ImageParams.from_prompt_and_overrides(prompt, explicit_params, inherited_params, selection_text)
     logger.info(
         f"{log_prefix}Image params: aspect={params.aspect_ratio}, quality={params.quality}, "
-        f"res={params.resolution}, format={params.format}, edit={bool(reference_image_bytes)}"
+        f"res={params.resolution}, format={params.format}, provider={params.provider}, "
+        f"model={params.model}, edit={bool(reference_image_bytes)}"
     )
+
+    explicit_api_key = (explicit_params or {}).get("api_key")
+    target_model = model_id or params.model
+
+    resolved = resolve_image_provider(
+        model_provider,
+        api_key,
+        is_byok,
+        requested_provider=params.provider,
+        image_api_key=explicit_api_key,
+    )
+    if not resolved:
+        wanted = params.provider or _default_image_provider()
+        if is_byok:
+            raise ValueError(
+                f"No API key provided for image provider '{wanted}' (BYOK account cannot use platform keys)"
+            )
+        raise ValueError(f"No platform API key available for image provider '{wanted}'")
+    provider, eff_api_key = resolved
+    if provider != (model_provider or "").lower().strip():
+        logger.info(f"{log_prefix}Image provider '{provider}' differs from chat provider '{model_provider}'")
+    if target_model and _infer_provider_from_model(target_model) not in (None, provider):
+        target_model = None  # a model that belongs to another provider is never sent to this one
 
     adapter_t0 = time.time()
     result = None
 
     if provider == "grok" and reference_image_bytes:
         try:
-            result = _call_grok_with_fallback(api_key, prompt, params, reference_image_bytes, request_id)
+            result = _call_grok_with_fallback(
+                eff_api_key, prompt, params, reference_image_bytes, request_id, model_id=target_model
+            )
         except Exception as grok_err:
             gemini_key = getattr(settings, "default_gemini_api_key", None)
             if is_byok or not gemini_key:
                 raise ValueError(f"Grok image edit failed and no fallback is available: {grok_err}") from grok_err
             logger.warning(f"{log_prefix}Grok edit failed ({grok_err}); falling back to Gemini")
-            provider, api_key = "gemini", gemini_key
+            provider, eff_api_key = "gemini", gemini_key
 
     if result is None:
         if provider == "gemini":
-            result = _call_gemini_with_fallback(api_key, prompt, params, reference_image_bytes, request_id)
+            result = _call_gemini_with_fallback(
+                eff_api_key, prompt, params, reference_image_bytes, request_id, model_id=target_model
+            )
         elif provider == "openai":
-            result = _call_openai_with_fallback(api_key, prompt, params, reference_image_bytes, request_id)
+            result = _call_openai_with_fallback(
+                eff_api_key, prompt, params, reference_image_bytes, request_id, model_id=target_model
+            )
         elif provider == "grok":
-            result = _call_grok_with_fallback(api_key, prompt, params, None, request_id)
+            result = _call_grok_with_fallback(
+                eff_api_key, prompt, params, None, request_id, model_id=target_model
+            )
         else:
             raise ValueError(f"Unsupported image provider: '{provider}'")
 

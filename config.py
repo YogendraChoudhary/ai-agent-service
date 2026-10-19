@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     image_router_shadow_mode: bool = Field(False, alias="IMAGE_ROUTER_SHADOW_MODE")
     image_memory_enabled: bool = Field(True, alias="IMAGE_MEMORY_ENABLED")
     image_default_format: str = Field("jpeg", alias="IMAGE_DEFAULT_FORMAT")
+    # Image provider used when the user's request names none (chat model never decides this).
+    image_default_provider: str = Field("gemini", alias="IMAGE_DEFAULT_PROVIDER")
     image_default_provider_fallback: str = Field("gemini", alias="IMAGE_DEFAULT_PROVIDER_FALLBACK")
     image_memory_ttl_seconds: int = Field(3600, alias="IMAGE_MEMORY_TTL_SECONDS")
 

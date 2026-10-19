@@ -342,7 +342,11 @@ class TestLatencyOptimizations(unittest.TestCase):
         response.data = [MagicMock(b64_json=base64.b64encode(b"image").decode())]
         fake_client = MagicMock()
         fake_client.images.generate.return_value = response
-        with patch("openai.OpenAI", return_value=fake_client), patch(
+        # No platform Gemini key: image generation stays on the (mocked) OpenAI client and the
+        # test can never reach a real provider.
+        with patch("config.settings.default_gemini_api_key", None), patch(
+            "openai.OpenAI", return_value=fake_client
+        ), patch(
             "src.s3_service.upload_image_from_bytes",
             return_value="https://cdn.example.com/test.png",
         ):

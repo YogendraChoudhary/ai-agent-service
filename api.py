@@ -265,6 +265,24 @@ class ProcessRequest(BaseModel):
     model: str = Field(..., min_length=1)
     api_key: str = Field(..., min_length=1)
     secondary_prompt: Optional[str] = ""
+    image_provider: Optional[str] = Field(None, max_length=32)
+    image_model: Optional[str] = Field(None, max_length=64)
+    image_params: Optional[Dict[str, Any]] = None
+
+    @field_validator('image_provider')
+    @classmethod
+    def validate_image_provider(cls, v):
+        if v is not None and v.lower() not in ('gemini', 'openai', 'grok'):
+            raise ValueError('Invalid image_provider. Must be one of: gemini, openai, grok')
+        return v.lower() if v is not None else None
+
+    @field_validator('image_params')
+    @classmethod
+    def validate_image_params(cls, v):
+        try:
+            return sanitize_image_params(v) or None
+        except ValueError as e:
+            raise ValueError(str(e))
 
     @field_validator('type')
     @classmethod
@@ -292,9 +310,18 @@ class StreamRequest(BaseModel):
     # Scopes the "previous image" memory so a follow-up in one document never picks up
     # an image generated in another.
     document_id: Optional[str] = Field(None, max_length=128, pattern=r'^[A-Za-z0-9_.:-]+$')
+    image_provider: Optional[str] = Field(None, max_length=32)
+    image_model: Optional[str] = Field(None, max_length=64)
     # Explicit image settings; they outrank anything inferred from the prompt text.
-    # Keys: aspect_ratio, quality, resolution, format, transparent_bg.
+    # Keys: aspect_ratio, quality, resolution, format, transparent_bg, provider, model.
     image_params: Optional[Dict[str, Any]] = None
+
+    @field_validator('image_provider')
+    @classmethod
+    def validate_image_provider(cls, v):
+        if v is not None and v.lower() not in ('gemini', 'openai', 'grok'):
+            raise ValueError('Invalid image_provider. Must be one of: gemini, openai, grok')
+        return v.lower() if v is not None else None
 
     @field_validator('image_params')
     @classmethod
@@ -524,6 +551,7 @@ async def async_validate_and_get_api_key(
     license_meta = {
         'user_id': user_id,
         'requires_user_api_keys': requires_user_api_keys,
+        'user_keys': user_keys,
     }
     return api_key, license_meta
 
@@ -752,6 +780,35 @@ async def stream_text(
 
                 next_reserve_threshold = (upfront_reserved_scaled // CREDIT_SCALE) * 1000
 
+                # Merge top-level image_provider and image_model into image_params if given
+                merged_image_params = dict(request_data.image_params or {})
+                if request_data.image_provider:
+                    merged_image_params["provider"] = request_data.image_provider
+                if request_data.image_model:
+                    merged_image_params["model"] = request_data.image_model
+
+                # Model named in the user's own words ("using grok"): regex only, never the LLM.
+                # An explicit API field wins. Resolved here so the matching user key is looked up.
+                if agent_type == 'general' and not merged_image_params.get("provider"):
+                    from src.image_gen import detect_image_model_request
+                    cue_provider, cue_model = detect_image_model_request(request_data.query)
+                    if cue_provider:
+                        merged_image_params["provider"] = cue_provider
+                        if cue_model and not merged_image_params.get("model"):
+                            merged_image_params["model"] = cue_model
+
+                # Resolve provider-specific API key if image provider differs from chat model
+                target_img_provider = merged_image_params.get("provider")
+                if target_img_provider and target_img_provider != model_provider and "api_key" not in merged_image_params:
+                    user_keys = license_meta.get("user_keys")
+                    resolved_img_key = redis_manager.resolve_api_key_from_user_keys(
+                        user_keys=user_keys,
+                        model_provider=target_img_provider,
+                        default_keys=None if is_byok else DEFAULT_API_KEYS,
+                    )
+                    if resolved_img_key:
+                        merged_image_params["api_key"] = resolved_img_key
+
                 async for chunk in iterate_in_threadpool(process_user_query_stream(
                     full_query,
                     model_provider=model_provider,
@@ -767,7 +824,7 @@ async def stream_text(
                     # text operations carry user text that can mention images freely.
                     image_routing=(agent_type == 'general'),
                     document_id=request_data.document_id,
-                    image_params=request_data.image_params,
+                    image_params=merged_image_params or None,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
