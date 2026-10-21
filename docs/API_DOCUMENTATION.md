@@ -767,9 +767,11 @@ Both endpoints and `/agent/email/generate` accept `model_source: "default" | "us
 `"user"`. The frontend sends `"default"` until the user changes the model dropdown, then `"user"`.
 Email continues to use the submitted provider. Existing image selection is unchanged.
 
-When task routing is enabled, `/agent/stream` selects Claude for default code requests and preserves the
-submitted provider for content. A user-selected provider takes priority. Code candidates are Claude →
-OpenAI → Gemini; content candidates are submitted provider → OpenAI → Claude. Providers without keys,
+When task routing is enabled, `/agent/stream` selects Claude for default code requests, OpenAI (GPT-5.2) for
+default `make_longer` and `generate_email_template` requests, and preserves the submitted provider for all
+other content, including `change_tone`. A user-selected provider takes priority. Code candidates are Claude →
+OpenAI → Gemini; writing candidates are OpenAI → submitted provider → Claude; content candidates are submitted
+provider → OpenAI → Claude. Providers without keys,
 providers without vision for reference-image requests, and blocked model IDs are removed. The original
 model tier is preserved. BYOK requests, including accounts with `use_own_keys`, never use platform keys
 for routing or classification.
@@ -794,25 +796,25 @@ When validation is enabled, a non-streaming answer that remains invalid returns 
 `{"error": "The generated code did not pass validation", "issues": ["..."]}`. This also applies when
 repair is disabled. The evaluation runner scores the final replacement when a streaming repair succeeds.
 
-All new rollout flags default to `false`:
+Rollout flags (set any to `false` to switch that piece off without a deploy):
 
-| Environment variable | Purpose |
-|---|---|
-| `TASK_ROUTING_ENABLED` | Apply task defaults and filter eligible providers |
-| `PROVIDER_FALLBACK_ENABLED` | Retry 429 once and switch providers before output begins |
-| `CODE_INTENT_REGEX_ENABLED` | Route explicit code requests inside `general` |
-| `CODE_INTENT_CLASSIFIER_ENABLED` | Resolve ambiguous code mentions with a bounded lightweight model |
-| `CODE_INTENT_SHADOW_MODE` | Log intent without changing the selected agent |
-| `CODE_VALIDATION_ENABLED` | Check generated code after completion |
-| `CODE_REPAIR_ENABLED` | Allow one repair |
-| `CODE_REPAIR_STREAM_EVENT` | Allow streaming repair and `content_replace` |
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `TASK_ROUTING_ENABLED` | `true` | Apply task defaults and filter eligible providers |
+| `PROVIDER_FALLBACK_ENABLED` | `true` | Retry 429 once and switch providers before output begins |
+| `CODE_INTENT_REGEX_ENABLED` | `true` | Route explicit code requests inside `general` |
+| `CODE_INTENT_CLASSIFIER_ENABLED` | `true` | Resolve ambiguous code mentions with a bounded lightweight model |
+| `CODE_INTENT_SHADOW_MODE` | `false` | Log intent without changing the selected agent |
+| `CODE_VALIDATION_ENABLED` | `true` | Check generated code after completion |
+| `CODE_REPAIR_ENABLED` | `true` | Allow one repair |
+| `CODE_REPAIR_STREAM_EVENT` | `false` | Allow streaming repair and `content_replace` (enable once the frontend handles it) |
 
 `CODE_CLASSIFIER_TIMEOUT_SECONDS` defaults to `1.5`. Platform classification uses the currently configured
 Claude autocomplete model; BYOK uses the user's provider's autocomplete model and key. Ordinary content
 without code cues never calls the classifier. Timeouts/errors/malformed answers fall back to content.
 Mixed requests such as an article containing a code example stay with the writing agent. Image intent wins.
 
-`TASK_ROUTE_DEFAULTS` and `TASK_FALLBACK_TREES` accept JSON objects with `code`/`content` keys and provider
+`TASK_ROUTE_DEFAULTS` and `TASK_FALLBACK_TREES` accept JSON objects with `code`/`writing`/`content` keys and provider
 names (`openai`, `claude`, `gemini`, `grok`, `deepseek`). A default of `null` keeps the submitted provider;
 `<requested>` in a fallback tree refers to that provider. Invalid overrides are logged and ignored at startup.
 Fable (`claude-fable-5-1`) remains blocked regardless of overrides.

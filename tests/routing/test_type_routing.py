@@ -161,6 +161,14 @@ class TestEndpointsPassTheDeclaredAgent(unittest.TestCase):
 
     META = {"user_id": "u1", "requires_user_api_keys": False, "user_keys": {}}
 
+    def setUp(self):
+        # The licence check is faked and there is no Redis, so provider routing stays off here.
+        from config import settings
+        for name in ("task_routing_enabled", "provider_fallback_enabled"):
+            p = patch.object(settings, name, False)
+            p.start()
+            self.addCleanup(p.stop)
+
     def _client(self):
         from fastapi.testclient import TestClient
         return TestClient(api.app, raise_server_exceptions=False)

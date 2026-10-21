@@ -2218,6 +2218,8 @@ def process_user_query_stream(
     from .intent_classifier import classify_intent
     request_type = ('generate_code' if force_agent_type == 'code_writer' else
                     'explain_code' if force_agent_type == 'code_explainer' else
+                    'make_longer' if force_agent_type == 'make_longer' else
+                    'generate_email_template' if force_agent_type == 'email_template' else
                     'general' if force_agent_type in (None, FREE_FORM_AGENT) else 'typed')
     platform_classifier_key = classifier_platform_key or ((key_resolver.default_keys or {}).get('anthropic_api_key') if key_resolver else None)
     if request_type == 'general' and image_intent and image_intent['kind'] in ('generate', 'edit'):

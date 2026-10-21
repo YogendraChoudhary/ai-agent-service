@@ -27,16 +27,17 @@ if _dotenv_path:
 
 
 class Settings(BaseSettings):
-    task_routing_enabled: bool = Field(False, alias="TASK_ROUTING_ENABLED")
-    provider_fallback_enabled: bool = Field(False, alias="PROVIDER_FALLBACK_ENABLED")
+    task_routing_enabled: bool = Field(True, alias="TASK_ROUTING_ENABLED")
+    provider_fallback_enabled: bool = Field(True, alias="PROVIDER_FALLBACK_ENABLED")
     task_route_defaults: str = Field('{}', alias="TASK_ROUTE_DEFAULTS")
     task_fallback_trees: str = Field('{}', alias="TASK_FALLBACK_TREES")
-    code_intent_regex_enabled: bool = Field(False, alias="CODE_INTENT_REGEX_ENABLED")
-    code_intent_classifier_enabled: bool = Field(False, alias="CODE_INTENT_CLASSIFIER_ENABLED")
+    code_intent_regex_enabled: bool = Field(True, alias="CODE_INTENT_REGEX_ENABLED")
+    code_intent_classifier_enabled: bool = Field(True, alias="CODE_INTENT_CLASSIFIER_ENABLED")
     code_intent_shadow_mode: bool = Field(False, alias="CODE_INTENT_SHADOW_MODE")
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
-    code_validation_enabled: bool = Field(False, alias="CODE_VALIDATION_ENABLED")
-    code_repair_enabled: bool = Field(False, alias="CODE_REPAIR_ENABLED")
+    code_validation_enabled: bool = Field(True, alias="CODE_VALIDATION_ENABLED")
+    code_repair_enabled: bool = Field(True, alias="CODE_REPAIR_ENABLED")
+    # Off until the frontend handles the content_replace SSE event.
     code_repair_stream_event: bool = Field(False, alias="CODE_REPAIR_STREAM_EVENT")
     text_prices_per_mtok: str = Field('{}', alias="TEXT_PRICES_PER_MTOK")
 
@@ -49,9 +50,9 @@ class Settings(BaseSettings):
             if not isinstance(data, dict):
                 raise ValueError('expected an object')
             if info.field_name == 'task_route_defaults':
-                valid = all(k in {'code', 'content'} and (v is None or v in providers) for k, v in data.items())
+                valid = all(k in {'code', 'writing', 'content'} and (v is None or v in providers) for k, v in data.items())
             elif info.field_name == 'task_fallback_trees':
-                valid = all(k in {'code', 'content'} and isinstance(v, list)
+                valid = all(k in {'code', 'writing', 'content'} and isinstance(v, list)
                             and all(isinstance(p, str) and p in providers | {'<requested>'} for p in v)
                             for k, v in data.items())
             else:

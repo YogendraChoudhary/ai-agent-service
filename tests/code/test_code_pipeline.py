@@ -22,6 +22,11 @@ class TestCodePipeline(unittest.TestCase):
             p = patch.object(settings, name, True)
             p.start()
             self.addCleanup(p.stop)
+        # These tests fake the licence check; routing is switched on per test where it is under test.
+        for name in ('task_routing_enabled', 'provider_fallback_enabled'):
+            p = patch.object(settings, name, False)
+            p.start()
+            self.addCleanup(p.stop)
 
     def agent(self):
         def run(query, stream=True, **kw):

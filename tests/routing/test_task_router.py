@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from config import Settings, settings
 from src.models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, AUTOCOMPLETE_MODEL_IDS
-from src.task_router import KeyResolver, resolve_route
+from src.task_router import KeyResolver, resolve_route, task_for_request
 from src.redis_manager import RedisManager
 from src.text_processing_agent import get_model, get_autocomplete_suggestion
 
@@ -15,8 +15,23 @@ class TestTaskRouter(unittest.TestCase):
         values.update(kw)
         return [c.provider for c in resolve_route(**values)]
 
+    @patch.object(settings, 'task_routing_enabled', False)
+    @patch.object(settings, 'provider_fallback_enabled', False)
     def test_flags_off_keeps_requested_provider(self):
         self.assertEqual(self.route(), ['gemini'])
+
+    def test_shipped_defaults_enable_routing_but_not_stream_repair(self):
+        import os
+        flags = [n.upper() for n in Settings.model_fields if n.startswith(('task_routing', 'provider_fallback', 'code_'))]
+        with patch.dict(os.environ, {}, clear=False):
+            for name in flags:
+                os.environ.pop(name, None)
+            config = Settings(_env_file=None)
+        for name in ('task_routing_enabled', 'provider_fallback_enabled', 'code_intent_regex_enabled',
+                     'code_intent_classifier_enabled', 'code_validation_enabled', 'code_repair_enabled'):
+            self.assertTrue(getattr(config, name), name)
+        self.assertFalse(config.code_repair_stream_event)
+        self.assertFalse(config.code_intent_shadow_mode)
 
     @patch.object(settings, 'task_routing_enabled', True)
     def test_defaults_and_user_choice(self):
@@ -24,6 +39,24 @@ class TestTaskRouter(unittest.TestCase):
         self.assertEqual(self.route(model_source='user'), ['gemini', 'claude', 'openai'])
         self.assertEqual(self.route(task='content'), ['gemini', 'openai', 'claude'])
         self.assertEqual(self.route(available_providers={'gemini'}), ['gemini'])
+
+    @patch.object(settings, 'task_routing_enabled', True)
+    def test_writing_defaults_to_openai_advanced(self):
+        self.assertEqual(self.route(task='writing'), ['openai', 'gemini', 'claude'])
+        self.assertEqual(self.route(task='writing', model_source='user'), ['gemini', 'openai', 'claude'])
+        route = resolve_route('writing', 'gemini', 'default', {'openai', 'gemini'}, True)
+        self.assertEqual(ADVANCED_MODEL_IDS[route[0].provider], 'gpt-5.2')
+
+    def test_writing_task_covers_only_make_longer_and_email_template(self):
+        self.assertEqual(task_for_request('make_longer', 'expand this')[0], 'writing')
+        self.assertEqual(task_for_request('generate_email_template', 'a launch email')[0], 'writing')
+        for request_type in ('typed', 'change_tone', 'enhance_with_ai', 'fix_grammar'):
+            with self.subTest(request_type=request_type):
+                self.assertEqual(task_for_request(request_type, 'make this formal')[0], 'content')
+
+    def test_writing_override_is_accepted(self):
+        config = Settings(_env_file=None, TASK_ROUTE_DEFAULTS='{"writing": "claude"}')
+        self.assertEqual(config.task_route_defaults, '{"writing": "claude"}')
 
     @patch.object(settings, 'provider_fallback_enabled', True)
     def test_same_tier_vision_filter_and_deduplication(self):
