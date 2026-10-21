@@ -26,6 +26,17 @@ All IDs below were verified against each provider's live /models endpoint on
 # ============================================
 # TEXT CHAT
 # ============================================
+BLOCKED_MODELS = frozenset({'claude-fable-5-1'})
+
+
+def ensure_allowed_model(model_id: str) -> str:
+    if model_id in BLOCKED_MODELS:
+        raise ValueError(f'Model {model_id} is blocked')
+    return model_id
+
+
+# Prices are supplied by deployment after verification; unknown prices remain unknown, never zero.
+TEXT_PRICES_PER_MTOK = {}
 
 # Capable tier — the main editor AI actions (write, enhance, summarise, ...).
 ADVANCED_MODEL_IDS = {

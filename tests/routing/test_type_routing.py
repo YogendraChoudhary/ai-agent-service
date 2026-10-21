@@ -18,7 +18,7 @@ from src.text_processing_agent import (
     determine_agent_type,
     process_user_query_stream,
 )
-from test_image_routing import RouteTestCase, AgentPathReached
+from tests.images.test_image_routing import RouteTestCase, AgentPathReached
 
 # (declared type, user text that the old keyword router read as a DIFFERENT operation)
 HIJACK_MATRIX = [
@@ -58,6 +58,7 @@ class TestTable(unittest.TestCase):
             "translate": "translation", "make_longer": "make_longer", "make_shorter": "make_shorter",
             "enhance_with_ai": "enhance", "change_tone": "tone", "general": "smart_global",
             "generate_email_template": "email_template", "extract_image_text": "text_extraction",
+            "generate_code": "code_writer", "explain_code": "code_explainer",
         })
 
     def test_general_is_the_free_form_agent(self):

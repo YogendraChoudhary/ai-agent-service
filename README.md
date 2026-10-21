@@ -4,6 +4,31 @@ A high-performance asynchronous AI agent service built with **FastAPI**, **Uvico
 
 The service provides multi-provider LLM inference (OpenAI, Anthropic Claude, Grok xAI, Google Gemini, DeepSeek), Server-Sent Events (SSE) streaming, low-latency keystroke autocomplete, concurrent web research tools, and credit reservation/settlement tracking.
 
+## Project layout
+
+```text
+api.py               Application entry point
+config.py            Application settings
+src/                 Service implementation
+tests/
+  code/              Code generation and validation tests
+  core/              Observability, latency, and security tests
+  email/             Email template tests
+  images/            Image generation and routing tests
+  routing/           Request routing, classification, and fallback tests
+  fixtures/          Shared labelled evaluation cases
+  conftest.py        Shared test guards
+scripts/             Local tools and opt-in live checks
+benchmarks/          Saved benchmark reports
+docs/                API documentation, plans, and benchmark notes
+```
+
+Install the test runner with `python -m pip install pytest`, then run `python -m pytest` from the
+project root. Test discovery is limited to `tests/`; the shared guards block real Redis access.
+Live provider checks remain opt-in scripts. Run one area with `python -m pytest tests/code`,
+or run the code intent corpus with `python scripts/evaluate_code.py`.
+The latency runner is `python scripts/benchmark_suite.py <phase>`; it writes reports to `benchmarks/`.
+
 ---
 
 ## 1. Environment Configuration
@@ -184,13 +209,18 @@ contains the words "fix grammar" still runs the simplify agent.
 | `complete` | `completion` | | `change_tone` | `tone` |
 | `emojify` | `emojify` | | `generate_email_template` | `email_template` |
 | `translate` | `translation` | | `extract_image_text` | `text_extraction` |
-| `make_longer` | `make_longer` | | **`general`** | **`smart_global`** (always) |
+| `make_longer` | `make_longer` | | **`general`** | **`smart_global`** (default) |
+| `generate_code` | `code_writer` | | `explain_code` | `code_explainer` |
 
-`general` always goes to the free-form agent, which plans its own tools from the user's words
+`general` defaults to the free-form agent, which plans its own tools from the user's words
 (`src/request_plan.py`: image count, web access, model tier) and may take the direct image route.
 Tables, lists and summaries requested through `general` are handled by that agent; the dedicated `table`,
 `list` and `summarize` agents have no API `type` and are no longer reachable through the API.
 `determine_agent_type` (keyword matching) remains only for callers that name no agent.
+
+Optional code intent routing, task defaults, provider fallback, and code validation ship disabled.
+See [the API handoff](docs/API_DOCUMENTATION.md#code-generation-and-task-routing) for flags, `model_source`,
+BYOK restrictions and the streaming `content_replace` contract. Image routing takes priority.
 
 ## 7. Model Routing Architecture
 

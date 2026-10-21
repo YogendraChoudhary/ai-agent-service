@@ -347,8 +347,9 @@ class TestLatencyOptimizations(unittest.TestCase):
         with patch("config.settings.default_gemini_api_key", None), patch(
             "openai.OpenAI", return_value=fake_client
         ), patch(
-            "src.s3_service.upload_image_from_bytes",
-            return_value="https://cdn.example.com/test.png",
+            "src.image_gen.upload_image_from_bytes_detailed",
+            return_value={"cdn_url": "https://cdn.example.com/test.png", "width": 10, "height": 10,
+                          "format": "png", "content_type": "image/png"},
         ):
             create_image_tool("key", pending_images)("test prompt")
             self.assertTrue(completion_event.wait(timeout=2.0))

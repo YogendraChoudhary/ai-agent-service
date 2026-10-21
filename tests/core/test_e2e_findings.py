@@ -4,6 +4,8 @@ import json
 import logging
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -32,7 +34,7 @@ class _FakeAgent:
     def __init__(self, events):
         self.events = events
 
-    def run(self, query, stream=True, images=None):
+    def run(self, query, stream=True, images=None, **kwargs):
         return iter(self.events)
 
 
@@ -110,6 +112,28 @@ class TestTraces(unittest.TestCase):
         obs.start_trace("t2", "/agent/process")
         obs.finish_trace("t2")
         self.assertIsNone(obs.get_trace("t2"))
+
+    def test_concurrent_usage_keeps_classifier_and_answer_totals(self):
+        trace = obs.start_trace('concurrent-usage', '/agent/stream')
+        barrier = Barrier(2)
+        original_set = trace.set
+
+        def simultaneous_set(**attrs):
+            barrier.wait(timeout=2)
+            original_set(**attrs)
+
+        with patch.object(trace, 'set', side_effect=simultaneous_set), \
+                patch.object(settings, 'text_prices_per_mtok', '{"classifier": [1, 2], "answer": [1, 2]}'), \
+                ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [workers.submit(obs.record_text_usage, 'concurrent-usage', model,
+                                      {'input_tokens': count, 'output_tokens': 1})
+                       for model, count in [('classifier', 10), ('answer', 20)]]
+            for future in futures:
+                future.result()
+        result = obs.finish_trace('concurrent-usage')
+        self.assertEqual((result['tokens_in'], result['tokens_out']), (30, 2))
+        self.assertEqual({usage['model'] for usage in result['usage']}, {'classifier', 'answer'})
+        self.assertAlmostEqual(result['est_cost_usd'], 0.000034)
 
     def test_jsonl_file_is_written_when_configured(self):
         with tempfile.NamedTemporaryFile("r+", suffix=".jsonl") as fh, patch.object(settings, "request_log_file", fh.name):

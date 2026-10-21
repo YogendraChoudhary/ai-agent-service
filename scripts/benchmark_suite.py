@@ -6,6 +6,13 @@ Runs real tests against configured AI models and records exact timings and quali
 import time
 import json
 import statistics
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+RESULTS_DIR = ROOT / "benchmarks"
+
 from config import settings
 from src.text_processing_agent import (
     create_agent,
@@ -96,7 +103,7 @@ def benchmark_streaming_task(agent_type: str, query: str, provider: str = "gemin
     }
 
 
-def print_comparison(before_file="benchmark_phase2_before.json", after_file="benchmark_phase2_after.json"):
+def print_comparison(before_file=RESULTS_DIR / "benchmark_phase2_before.json", after_file=RESULTS_DIR / "benchmark_phase2_after.json"):
     import os
     if not os.path.exists(before_file) or not os.path.exists(after_file):
         return
@@ -155,7 +162,8 @@ def print_comparison(before_file="benchmark_phase2_before.json", after_file="ben
 def run_full_suite(phase: str = "phase2_after", providers=None):
     if providers is None:
         providers = ["openai", "grok"]
-    out_file = f"benchmark_{phase}.json"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_file = str(RESULTS_DIR / f"benchmark_{phase}.json")
     print("=" * 60)
     print(f"STARTING REAL BENCHMARK SUITE ({phase.upper()})")
     print(f"Target Providers: {', '.join(providers)}")
@@ -200,7 +208,8 @@ def run_full_suite(phase: str = "phase2_after", providers=None):
 
 
 def run_phase3_suite(phase: str = "phase3_before"):
-    out_file = f"benchmark_{phase}.json"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_file = str(RESULTS_DIR / f"benchmark_{phase}.json")
     print("=" * 60)
     print(f"STARTING PHASE 3 BENCHMARK SUITE ({phase.upper()})")
     print("Testing: Prompt Caching, Prefix Alignment, Web Reader, Search Reliability, Claude Tools")
@@ -309,7 +318,7 @@ def run_phase3_suite(phase: str = "phase3_before"):
     return results
 
 
-def print_phase3_comparison(before_file="benchmark_phase3_before.json", after_file="benchmark_phase3_after.json"):
+def print_phase3_comparison(before_file=RESULTS_DIR / "benchmark_phase3_before.json", after_file=RESULTS_DIR / "benchmark_phase3_after.json"):
     import os
     if not os.path.exists(before_file) or not os.path.exists(after_file):
         return
@@ -349,7 +358,8 @@ def print_phase3_comparison(before_file="benchmark_phase3_before.json", after_fi
 
 def run_phase4_suite(phase: str = "phase4_before"):
     from concurrent.futures import ThreadPoolExecutor
-    out_file = f"benchmark_{phase}.json"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_file = str(RESULTS_DIR / f"benchmark_{phase}.json")
     print("=" * 60)
     print(f"STARTING PHASE 4 BENCHMARK SUITE ({phase.upper()})")
     print("Testing: Take 3.1 (Parallel Tool Execution) & Take 3.2 (Secondary Search Fallbacks)")
@@ -478,7 +488,7 @@ def run_phase4_suite(phase: str = "phase4_before"):
     return results
 
 
-def print_phase4_comparison(before_file="benchmark_phase4_before.json", after_file="benchmark_phase4_after.json"):
+def print_phase4_comparison(before_file=RESULTS_DIR / "benchmark_phase4_before.json", after_file=RESULTS_DIR / "benchmark_phase4_after.json"):
     import os
     if not os.path.exists(before_file) or not os.path.exists(after_file):
         return
@@ -510,7 +520,6 @@ def print_phase4_comparison(before_file="benchmark_phase4_before.json", after_fi
     
 
 if __name__ == "__main__":
-    import sys
     phase = "phase2_before"
     if len(sys.argv) > 1:
         phase = sys.argv[1]

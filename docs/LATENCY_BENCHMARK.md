@@ -196,7 +196,7 @@ Across all three major providers (Gemini, OpenAI, Grok), eliminating reasoning s
 
 ### Empirical Phase 3 Benchmark Results
 
-*Source data: `benchmark_phase3_before.json` vs `benchmark_phase3_after.json`*
+*Source data: `benchmarks/benchmark_phase3_before.json` vs `benchmarks/benchmark_phase3_after.json`*
 
 | Metric / Test Case | Before Phase 3 | **After Phase 3** | **Result / Gain** |
 |---|---|---|---|
@@ -231,7 +231,7 @@ Across all three major providers (Gemini, OpenAI, Grok), eliminating reasoning s
 
 ### Empirical Phase 4 Benchmark Results
 
-*Source data: `benchmark_phase4_before.json` vs `benchmark_phase4_after.json`*
+*Source data: `benchmarks/benchmark_phase4_before.json` vs `benchmarks/benchmark_phase4_after.json`*
 
 | Metric / Test Case | Before Phase 4 | **After Phase 4** | **Empirical Gain / Speedup** |
 |---|---|---|---|
@@ -261,7 +261,7 @@ This phase changes routing and request shaping. It was **not** benchmarked end t
 4. **Memory**: Redis, 1 h TTL, scoped per `document_id` when the client sends one (never falling back to another document), chained edits bounded to the last 3 modifications.
 
 ### Router evaluation (`python scripts/benchmark_image_flow.py`)
-Hand-written corpus of 126 labelled queries (`image_intent_eval_cases.py`), including the text requests that earlier revisions misrouted to image generation. Passing it shows those regressions stay fixed; it does not prove real-world accuracy.
+Hand-written corpus of 126 labelled queries (`tests/fixtures/image_intent_eval_cases.py`), including the text requests that earlier revisions misrouted to image generation. Passing it shows those regressions stay fixed; it does not prove real-world accuracy.
 
 | Measure | Result |
 |---|---|

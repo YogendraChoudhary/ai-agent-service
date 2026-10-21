@@ -188,6 +188,28 @@ def log_response_body(request_id: str, endpoint: str, body: Any) -> None:
         logger.info(f"📤 [{request_id}] {endpoint} RESPONSE {_clip(redact(body))}")
 
 
+def record_text_usage(request_id, model_id, metrics):
+    """Accumulate model/repair usage. A missing price or token count remains unknown."""
+    from .models import TEXT_PRICES_PER_MTOK
+    trace = get_trace(request_id)
+    if trace is None or metrics is None:
+        return
+    data = metrics.to_dict() if hasattr(metrics, 'to_dict') else metrics
+    if not isinstance(data, dict):
+        return
+    tokens_in, tokens_out = data.get('input_tokens'), data.get('output_tokens')
+    if tokens_in is None or tokens_out is None:
+        return
+    prices = {**TEXT_PRICES_PER_MTOK, **json.loads(settings.text_prices_per_mtok)}
+    price = prices.get(model_id)
+    cost = ((tokens_in * price[0] + tokens_out * price[1]) / 1_000_000) if price else None
+    with trace._lock:
+        usage = trace.attrs.get('usage', []) + [dict(model=model_id, tokens_in=tokens_in, tokens_out=tokens_out, est_cost_usd=cost)]
+        trace.attrs.update(usage=usage, tokens_in=sum(u['tokens_in'] for u in usage),
+                           tokens_out=sum(u['tokens_out'] for u in usage),
+                           est_cost_usd=sum(u['est_cost_usd'] for u in usage) if all(u['est_cost_usd'] is not None for u in usage) else None)
+
+
 # ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
@@ -207,9 +229,12 @@ def latency_stats() -> Dict[str, Any]:
     """p50/p95/max of total_seconds per endpoint+route, plus per image model."""
     groups: Dict[str, List[float]] = {}
     images: Dict[str, List[float]] = {}
+    tasks: Dict[str, List[float]] = {}
     for s in list(_RING):
         if s.get("status") == "ok":
             groups.setdefault(f"{s['endpoint']} | {s.get('route') or '-'}", []).append(s["total_seconds"])
+            if s.get('task'):
+                tasks.setdefault(f"{s['task']} | {s.get('model_used') or s.get('chat_model')}", []).append(s['total_seconds'])
         for img in s.get("images", []):
             if img.get("status") == "done" and img.get("seconds") is not None:
                 images.setdefault(f"{img.get('provider')}/{img.get('model')}", []).append(float(img["seconds"]))
@@ -217,4 +242,4 @@ def latency_stats() -> Dict[str, Any]:
     def fmt(d):
         return {k: {"count": len(v), "p50": _pct(v, 0.5), "p95": _pct(v, 0.95), "max": round(max(v), 3)} for k, v in d.items()}
 
-    return {"requests": fmt(groups), "image_generation": fmt(images), "samples": len(_RING)}
+    return {"requests": fmt(groups), "tasks": fmt(tasks), "image_generation": fmt(images), "samples": len(_RING)}

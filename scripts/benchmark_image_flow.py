@@ -1,7 +1,7 @@
 """
 Image router evaluation (computed, nothing hardcoded).
 
-Reports, on the labelled corpus in image_intent_eval_cases.py:
+Reports, on the labelled corpus in tests/fixtures/image_intent_eval_cases.py:
   * routing precision / recall and every misroute, per group
   * how the previous keyword router (determine_agent_type) handled the same image requests
   * parameter extraction accuracy on a small labelled prompt set
@@ -27,7 +27,7 @@ sys.path.insert(0, str(root_dir))
 
 from PIL import Image
 
-from image_intent_eval_cases import CASES
+from tests.fixtures.image_intent_eval_cases import CASES
 from src.image_gen import ImageParams
 from src.intent import detect_image_intent
 from src.s3_service import convert_image_format, sniff_image_bytes
@@ -165,7 +165,8 @@ def main():
         "router_decision_time": time_router(),
         "image_ops": time_image_ops(),
     }
-    out_path = root_dir / "benchmark_image_router.json"
+    out_path = root_dir / "benchmarks" / "benchmark_image_router.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
     print(json.dumps(results, indent=2))
     print(f"\nWrote {out_path}")

@@ -758,3 +758,72 @@ const agent = new TextProcessingAgent({
 ## Support
 
 For issues or questions, please refer to the main repository or contact the development team.
+
+## Code generation and task routing
+
+`/agent/process` and `/agent/stream` accept `generate_code` (tagged Markdown code fences only) and
+`explain_code` (Markdown prose). Code generation has budgeted web search/page reading and no image tools.
+Both endpoints and `/agent/email/generate` accept `model_source: "default" | "user"`; omission means
+`"user"`. The frontend sends `"default"` until the user changes the model dropdown, then `"user"`.
+Email continues to use the submitted provider. Existing image selection is unchanged.
+
+When task routing is enabled, `/agent/stream` selects Claude for default code requests and preserves the
+submitted provider for content. A user-selected provider takes priority. Code candidates are Claude →
+OpenAI → Gemini; content candidates are submitted provider → OpenAI → Claude. Providers without keys,
+providers without vision for reference-image requests, and blocked model IDs are removed. The original
+model tier is preserved. BYOK requests, including accounts with `use_own_keys`, never use platform keys
+for routing or classification.
+
+`/agent/process` always uses the submitted provider/key; the backend still owns its billing. Both endpoints
+can retry a 429 once when provider fallback is enabled, honoring Retry-After up to two seconds. Cross-provider
+fallback only occurs on streaming, for rate limits, server failures, overload and connection timeouts/resets,
+before content or background image work begins. Auth, bad requests and safety failures stop immediately.
+Streaming text is billed to the provider/model that actually answered; character-based prices are unchanged.
+
+Code validation checks fences, Python syntax, JSON syntax, HTML tags, and JS/TS/CSS structure. It never
+executes code or proves runtime correctness. One repair can replace invalid code. Before enabling streaming
+repair, the frontend must support this SSE event:
+
+```json
+{"type":"content_replace","content":"```python\ndef add(a, b):\n    return a + b\n```"}
+```
+
+Replace all previously streamed content, then process `done` normally. Until that support ships, streaming
+validation only logs errors; `/agent/process` can repair its result in place.
+When validation is enabled, a non-streaming answer that remains invalid returns HTTP 422 with
+`{"error": "The generated code did not pass validation", "issues": ["..."]}`. This also applies when
+repair is disabled. The evaluation runner scores the final replacement when a streaming repair succeeds.
+
+All new rollout flags default to `false`:
+
+| Environment variable | Purpose |
+|---|---|
+| `TASK_ROUTING_ENABLED` | Apply task defaults and filter eligible providers |
+| `PROVIDER_FALLBACK_ENABLED` | Retry 429 once and switch providers before output begins |
+| `CODE_INTENT_REGEX_ENABLED` | Route explicit code requests inside `general` |
+| `CODE_INTENT_CLASSIFIER_ENABLED` | Resolve ambiguous code mentions with a bounded lightweight model |
+| `CODE_INTENT_SHADOW_MODE` | Log intent without changing the selected agent |
+| `CODE_VALIDATION_ENABLED` | Check generated code after completion |
+| `CODE_REPAIR_ENABLED` | Allow one repair |
+| `CODE_REPAIR_STREAM_EVENT` | Allow streaming repair and `content_replace` |
+
+`CODE_CLASSIFIER_TIMEOUT_SECONDS` defaults to `1.5`. Platform classification uses the currently configured
+Claude autocomplete model; BYOK uses the user's provider's autocomplete model and key. Ordinary content
+without code cues never calls the classifier. Timeouts/errors/malformed answers fall back to content.
+Mixed requests such as an article containing a code example stay with the writing agent. Image intent wins.
+
+`TASK_ROUTE_DEFAULTS` and `TASK_FALLBACK_TREES` accept JSON objects with `code`/`content` keys and provider
+names (`openai`, `claude`, `gemini`, `grok`, `deepseek`). A default of `null` keeps the submitted provider;
+`<requested>` in a fallback tree refers to that provider. Invalid overrides are logged and ignored at startup.
+Fable (`claude-fable-5-1`) remains blocked regardless of overrides.
+
+Traces record task, model source, intent, candidates, actual model, fallbacks, validation and available token
+usage. Configure `TEXT_PRICES_PER_MTOK` as `{"model-id": [input_USD_per_million, output_USD_per_million]}` using
+verified prices. Unknown prices are `null`, not zero. Metrics group latency by task and actual model.
+
+Run `python scripts/evaluate_code.py` for the 195-case intent corpus. For paid quality evaluation, run
+`python scripts/evaluate_code.py --live`; it has 30 prompts per language group (Python, JS/TS, HTML/CSS, SQL)
+per selected provider and saves code, validation, timing, tokens and estimated cost to
+`local_run/code_evaluation.json`. Use `--limit 1` for a smoke check. Generated code is never executed.
+Review those outputs side by side before production rollout. Claude IDs remain unchanged until new IDs can
+be verified against the live model list.

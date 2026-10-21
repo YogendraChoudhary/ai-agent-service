@@ -9,7 +9,7 @@ import unittest
 from collections import Counter
 
 from src.intent import detect_image_intent
-from image_intent_eval_cases import CASES
+from tests.fixtures.image_intent_eval_cases import CASES
 
 
 class TestImageIntentEval(unittest.TestCase):

@@ -2,7 +2,7 @@
 
 For: the Eddyter frontend engineer integrating AI email generation.
 Backend: this agent service (`src/email_template`, routes in `api.py`).
-Verified: 2026-10-21. 322 automated tests pass, including `test_email_edge_cases.py`, which asserts every
+Verified: 2026-10-21. 322 automated tests pass, including `tests/email/test_email_edge_cases.py`, which asserts every
 edge case in §8. A live end-to-end request through the route (OpenAI) returned 200.
 
 ---
@@ -393,7 +393,7 @@ Request (each is a 400 before any AI call, `test_email_edge_cases.TestRequestVal
 14. Theme: bad hex, unknown style, unknown key, `custom` without `background` → 400.
 15. Any unknown or misspelt top-level field → 400.
 
-Generation (`TestGenerateOutcomes`, `test_email_service.py`):
+Generation (`TestGenerateOutcomes`, `tests/email/test_email_service.py`):
 16. Brief matches no type → `routing: "general"`, still a valid email.
 17. Brief in another language → `general` (detection is English-only).
 18. AI returns non-JSON or breaks a rule → one automatic repair; success = 200 with a `repaired` warning;
@@ -413,7 +413,7 @@ Generation (`TestGenerateOutcomes`, `test_email_service.py`):
 30. `footer.social` is always present (possibly `[]`).
 31. Feature switched off → 503 on all three routes.
 
-Images (`TestImageEndpoint`, `test_email_images.py`):
+Images (`TestImageEndpoint`, `tests/email/test_email_images.py`):
 32. Data URL prefix and line breaks in base64 → accepted.
 33. PNG, JPEG, WebP, GIF → accepted; SVG and other non-images → 400 "Could not read the image" (HEIC is not
     supported either: convert on the client).

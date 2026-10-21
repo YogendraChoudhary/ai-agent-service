@@ -186,7 +186,7 @@ Algorithm:
 - Send the model only the resolved category, never the pattern table.
 
 The patterns were checked against 14 sample briefs (all routed correctly); those become the seed of
-`test_email_routing.py`. Every pattern change must keep that file green, and new misroutes found in production are
+`tests/email/test_email_routing.py`. Every pattern change must keep that file green, and new misroutes found in production are
 added to it as cases.
 
 ### 3.6 Category registry and growth loop
@@ -355,10 +355,10 @@ src/email_template/
   service.py       # generate(), refine(), block_action(), subject_lines(), review()
 ```
 
-Tests follow the repo's root-level convention: `test_email_schema.py`, `test_email_validate.py`,
-`test_email_tone.py`, `test_email_patch.py`, `test_email_routing.py`, `test_email_examples.py` (examples add no facts), `test_email_images.py` (every slot
-output is exactly its size and under the byte limit, for each source ratio), `test_email_service.py` (LLM mocked), plus an opt-in eval
-`test_email_generate_eval.py` (real providers, see §8).
+Tests live under `tests/email/`: `tests/email/test_email_schema.py`, `tests/email/test_email_validate.py`,
+`tests/email/test_email_tone.py`, `tests/email/test_email_patch.py`, `tests/email/test_email_routing.py`, `tests/email/test_email_examples.py` (examples add no facts), `tests/email/test_email_images.py` (every slot
+output is exactly its size and under the byte limit, for each source ratio), `tests/email/test_email_service.py` (LLM mocked), plus an opt-in eval
+`tests/email/test_email_generate_eval.py` (real providers, see §8).
 
 ### 5.2 Structured output across providers
 

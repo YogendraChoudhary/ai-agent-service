@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 # ---------------------------------------------------------------------------
 # Third-party
@@ -30,6 +30,7 @@ from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
 # Local
 # ---------------------------------------------------------------------------
 from config import settings
+from src.code_validate import CodeValidationError
 from src.credit_manager import (
     AUTOCOMPLETE_CREDITS_SCALED,
     CREDIT_SCALE,
@@ -49,6 +50,7 @@ from src.text_processing_agent import (
     supports_vision,
 )
 from src.observability import (
+    get_trace,
     finish_trace,
     log_request_body,
     log_response_body,
@@ -100,6 +102,7 @@ VALID_AGENT_TYPES: frozenset[str] = frozenset({
     'fix_grammar', 'simplify', 'complete', 'emojify', 'translate',
     'make_longer', 'make_shorter', 'enhance_with_ai', 'change_tone',
     'general', 'generate_email_template', 'extract_image_text',
+    'generate_code', 'explain_code',
 })
 _SORTED_AGENT_TYPES = ', '.join(sorted(VALID_AGENT_TYPES))
 
@@ -279,6 +282,7 @@ class ProcessRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
     model: str = Field(..., min_length=1)
+    model_source: Literal['default', 'user'] = 'user'
     api_key: str = Field(..., min_length=1)
     secondary_prompt: Optional[str] = ""
     image_provider: Optional[str] = Field(None, max_length=32)
@@ -319,6 +323,7 @@ class StreamRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
     model: str = Field(..., min_length=1)
+    model_source: Literal['default', 'user'] = 'user'
     api_key: str = Field(..., min_length=1)
     secondary_prompt: Optional[str] = ""
     original_prompt: Optional[str] = ""
@@ -403,6 +408,7 @@ class EmailThemeRequest(BaseModel):
 class EmailGenerateRequest(BaseModel):
     model_config = {'extra': 'forbid'}   # a misspelt field (socialLinks) is an error, not silently ignored
     model: str = Field(..., min_length=1)
+    model_source: Literal['default', 'user'] = 'user'
     api_key: str = Field(..., min_length=1)
     brief: str = Field(..., min_length=3, max_length=5000)
     category: Optional[str] = Field(None, max_length=40)       # omitted -> routed from the brief
@@ -546,6 +552,8 @@ class ErrorResponse(BaseModel):
 # Full query-prefix map — now includes ALL valid agent types (fixes Bug #9:
 # generate_email_template and extract_image_text were missing, causing KeyError)
 TYPE_PREFIX_MAP: dict[str, str] = {
+    'generate_code': '',
+    'explain_code': '',
     'fix_grammar':            'Fix grammar: ',
     'simplify':               'Simplify: ',
     'complete':               'Complete: ',
@@ -664,6 +672,7 @@ async def async_validate_and_get_api_key(
     model_provider: str,
     request_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
+    allow_missing_key: bool = False,
 ) -> tuple[str, dict]:
     """
     Validate license key and return (ai_api_key, license_meta) asynchronously.
@@ -722,6 +731,8 @@ async def async_validate_and_get_api_key(
 
     subscription_status = license_info.get('subscription_status', '')
     requires_user_api_keys = license_info.get('requires_user_api_keys', False)
+    if requires_user_api_keys:
+        user_keys = {**user_keys, 'use_own_keys': True}
 
     if subscription_status == 'past_due' and not requires_user_api_keys:
         logger.warning(f"[{request_id}] ❌ Blocked: subscription is past_due on managed plan")
@@ -734,10 +745,10 @@ async def async_validate_and_get_api_key(
     api_key = redis_manager.resolve_api_key_from_user_keys(
         user_keys=user_keys,
         model_provider=model_provider,
-        default_keys=None if requires_user_api_keys else DEFAULT_API_KEYS,
+        default_keys=None if requires_user_api_keys or user_keys.get('use_own_keys') else DEFAULT_API_KEYS,
     )
 
-    if not api_key:
+    if not api_key and not allow_missing_key:
         logger.error(f"[{request_id}] ❌ No API key available for model: {model_provider}")
         raise HTTPException(
             status_code=400,
@@ -840,6 +851,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             credit_manager=None,
             image_routing=(agent_type == 'general'),
             image_params=merged_image_params or None,
+            model_source=request_data.model_source,
         )
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
         trace_mark(request_id, 'pipeline_done')
@@ -865,13 +877,14 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 )
 
         # Strip markdown code-fence wrappers the model sometimes emits
-        if response.startswith('```markdown\n'):
+        is_code = agent_type in ('generate_code', 'explain_code') or get_trace(request_id).attrs.get('agent_type') == 'code_writer'
+        if not is_code and response.startswith('```markdown\n'):
             response = response[12:]
-        elif response.startswith('```md\n'):
+        elif not is_code and response.startswith('```md\n'):
             response = response[6:]
-        elif response.startswith('```\n'):
+        elif not is_code and response.startswith('```\n'):
             response = response[4:]
-        if response.endswith('\n```'):
+        if not is_code and response.endswith('\n```'):
             response = response[:-4]
 
         total_duration = time.time() - start_time
@@ -890,6 +903,10 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             headers={"X-Request-ID": request_id},
         )
 
+    except CodeValidationError as exc:
+        finish_trace(request_id, 'rejected', error=str(exc), http_status=422)
+        return JSONResponse(status_code=422, content={'error': str(exc), 'issues': exc.errors},
+                            headers={'X-Request-ID': request_id})
     except HTTPException as exc:
         finish_trace(request_id, 'rejected', error=str(exc.detail), http_status=exc.status_code)
         raise  # let FastAPI's exception handler format the response
@@ -943,18 +960,27 @@ async def stream_text(
         # Uses async_validate_and_get_api_key to run Redis calls concurrently via asyncio.gather (Point 1).
         api_key, license_meta = await async_validate_and_get_api_key(
             license_key, model_provider, request_id, background_tasks,
+            **({'allow_missing_key': True} if settings.task_routing_enabled or settings.provider_fallback_enabled else {}),
         )
         trace_mark(request_id, 'auth_done', user=license_meta['user_id'])
 
         user_id = license_meta['user_id']
         is_byok = license_meta['requires_user_api_keys']
+        key_resolver = None
+        text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
+        if settings.task_routing_enabled or settings.provider_fallback_enabled:
+            from src.task_router import KeyResolver
+            key_resolver = KeyResolver(license_meta['user_keys'], None if text_byok else DEFAULT_API_KEYS,
+                                       redis_manager.resolve_api_key_from_user_keys)
+            if not key_resolver.available_providers:
+                raise HTTPException(status_code=400, detail='No API key configured for an eligible provider')
         original_prompt = (
             request_data.original_prompt.strip() if request_data.original_prompt else ''
         )
 
         image_urls = validate_reference_images(request_data.image_urls, request_id)
 
-        if image_urls and not supports_vision(model_provider):
+        if image_urls and not supports_vision(model_provider) and key_resolver is None:
             logger.warning(f"[{request_id}] {model_provider} cannot accept image input")
             usable = ", ".join(sorted(VISION_CAPABLE_PROVIDERS))
             raise HTTPException(
@@ -1017,6 +1043,7 @@ async def stream_text(
             trace_error = None
             out_preview: list[str] = []
             out_preview_len = 0
+            used_provider, used_model = model_provider, None
             try:
                 yield f"data: {json.dumps({'type': 'start', 'request_id': request_id})}\n\n"
 
@@ -1042,6 +1069,11 @@ async def stream_text(
                     image_routing=(agent_type == 'general'),
                     document_id=request_data.document_id,
                     image_params=merged_image_params or None,
+                    model_source=request_data.model_source,
+                    key_resolver=key_resolver,
+                    report_model=True,
+                    classifier_platform_key=DEFAULT_API_KEYS.get('anthropic_api_key') if not text_byok else None,
+                    text_byok=text_byok,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
@@ -1055,16 +1087,18 @@ async def stream_text(
                         pending_images = chunk["__pending_images__"]
                         continue
 
-                    if output_chars == 0 and chunk:
-                        trace_mark(request_id, 'first_token')
-                    output_chars += len(chunk)
-                    if out_preview_len < 20000:
-                        out_preview.append(chunk)
-                        out_preview_len += len(chunk)
+                    if isinstance(chunk, dict) and '__model_used__' in chunk:
+                        used_provider, used_model = chunk['__model_used__']
+                        continue
+                    replacing = isinstance(chunk, dict) and '__content_replace__' in chunk
+                    if replacing:
+                        chunk = chunk['__content_replace__']
+
+                    next_output_chars = len(chunk) if replacing else output_chars + len(chunk)
 
                     # Per-1000-char incremental reservation (non-BYOK only)
                     if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
-                        while (input_chars + output_chars) > next_reserve_threshold:
+                        while (input_chars + next_output_chars) > next_reserve_threshold:
                             if (
                                 upfront_reserved_scaled + extra_reserved_scaled
                                 >= MAX_RESERVATION_PER_REQUEST_SCALED
@@ -1082,7 +1116,16 @@ async def stream_text(
                             yield f"data: {json.dumps({'type': 'credit_limit_reached', 'output_chars': output_chars})}\n\n"
                             break
 
-                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    if output_chars == 0 and chunk:
+                        trace_mark(request_id, 'first_token')
+                    output_chars = next_output_chars
+                    if replacing:
+                        out_preview, out_preview_len = [chunk[:20000]], min(len(chunk), 20000)
+                    elif out_preview_len < 20000:
+                        out_preview.append(chunk)
+                        out_preview_len += len(chunk)
+
+                    yield f"data: {json.dumps({'type': 'content_replace' if replacing else 'content', 'content': chunk})}\n\n"
 
                 trace_mark(request_id, 'text_done')
 
@@ -1202,7 +1245,9 @@ async def stream_text(
                         op_type = 'text'
 
                     image_reserved_scaled, image_details = image_billing(pending_images)
-                    bill_provider, bill_model = billed_provider_model(model_provider, op_type, image_details)
+                    bill_provider, bill_model = billed_provider_model(used_provider, op_type, image_details)
+                    if op_type != 'image':
+                        bill_model = used_model
                     if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
                         total_reserved_scaled = (
                             upfront_reserved_scaled
@@ -1246,7 +1291,7 @@ async def stream_text(
                     fire_credit_deduction(
                         user_id, input_chars, output_chars, 'text',
                         resolved_image_count,
-                        provider=model_provider, model=None,
+                        provider=used_provider, model=used_model,
                         duration_ms=duration_ms, success=False, error_code=error_code,
                     )
 

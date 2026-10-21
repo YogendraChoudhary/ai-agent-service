@@ -286,6 +286,7 @@ class TestUnifiedFlow(unittest.TestCase):
             res = generate_image_unified(
                 "make it night", "openai", "k", explicit_params={"format": "webp"}, user_id="u1",
                 document_id="docA", inherited_params={"aspect_ratio": "16:9"},
+                is_byok=True,
                 context_extra={"base_prompt": "a mosque", "modifications": ["make it night"]},
             )
         self.assertEqual(upload.call_args[1]["target_format"], "webp")
