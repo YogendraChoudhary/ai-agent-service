@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     image_credits_by_model: str = Field("", alias="IMAGE_CREDITS_BY_MODEL")
 
     # ------------------------------------------------------------------
+    # AI email templates (src/email_template). The model writes JSON blocks; code validates them.
+    # ------------------------------------------------------------------
+    email_ai_enabled: bool = Field(True, alias="EMAIL_AI_ENABLED")                # False = /agent/email/* return 503
+    email_ai_repair_enabled: bool = Field(True, alias="EMAIL_AI_REPAIR_ENABLED")  # one "fix these errors" retry
+    email_ai_max_variants: int = Field(3, alias="EMAIL_AI_MAX_VARIANTS")
+
+    # ------------------------------------------------------------------
     # Observability (src/observability.py). Bodies contain user text, so they are OFF by default.
     # ------------------------------------------------------------------
     request_log_file: str = Field("", alias="REQUEST_LOG_FILE")                  # JSONL, one summary per request

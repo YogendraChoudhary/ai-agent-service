@@ -3,9 +3,12 @@
 # was previously declared mid-module after constants)
 # ---------------------------------------------------------------------------
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -376,6 +379,134 @@ class AutocompleteRequest(BaseModel):
 class AbortRequest(BaseModel):
     request_id: str = Field(..., min_length=1)
     api_key: str = Field(..., min_length=1)
+
+
+_REF_KEY = r'^[a-z0-9_]{1,40}$'
+
+
+class EmailThemeRequest(BaseModel):
+    """Look of the email, picked by the user (or their brand kit). Passed through to the template for the renderer."""
+    model_config = {'extra': 'forbid'}
+    accent_color: Optional[str] = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
+    hero: Optional[Dict[str, Any]] = None     # {"style": light|dark|brand|custom, "background"?, "text"?}
+    footer: Optional[Dict[str, Any]] = None
+
+    @field_validator('hero', 'footer')
+    @classmethod
+    def validate_section(cls, v):
+        if v is None:
+            return v
+        from src.email_template.schema import SectionTheme
+        return SectionTheme.model_validate(v).model_dump(exclude_none=True)
+
+
+class EmailGenerateRequest(BaseModel):
+    model_config = {'extra': 'forbid'}   # a misspelt field (socialLinks) is an error, not silently ignored
+    model: str = Field(..., min_length=1)
+    api_key: str = Field(..., min_length=1)
+    brief: str = Field(..., min_length=3, max_length=5000)
+    category: Optional[str] = Field(None, max_length=40)       # omitted -> routed from the brief
+    tone: Optional[str] = Field(None, pattern=r'^(formal|professional|professional_warm)$')
+    audience: Optional[str] = Field(None, max_length=300)
+    language: str = Field('en-GB', pattern=r'^[a-z]{2,3}(-[A-Z]{2})?$')
+    length: str = Field('standard', pattern=r'^(short|standard|detailed)$')
+    allowed_merge_tags: List[str] = Field(default_factory=list, max_length=50)
+    links: Dict[str, str] = Field(default_factory=dict)        # key -> https URL; only keys reach the model
+    assets: Dict[str, str] = Field(default_factory=dict)       # key -> short description
+    sender: Dict[str, str] = Field(default_factory=dict)       # name, title, org, contact
+    org_name: Optional[str] = Field(None, max_length=80)
+    brand_kit_id: Optional[str] = Field(None, max_length=64)
+    variants: int = Field(1, ge=1, le=3)
+    # omitted -> category default; social_links imply "none" (signature and social icons are exclusive)
+    sign_off: Optional[str] = Field(None, pattern=r'^(signature|none)$')
+    social_links: Dict[str, str] = Field(default_factory=dict)            # platform -> URL, max 4, footer order
+    theme: Optional[EmailThemeRequest] = None                             # chosen by the user, never the model
+
+    @field_validator('brief')
+    @classmethod
+    def validate_brief(cls, v):
+        v = v.strip()
+        if len(v) < 3:
+            raise ValueError('brief must contain at least 3 characters of text')
+        return v
+
+    @field_validator('social_links')
+    @classmethod
+    def validate_social_links(cls, v):
+        from src.email_template.schema import SOCIAL_MAX, SOCIAL_PLATFORMS
+        if len(v) > SOCIAL_MAX:
+            raise ValueError(f'At most {SOCIAL_MAX} social links')
+        for platform, url in v.items():
+            if platform not in SOCIAL_PLATFORMS:
+                raise ValueError(f"Unknown social platform '{platform}'. Use: {', '.join(SOCIAL_PLATFORMS)}")
+            ok = re.fullmatch(r'mailto:[^\s<>"@]+@[^\s<>"]+', url) if platform == 'email' \
+                else re.fullmatch(r'https://[^\s<>"]{1,2000}', url)
+            if not ok:
+                raise ValueError(f"Social link '{platform}' must be an https URL (mailto: for email)")
+        return v
+
+    @field_validator('model')
+    @classmethod
+    def validate_model(cls, v):
+        if v.lower() not in SUPPORTED_MODELS:
+            raise ValueError(f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}')
+        return v.lower()
+
+    @field_validator('allowed_merge_tags')
+    @classmethod
+    def validate_merge_tags(cls, v):
+        for tag in v:
+            if not re.fullmatch(_REF_KEY, tag):
+                raise ValueError(f"Invalid merge tag '{tag}': use lowercase letters, digits and _")
+        return v
+
+    @field_validator('links')
+    @classmethod
+    def validate_links(cls, v):
+        if len(v) > 20:
+            raise ValueError('At most 20 links')
+        for key, url in v.items():
+            if not re.fullmatch(_REF_KEY, key):
+                raise ValueError(f"Invalid link key '{key}': use lowercase letters, digits and _")
+            if key.startswith('social_'):
+                raise ValueError(f"Link key '{key}': the social_ prefix is reserved for social_links")
+            if not re.fullmatch(r'https://[^\s<>"]{1,2000}', url):
+                raise ValueError(f"Link '{key}' must be an https URL")
+        return v
+
+    @field_validator('assets')
+    @classmethod
+    def validate_assets(cls, v):
+        if len(v) > 20:
+            raise ValueError('At most 20 assets')
+        for key, desc in v.items():
+            if not re.fullmatch(_REF_KEY, key) or len(desc) > 200:
+                raise ValueError(f"Invalid asset '{key}': key must be lowercase/digits/_ and description <= 200 chars")
+        return v
+
+    @field_validator('sender')
+    @classmethod
+    def validate_sender(cls, v):
+        allowed = {'name', 'title', 'org', 'contact'}
+        if set(v) - allowed or any(len(x) > 120 for x in v.values()):
+            raise ValueError(f"sender may only contain {sorted(allowed)}, each <= 120 chars")
+        return v
+
+
+class EmailImageRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    slot: str = Field(..., pattern=r'^(hero|inline|logo)$')
+    action: str = Field('fit', pattern=r'^fit$')                # refine / generate arrive in phase 2
+    image_base64: str = Field(..., min_length=16, max_length=21_000_000)  # ~15 MB decoded
+    focal_point: Optional[List[float]] = Field(None, min_length=2, max_length=2)
+    user_id: Optional[str] = Field(None, pattern=r'^[A-Za-z0-9_-]{1,64}$')  # S3 folder + storage quota
+
+    @field_validator('focal_point')
+    @classmethod
+    def validate_focal_point(cls, v):
+        if v is not None and not all(0.0 <= x <= 1.0 for x in v):
+            raise ValueError('focal_point must be [x, y] with each value between 0 and 1')
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -1333,6 +1464,120 @@ async def abort_request(request_data: AbortRequest) -> JSONResponse:
         status_code=200,
         content={'success': True},
         headers={"X-Request-ID": req_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# AI email templates (src/email_template). Same server-to-server contract as /agent/process: api_key is the
+# provider key the backend resolved, and the backend bills the call. Output is template JSON; the editor
+# renders HTML from it.
+# ---------------------------------------------------------------------------
+@app.get('/agent/email/categories')
+async def email_categories() -> JSONResponse:
+    """Email types the frontend can offer, in routing order. Only enabled types (with an example) are listed."""
+    from src.email_template.categories import enabled_categories
+
+    if not settings.email_ai_enabled:
+        return JSONResponse(status_code=503, content={'error': 'AI email templates are disabled'})
+    return JSONResponse(content={'categories': [
+        {'id': c.id, 'label': c.label, 'default_tone': c.default_tone, 'image_slots': list(c.image_slots),
+         'needs_button': c.needs_button, 'needs_signature': c.needs_signature, 'bulk': c.bulk}
+        for c in enabled_categories().values()
+    ]})
+
+
+@app.post('/agent/email/generate')
+async def email_generate(request_data: EmailGenerateRequest) -> JSONResponse:
+    from src.email_template.service import (
+        EmailGenerationError, EmailProviderError, GenerateRequest, generate, make_agno_llm,
+    )
+
+    request_id = str(uuid.uuid4())[:8]
+    headers = {"X-Request-ID": request_id}
+    if not settings.email_ai_enabled:
+        return JSONResponse(status_code=503, content={'error': 'AI email templates are disabled'}, headers=headers)
+    start_trace(request_id, '/agent/email/generate', chat_model=request_data.model,
+                query_chars=len(request_data.brief))
+    log_request_body(request_id, '/agent/email/generate', request_data.model_dump())
+
+    req = GenerateRequest(
+        brief=request_data.brief, category=request_data.category, tone=request_data.tone,
+        audience=request_data.audience, language=request_data.language, length=request_data.length,
+        allowed_merge_tags=tuple(request_data.allowed_merge_tags), links=request_data.links,
+        assets=request_data.assets, sender=request_data.sender, org_name=request_data.org_name,
+        brand_kit_id=request_data.brand_kit_id, variants=request_data.variants,
+        sign_off=request_data.sign_off, social_links=request_data.social_links,
+        theme=request_data.theme.model_dump(exclude_none=True) if request_data.theme else None,
+    )
+    llm = make_agno_llm(request_data.model, request_data.api_key, request_id=request_id, is_byok=True)
+    try:
+        result = await run_in_threadpool(generate, req, llm, request_id)
+    except ValueError as e:
+        finish_trace(request_id, 'rejected', error=str(e), http_status=400)
+        return JSONResponse(status_code=400, content={'error': str(e)}, headers=headers)
+    except EmailGenerationError as e:
+        finish_trace(request_id, 'rejected', error=str(e), http_status=422)
+        return JSONResponse(
+            status_code=422,
+            content={'error': 'The generated email did not pass validation',
+                     'issues': [i.as_dict() for i in e.errors]},
+            headers=headers,
+        )
+    except EmailProviderError as e:
+        logger.error(f"[{request_id}] email generate provider error — {e}")
+        finish_trace(request_id, 'error', error=str(e), http_status=502)
+        return JSONResponse(status_code=502, content={'error': str(e)}, headers=headers)
+    except Exception as e:
+        logger.error(f"[{request_id}] email generate FAILED — {e}")
+        finish_trace(request_id, 'error', error=str(e), http_status=500)
+        return JSONResponse(status_code=500, content={'error': str(e)}, headers=headers)
+
+    log_response_body(request_id, '/agent/email/generate', result)
+    finish_trace(request_id, 'ok', http_status=200)
+    return JSONResponse(status_code=200, content={'success': True, **result}, headers=headers)
+
+
+@app.post('/agent/email/image')
+async def email_image(request_data: EmailImageRequest) -> JSONResponse:
+    """Crop and compress an image to a fixed email slot size, then upload it. Phase 1: action 'fit' only."""
+    from src.email_template.images import SlotImageError, fit_to_slot
+    from src.s3_service import StorageQuotaExceededError, upload_image_from_bytes_detailed
+
+    request_id = str(uuid.uuid4())[:8]
+    headers = {"X-Request-ID": request_id}
+    if not settings.email_ai_enabled:
+        return JSONResponse(status_code=503, content={'error': 'AI email templates are disabled'}, headers=headers)
+    try:
+        b64 = request_data.image_base64
+        if b64.startswith('data:'):  # browsers' FileReader.readAsDataURL output
+            b64 = b64.partition(',')[2]
+        raw = base64.b64decode(re.sub(r'\s+', '', b64), validate=True)
+        focal = tuple(request_data.focal_point) if request_data.focal_point else None
+        fitted = await run_in_threadpool(fit_to_slot, raw, request_data.slot, focal)
+        uploaded = await run_in_threadpool(
+            upload_image_from_bytes_detailed, fitted.data, fitted.content_type, request_data.user_id, request_id,
+        )
+    except (binascii.Error, ValueError) as e:  # SlotImageError is a ValueError
+        status = 400 if not isinstance(e, SlotImageError) or 'compress' not in str(e) else 422
+        return JSONResponse(status_code=status, content={'error': f'Invalid image: {e}'}, headers=headers)
+    except StorageQuotaExceededError as e:
+        return JSONResponse(status_code=413, content={'error': str(e)}, headers=headers)
+    except Exception as e:
+        logger.error(f"[{request_id}] email image FAILED — {e}")
+        return JSONResponse(status_code=500, content={'error': str(e)}, headers=headers)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            'success': True,
+            'slot': request_data.slot,
+            'url': uploaded['cdn_url'],
+            'width': fitted.width, 'height': fitted.height,
+            'display_width': fitted.display_width, 'display_height': fitted.display_height,
+            'content_type': fitted.content_type,
+            'size_bytes': len(fitted.data),
+        },
+        headers=headers,
     )
 
 

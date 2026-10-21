@@ -1,0 +1,40 @@
+{
+  "input": {
+    "brief": "Tell all employees that the remote working policy is changing: from now on staff can work remotely up to three days a week, and remote days must be agreed with their line manager in advance. Link to the full policy.",
+    "audience": "All employees",
+    "language": "en-GB",
+    "length": "standard",
+    "allowed_merge_tags": ["first_name", "company_name", "sender_name", "sender_title", "company_address"],
+    "links": ["policy_document"],
+    "assets": {"logo_primary": "Company logo"},
+    "image_slots": []
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "Update to our remote working policy",
+        "Remote working policy: what is changing",
+        "Changes to remote working arrangements"
+      ],
+      "preheader": "Remote working up to three days a week, agreed in advance"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "logo_asset": "asset:logo_primary", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "greeting", "text": "Dear {{first_name}},"},
+      {"id": "b3", "type": "paragraph", "text": "We are writing to inform you of an update to our remote working policy, which applies from [[fill: effective date]]."},
+      {"id": "b4", "type": "key_value", "rows": [
+        {"label": "Policy", "value": "Remote working policy"},
+        {"label": "Effective date", "value": "[[fill: effective date]]"},
+        {"label": "Applies to", "value": "All employees"}
+      ]},
+      {"id": "b5", "type": "list", "style": "bulleted", "items": [
+        "You may work remotely for up to three days each week.",
+        "Remote days must be agreed with your line manager in advance."
+      ]},
+      {"id": "b6", "type": "button", "label": "Read the full policy", "link": "link:policy_document"},
+      {"id": "b7", "type": "paragraph", "text": "If you have any questions about these changes, please speak to your line manager."},
+      {"id": "b8", "type": "signature", "closing": "Kind regards,", "name": "{{sender_name}}", "title": "{{sender_title}}", "org": "{{company_name}}"},
+      {"id": "b9", "type": "footer", "address": "{{company_address}}", "unsubscribe": false}
+    ]
+  }
+}

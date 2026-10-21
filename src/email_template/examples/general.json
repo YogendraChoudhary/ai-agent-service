@@ -1,0 +1,35 @@
+{
+  "input": {
+    "brief": "Tell our team the office is moving to the Bannerghatta Road campus next month. Desk assignments will be shared on Friday.",
+    "audience": "Internal team",
+    "language": "en-GB",
+    "length": "short",
+    "allowed_merge_tags": ["first_name", "company_name"],
+    "links": [],
+    "assets": {},
+    "image_slots": []
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "Our office is moving next month",
+        "Office move to the Bannerghatta Road campus",
+        "Relocation update: desk assignments on Friday"
+      ],
+      "preheader": "We move to the Bannerghatta Road campus next month; desks are announced Friday"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "greeting", "text": "Dear {{first_name}},"},
+      {"id": "b3", "type": "paragraph", "text": "We are writing to let you know that our office is moving to the Bannerghatta Road campus next month."},
+      {"id": "b4", "type": "key_value", "rows": [
+        {"label": "New location", "value": "Bannerghatta Road campus"},
+        {"label": "Move date", "value": "[[fill: exact move date]]"},
+        {"label": "Desk assignments", "value": "Shared on Friday"}
+      ]},
+      {"id": "b5", "type": "paragraph", "text": "Your desk assignment will be shared on Friday. Further details about the move will follow."},
+      {"id": "b6", "type": "signature", "closing": "Kind regards,", "name": "[[fill: sender name or team]]"},
+      {"id": "b7", "type": "footer", "unsubscribe": false}
+    ]
+  }
+}

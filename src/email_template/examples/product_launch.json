@@ -1,0 +1,39 @@
+{
+  "input": {
+    "brief": "Launch Acme Insights, our new analytics dashboard for finance teams. It brings all reports into one place, updates data automatically every hour, and any report can be shared with a single link. Link to the product page. Add a banner image of the dashboard on a laptop.",
+    "audience": "Existing customers",
+    "language": "en-GB",
+    "length": "short",
+    "allowed_merge_tags": ["first_name", "company_name", "company_address"],
+    "links": ["product_page"],
+    "assets": {"logo_primary": "Company logo"},
+    "image_slots": ["hero"],
+    "sign_off": "none"
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "Introducing Acme Insights",
+        "Acme Insights: your reports in one place",
+        "Meet Acme Insights for finance teams"
+      ],
+      "preheader": "A new analytics dashboard that brings your finance reports together"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "logo_asset": "asset:logo_primary", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "hero_banner", "eyebrow": "New", "headline": "Meet Acme Insights",
+       "summary": "An analytics dashboard that brings all your finance reports into one place.",
+       "button": {"label": "See Acme Insights", "link": "link:product_page"}},
+      {"id": "b3", "type": "image", "slot": "hero", "source": null,
+       "alt": "An analytics dashboard shown on a laptop screen",
+       "generation_prompt": "A modern laptop on a clean desk showing an abstract analytics dashboard with simple charts, soft natural light, no readable text, no logos, no people, subject centred with space around it"},
+      {"id": "b4", "type": "features", "items": [
+        {"title": "One place", "text": "All your finance reports in a single dashboard."},
+        {"title": "Always current", "text": "Data updates automatically every hour."},
+        {"title": "Easy to share", "text": "Share any report with a single link."}
+      ]},
+      {"id": "b5", "type": "paragraph", "text": "Acme Insights is our new analytics dashboard, designed for finance teams."},
+      {"id": "b6", "type": "footer", "address": "{{company_address}}", "unsubscribe": true}
+    ]
+  }
+}

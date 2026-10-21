@@ -1,0 +1,36 @@
+{
+  "input": {
+    "brief": "Tell customers we are rolling out scheduled exports: reports can now be exported automatically on a daily or weekly schedule and sent straight to email, in CSV or PDF format. Available on all plans from today. Link to the help article.",
+    "audience": "All customers",
+    "language": "en-GB",
+    "length": "short",
+    "allowed_merge_tags": ["first_name", "company_name", "company_address"],
+    "links": ["help_article"],
+    "assets": {},
+    "image_slots": []
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "Now available: scheduled exports",
+        "Export reports automatically, daily or weekly",
+        "New: scheduled exports for your reports"
+      ],
+      "preheader": "Send reports to email automatically in CSV or PDF, on all plans from today"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "hero_banner", "eyebrow": "New feature", "headline": "Scheduled exports are here",
+       "summary": "Export your reports automatically on a daily or weekly schedule."},
+      {"id": "b3", "type": "paragraph", "text": "From today, scheduled exports are available on all plans. Choose a schedule and your reports are sent straight to your email."},
+      {"id": "b4", "type": "features", "items": [
+        {"title": "Daily or weekly", "text": "Choose the schedule for each report."},
+        {"title": "Straight to email", "text": "Reports arrive in your inbox automatically."},
+        {"title": "CSV or PDF", "text": "Pick the format you need."}
+      ]},
+      {"id": "b5", "type": "button", "label": "Read the guide", "link": "link:help_article"},
+      {"id": "b6", "type": "signature", "closing": "Kind regards,", "name": "The {{company_name}} team"},
+      {"id": "b7", "type": "footer", "address": "{{company_address}}", "unsubscribe": true}
+    ]
+  }
+}

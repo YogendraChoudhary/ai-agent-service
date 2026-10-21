@@ -1,0 +1,30 @@
+{
+  "input": {
+    "brief": "Announce that our office will be closed on Friday for the public holiday. Customer support will respond to messages on Monday.",
+    "audience": "Customers",
+    "language": "en-GB",
+    "length": "short",
+    "allowed_merge_tags": ["company_name", "company_address"],
+    "links": [],
+    "assets": {"logo_primary": "Company logo"},
+    "image_slots": []
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "Our office will be closed on Friday",
+        "Office closure on Friday for the public holiday",
+        "Holiday closure: support resumes on Monday"
+      ],
+      "preheader": "Customer support will reply to your messages on Monday"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "logo_asset": "asset:logo_primary", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "heading", "text": "Office closed on Friday", "level": 1},
+      {"id": "b3", "type": "paragraph", "text": "Our office will be closed on Friday for the public holiday."},
+      {"id": "b4", "type": "paragraph", "text": "Customer support will respond to any messages received during the closure on Monday. Thank you for your patience."},
+      {"id": "b5", "type": "signature", "closing": "Kind regards,", "name": "The {{company_name}} team"},
+      {"id": "b6", "type": "footer", "address": "{{company_address}}", "unsubscribe": false}
+    ]
+  }
+}

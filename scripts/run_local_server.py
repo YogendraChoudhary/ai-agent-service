@@ -9,6 +9,7 @@ REAL (so the run exercises the production code path):
 
 REPLACED (nothing outside this machine is touched):
   Redis / licence check   -> any licence key is accepted as user "local-dev-user", default provider keys from .env
+  Follow-up image memory  -> in-memory (the "previous image" a follow-up refers to); the real Redis is never contacted
   CreditManager           -> in-memory balance (starts at 1000 credits), every reserve/release is logged
   Backend credit webhook  -> NOT sent; the payload it would carry is logged ("WEBHOOK would send")
   S3 upload               -> written to local_run/images and served at /local-images/<file>
@@ -48,6 +49,9 @@ os.environ.update({
     "WEBHOOK_SECRET": "",
     "CREDIT_PRECHECK_ENABLED": "true",
     "CREDIT_SETTLE_DELAY_SECONDS": "0",
+    # Reference images must live under CDN_URL. Locally the "CDN" is this server's /local-images folder,
+    # so an image_ready url can be sent straight back as image_urls for a refinement.
+    "CDN_URL": f"http://127.0.0.1:{os.environ.get('LOCAL_PORT', '8000')}/local-images",
 })
 
 import warnings
@@ -83,6 +87,26 @@ class LocalDevRedis(RedisManager):
 
     def get_user_api_keys(self, user_id):
         return {}                  # no personal keys: platform default keys from .env are used
+
+
+class FakeRedisClient:
+    """The few Redis commands the image follow-up memory uses, held in memory (with expiry)."""
+
+    def __init__(self):
+        self._data = {}
+
+    def set(self, key, value, ex=None):
+        self._data[key] = (value, time.time() + ex if ex else None)
+        log.info(f"🧠 image memory SET {key} (ttl={ex}s)")
+        return True
+
+    def get(self, key):
+        item = self._data.get(key)
+        if not item or (item[1] and item[1] < time.time()):
+            log.info(f"🧠 image memory GET {key} -> miss")
+            return None
+        log.info(f"🧠 image memory GET {key} -> hit")
+        return item[0]
 
 
 class FakeCreditManager:
@@ -178,6 +202,11 @@ def install():
         return holder["cm"]
 
     api.get_redis_manager = lambda: LocalDevRedis()
+    # image_gen reaches Redis through the process-wide singleton, not through api: replace that too
+    import src.redis_manager as redis_module
+    from types import SimpleNamespace
+    fake_redis = SimpleNamespace(redis_client=FakeRedisClient())
+    redis_module.get_redis_manager = lambda: fake_redis
     api.CreditManager = make_cm
     fire, fire_release = make_webhooks(holder)
     api.fire_credit_deduction = fire

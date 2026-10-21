@@ -1,0 +1,35 @@
+{
+  "input": {
+    "brief": "Remind employees that the annual compliance training must be completed by 30 November. Link to the training portal.",
+    "audience": "All employees",
+    "language": "en-GB",
+    "length": "short",
+    "allowed_merge_tags": ["first_name", "company_name", "sender_name", "sender_title"],
+    "links": ["training_portal"],
+    "assets": {},
+    "image_slots": []
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "Reminder: compliance training due 30 November",
+        "Complete your compliance training by 30 November",
+        "Annual compliance training deadline"
+      ],
+      "preheader": "Please complete the annual compliance training before 30 November"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "greeting", "text": "Dear {{first_name}},"},
+      {"id": "b3", "type": "notice", "variant": "important", "text": "The annual compliance training must be completed by 30 November."},
+      {"id": "b4", "type": "paragraph", "text": "This is a reminder to complete your annual compliance training using the training portal."},
+      {"id": "b5", "type": "key_value", "rows": [
+        {"label": "Training", "value": "Annual compliance training"},
+        {"label": "Deadline", "value": "30 November"}
+      ]},
+      {"id": "b6", "type": "button", "label": "Open the training portal", "link": "link:training_portal"},
+      {"id": "b7", "type": "signature", "closing": "Kind regards,", "name": "{{sender_name}}", "title": "{{sender_title}}"},
+      {"id": "b8", "type": "footer", "unsubscribe": false}
+    ]
+  }
+}

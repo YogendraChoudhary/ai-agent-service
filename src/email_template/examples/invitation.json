@@ -1,0 +1,38 @@
+{
+  "input": {
+    "brief": "Invite our clients to our annual partner summit at the Grand Hall. Ask them to RSVP using the registration link. Add a banner image of a modern conference hall.",
+    "audience": "Clients and partners",
+    "language": "en-GB",
+    "length": "standard",
+    "allowed_merge_tags": ["first_name", "company_name", "company_address"],
+    "links": ["rsvp"],
+    "assets": {"logo_primary": "Company logo"},
+    "image_slots": ["hero"]
+  },
+  "output": {
+    "meta": {
+      "subject_options": [
+        "You are invited: our annual partner summit",
+        "Join us at the annual partner summit",
+        "Invitation to the partner summit at the Grand Hall"
+      ],
+      "preheader": "Please reply using the registration link to confirm your place"
+    },
+    "blocks": [
+      {"id": "b1", "type": "header", "logo_asset": "asset:logo_primary", "org_name": "{{company_name}}"},
+      {"id": "b2", "type": "image", "slot": "hero", "source": null, "alt": "A modern conference hall prepared for a summit", "generation_prompt": "Wide view of a modern, bright conference hall with rows of seating and a stage, soft natural light, calm professional atmosphere, no people in focus, no text or signage"},
+      {"id": "b3", "type": "heading", "text": "Our annual partner summit", "level": 1},
+      {"id": "b4", "type": "greeting", "text": "Dear {{first_name}},"},
+      {"id": "b5", "type": "paragraph", "text": "We would be delighted to welcome you to our annual partner summit at the Grand Hall."},
+      {"id": "b6", "type": "key_value", "rows": [
+        {"label": "Event", "value": "Annual partner summit"},
+        {"label": "Date", "value": "[[fill: summit date]]"},
+        {"label": "Time", "value": "[[fill: start and end time]]"},
+        {"label": "Venue", "value": "The Grand Hall"}
+      ]},
+      {"id": "b7", "type": "button", "label": "Reply to confirm", "link": "link:rsvp"},
+      {"id": "b8", "type": "signature", "closing": "Warm regards,", "name": "[[fill: sender name]]", "org": "{{company_name}}"},
+      {"id": "b9", "type": "footer", "address": "{{company_address}}", "unsubscribe": false}
+    ]
+  }
+}
