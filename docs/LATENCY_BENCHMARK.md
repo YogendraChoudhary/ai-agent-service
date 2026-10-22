@@ -277,3 +277,177 @@ Because the legacy router already sent almost all image requests to `smart_globa
 ### Not verified
 - Live behaviour of the Grok JSON edit call, Gemini `image_size`, and OpenAI `input_fidelity` / `output_format` (covered only by mocked-SDK tests).
 - Whether the editor swaps the direct route's `![alt](placeholder::id)` the same way as the agent's output.
+
+---
+
+## ✍️ Phase 6: Blog generation – first content (`BLOG_OUTLINE_MODEL`)
+
+*Run: October 22, 2026. Live APIs (OpenAI, Gemini). Drafting model for every post: `gpt-5.2`. Plan target (docs/rich_content_engine_plan.md,
+Phase 5): first content ≤ 12 s, p50 total ≤ 40 s for 1,400 words with 3 pictures.*
+
+`generate_blog` opens with an outline (about 950 tokens of JSON) before any text can be shown, so the outline call is the time to first content.
+The first live post reached it at **13.8-14.5 s**.
+
+### Where the 14 s goes (`gpt-5.2`, one brief, single calls)
+
+| Variant | Time | Output tokens | Finding |
+|---|---|---|---|
+| Current: gpt-5.2, default settings | 12.6 s and 14.7 s | 941-951 | pure generation speed, about 75 tokens/s; no hidden reasoning tokens |
+| `reasoning_effort=none` | 12.4 s | 943 | no change: there is no reasoning to remove |
+| `reasoning_effort=low` | 18.0 s | 1,269 (269 reasoning) | slower |
+| `reasoning_effort=minimal` | error | – | not supported by this model |
+| Compact JSON in the few-shot example | 12.8 s | 950 | no change |
+
+So the time is the model's output speed. Settings do not help; a faster model does.
+
+### The outline call by model (3 briefs x 2 repeats, `python scripts/evaluate_blog.py --live --outline-only --models ...`)
+
+| Model | Median | Range | Valid on the first reply | Output tokens | Speed |
+|---|---|---|---|---|---|
+| OpenAI `gpt-5.2` (the drafting model) | 13.0 s | 12.0-15.2 s | 6/6 | 972 | 75 tok/s |
+| OpenAI `gpt-4o-mini` (the "lighter" tier of the same provider) | 8.8 s | 8.4-9.4 s | 6/6 | 757 | 86 tok/s |
+| Gemini `gemini-3.8-flash` | 8.1 s | 7.6-10.2 s | 6/6 | 908 | 111 tok/s |
+| **Gemini `gemini-3.5-flash-lite`** | **3.5 s** | 3.3-3.9 s | 6/6 | 914 | 259 tok/s |
+
+A lighter tier of the same provider barely helps; a different, faster provider does. Reading the outlines side by side, the Gemini
+ones were as good or sharper (more opinionated angles: "Stop treating one-on-ones as status updates") and satisfied the same rules.
+
+### What was built
+
+`BLOG_OUTLINE_MODEL=gemini:basic` (unset by default) runs only the **first outline attempt** on that model. The repair, and every part,
+stay on the drafting model, so a weak first pass costs time, never quality. It is used only if the request may use that provider
+(BYOK accounts: their own key); otherwise, or if it fails, the outline falls back to the drafting providers. Billing and
+`model_used` follow the model that writes the post; the trace records `outline_model` and every model call (`llm_calls`).
+
+### The tail, and what it taught
+
+120 production-path probes of "time to first content" (`gemini:basic`, stream closed at the title):
+
+| Code | n | Median | Max | Slow (> 6 s) | Cause of the slow ones |
+|---|---|---|---|---|---|
+| Fast outline, repair on any fault | 60 | 2.87 s | 9.47 s | 4 | first reply invalid, repaired on gpt-5.2 (+6.5 s): 3x `visual_gap`, 1x JSON syntax |
+| + lossless faults fixed by code, no model call | 60 | 2.92 s | 3.47 s | **0** | the one `visual_gap` in this batch was fixed in code |
+
+`visual_gap` (two neighbouring sections without a visual), a short quote count, section lengths and duplicate visuals are
+satisfied by `finalize()` with no loss (a pull-quote directive has no content of its own). They no longer cost a model call; faults
+that need content (a table, a picture) or are structural (JSON, schema) still go back to the model.
+
+### Three live posts, final code (with pictures; `python scripts/evaluate_blog.py --live --providers openai --outline-model gemini:basic --images`)
+
+| Brief | Outline model | First content | Total | Words | Tables / quotes / pictures | Longest prose run | Part repairs | Warnings |
+|---|---|---|---|---|---|---|---|---|
+| sleep routine | gemini-3.5-flash-lite | **4.2 s** | 22.3 s | 1,500 | 1 / 2 / 3 | 215 | 1 | 0 |
+| one-on-ones | gemini-3.5-flash-lite | **3.7 s** | 23.3 s | 1,509 | 1 / 2 / 3 | 161 | 1 | 0 |
+| language methods | gemini-3.5-flash-lite | **4.3 s** | 19.9 s | 1,446 | 1 / 2 / 3 | 202 | 0 | 0 |
+| *baseline: one-on-ones* | gpt-5.2 | 13.0 s | 29.6 s | 1,365 | 2 / 2 / 3 | 182 | 1 | 0 |
+| *baseline: language methods* | gpt-5.2 | 13.1 s | 30.5 s | 1,430 | 3 / 2 / 3 | 169 | 1 | 0 |
+| *baseline: sleep routine (earlier run)* | gpt-5.2 | 13.8 s | 29.8 s | – | 3 / 5 / 3 | – | 0 | 0 |
+
+**First content: 13.0 s -> 4.2 s median**, inside the 12 s target with room to spare; total p50 22.3 s against the 40 s target.
+The difference in *first content* is the outline model. The difference in *total* also includes two writer-stage fixes made in the same
+round (below), which removed most part repairs and is why the final posts have exactly the planned visuals.
+
+### Found along the way (all fixed, with tests)
+
+- **Unassigned visuals.** gpt-5.2 ignored a general "write a table or quote only when assigned" rule (3-7 extra quotes and 1-3
+  extra tables per post). Listing what is *not* assigned in the part's request (`not_assigned: ["table", "quote"]`) fixed it at the
+  source: the final posts have zero extra quotes and zero unassigned tables.
+- **Trimming extras can cost a repair.** Dropping an unassigned pull quote also removes a visual break and some words, which
+  triggered `prose_run` and `length` repairs (up to 4 in one post). A trim now happens only if it adds no lint error.
+- **Miscounted table delimiter** (4 columns, `|---|---|---|`) is not a table to the editor; it is rebuilt in code.
+
+### Not verified
+
+- The two slow outlines of the first full-post run (11.4 s and 12.5 s) were first-reply repairs of the kind above; at that time the
+  trace did not record per-call timings, so this is inferred from the later probes, not observed directly.
+- Text cost: `TEXT_PRICES_PER_MTOK` is not configured, so only token counts are recorded (about 12.7-14.8K in / 2.9-3.4K out per
+  post, down from about 15.4K / 3.5K in the baseline).
+- Gemini's rate limits under concurrent load; Claude (the configured key returned 401); the effect of sending the brief to a
+  second provider is a product decision, which is why the setting ships unset.
+
+
+---
+
+## ✍️ Phase 7: Blog generation – first text on GPT (`BLOG_STREAM_TITLE`)
+
+*Run: October 22, 2026. Live OpenAI: `gpt-5.2` wrote the outline and every part; Gemini (`gemini-3.1-flash-lite-image`) drew the pictures.
+The brief was to keep the GPT outline exactly as it is and get the first text on screen sooner.*
+
+Phase 6 found that the 13-15 s to first content is the outline call alone and that it is pure generation speed. This phase measured
+what that call is made of when it is **streamed** (direct SDK calls with the real outline prompt; 6 runs each on 3 briefs, 14 in flight
+at once; throwaway script, not in the repo), and which levers move it.
+
+### The outline call, streamed (`gpt-5.2`)
+
+| Variant | First token | Title + subtitle written | Whole outline | Output tokens | Speed |
+|---|---|---|---|---|---|
+| As shipped | 1.9 s | **2.4 s** | 15.0 s (13.4-15.8) | 959 (0 reasoning) | 74 tok/s |
+| `service_tier="priority"` (served as priority 6 of 6) | 1.9 s | 2.3 s | **9.9 s** (9.4-10.5) | 985 | 118 tok/s |
+| Prompt without the fields code overwrites anyway (ids, positions, ...) | 1.7 s | 2.3 s | 14.5 s | 931 | 70 tok/s |
+
+The title and subtitle are the first two keys of the JSON in every run (18 of 18, and in every other model's reply that produced
+text), so they exist about 2 s after the request even though the outline takes 13-15 s. Dropping the fields code overwrites saves
+3% of the tokens (about 0.5 s) and made no outline more reliable, so it was not built. The priority tier makes the same call a third
+faster for a premium per token; it is not built (it costs money and the post is identical), it is the next lever for the first
+paragraph.
+
+### Other GPT models for the outline (production prompt, 2 briefs each, defaults)
+
+| Model | Whole outline | First reply valid | Note |
+|---|---|---|---|
+| gpt-4.1-nano | 3.4 s | 2/2 | blander headings ("Understanding the foundations of good sleep") |
+| gpt-4.1-mini / gpt-4.1 | 6.3 s / 6.4 s | 2/2 | blander headings |
+| gpt-5.4-nano | 6.2 s | 1/2 | |
+| gpt-5.4-mini | 7.1 s | 2/2 | headings closest to gpt-5.2's |
+| gpt-5.6-terra | 9.9 s | 2/2 | headings close to gpt-5.2's |
+| gpt-5.4, gpt-5.1, gpt-5.5, gpt-5.6-luna / -sol | 12.9-15.9 s | 0-1 of 2 for 5.5 / luna / sol (picture prompts failing the lint) | no faster than gpt-5.2 |
+| gpt-5-mini / gpt-5-nano | 26.6 s / 54.9 s | 2/0 | default reasoning spends 1.9K-6K tokens |
+
+`gpt-5.2-chat-latest` and `gpt-5.3-chat-latest` answer 404 (deprecated). A different outline model changes the outline, so none of
+this is built: it needs a side-by-side read first (`BLOG_OUTLINE_MODEL` only accepts `provider[:tier]` today).
+
+### What was built
+
+The outline call is streamed (`CallSpec.on_text`, the same agno streaming the chat path uses) and `generate_blog_stream` runs it in a
+thread, so the post opens with its title the moment `TitleWatcher` has both strings. Nothing else changes: the same outline is
+validated, repaired and filled; the `outline` event, the pictures and the parts follow as before; `BLOG_STREAM_TITLE=false` restores the
+old order, and the post is byte-identical either way (a test runs it both ways).
+
+### Live posts, final code (`gpt-5.2` for the outline and every part, with pictures)
+
+Eight briefs at the new 1,450-word plan (`python scripts/evaluate_blog.py --live --providers openai --images`, no `--outline-model`):
+
+| Brief | Title shown | Outline done | First paragraph (outline + intro call) | Total | Words (plan 1,450) | Tables / quotes / pictures | Part repairs |
+|---|---|---|---|---|---|---|---|
+| sleep routine | **2.3 s** | 14.3 s | 18.4 s | 29.6 s | 1,439 | 1 / 2 / 3 | 0 |
+| one-on-ones | **1.6 s** | 13.5 s | 16.8 s | 29.3 s | 1,478 | 1 / 2 / 3 | 0 |
+| language methods | **1.5 s** | 14.3 s | 18.4 s | 30.7 s | 1,495 | 1 / 2 / 3 | 0 |
+| four-day week | **1.5 s** | 14.4 s | 17.9 s | 29.0 s | 1,421 | 1 / 2 / 3 | 0 |
+| personal budgeting | **1.7 s** | 13.8 s | 17.9 s | 32.3 s | 1,540 | 1 / 2 / 3 | 1 (one part kept a 245-word run: a warning) |
+| travelling light | **1.6 s** | 14.6 s | 18.7 s | 33.0 s | 1,508 | 1 / 2 / 3 | 1 |
+| running habit | **1.5 s** | 13.7 s | 16.7 s | 149.2 s* | 1,339 | 2 / 2 / 2* | 0 |
+| customer interviews | **1.8 s** | 12.7 s | 15.8 s | 30.0 s | 1,542 | 1 / 2 / 3 | 0 |
+
+\* One Gemini picture never came back (its call stayed "generating"); the text was finished at 29.1 s and the evaluation waits 120 s
+for pictures. The other 23 pictures took 3.5 s each (median).
+
+**Time to first text: 13-15 s -> 1.6 s median (1.5-2.3 s)**, and the title was on screen before the outline was done in all 8 posts.
+The first paragraph is unchanged at about 18 s (median 17.9 s). Words: mean 1,470, median 1,486, every post within 10% of the plan and
+5 of 8 within 5%; the same code before the length calibration gave a mean of 1,512 (7 posts, stdev 66). Tokens per post: 13.2-16.3K in
+and 3.1-3.7K out (streaming records its usage like a plain call).
+
+### Found along the way
+
+- **A post was lost to a 301-character angle.** The first live run at the new length failed one brief outright: gpt-5.2's section angles
+  run up to 335 characters, the cap was 300, and its repair did not shorten them (a model cannot count characters; across 12 direct
+  runs the language brief broke the cap in 4 of 6). An angle and the intro hook are guidance the reader never sees, so the cap is 500
+  and anything longer is cut by code at a sentence.
+- **gpt-5.2 writes about 4% more than it is asked for** (sections +3.6%, intro +12%): 7 live posts planned at 1,450 words came to 1,512
+  on average. Parts are now asked for 96% of their target; the lint still judges them against the real one.
+
+### Not verified
+
+- The first paragraph is still ~18 s: it needs the whole outline (~14 s) plus the intro call (~4 s). Streaming cannot move that; the
+  priority tier (about 5 s) or a faster outline model (after a read of its outlines) can.
+- Priority-tier pricing was not looked up; the sweep used 2 briefs and one run per model.
+- A client that leaves after the title no longer starts pictures, but the outline call itself still runs to its end (as before).

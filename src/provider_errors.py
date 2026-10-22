@@ -24,6 +24,22 @@ def is_retryable(err):
                            'resource_exhausted', 'rate limit', 'ratelimit'))
 
 
+def is_provider_unusable(err):
+    """A broken key, missing permission or retired model: this provider cannot serve, but another one can."""
+    status = status_code(err)
+    text = (type(err).__name__ + ' ' + str(err)).lower()
+    if any(s in text for s in ('safety', 'content_filter')):
+        return False
+    return status in (401, 403, 404) or any(
+        s in text for s in ('invalid api key', 'invalid x-api-key', 'authentication', 'permission denied',
+                           'model not found', 'model_not_found'))
+
+
+def can_fall_back(err):
+    """Errors that move a request to the next provider. Bad requests and safety blocks would fail everywhere."""
+    return is_retryable(err) or is_provider_unusable(err)
+
+
 def is_rate_limit(err):
     return status_code(err) == 429 or any(s in str(err).lower() for s in ('rate limit', 'resource_exhausted'))
 

@@ -58,7 +58,7 @@ class TestTable(unittest.TestCase):
             "translate": "translation", "make_longer": "make_longer", "make_shorter": "make_shorter",
             "enhance_with_ai": "enhance", "change_tone": "tone", "general": "smart_global",
             "generate_email_template": "email_template", "extract_image_text": "text_extraction",
-            "generate_code": "code_writer", "explain_code": "code_explainer",
+            "generate_code": "code_writer", "explain_code": "code_explainer", "generate_blog": "blog_writer",
         })
 
     def test_general_is_the_free_form_agent(self):

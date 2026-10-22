@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Optional
 
 from dotenv import find_dotenv, load_dotenv
@@ -24,6 +25,11 @@ from pydantic_settings import BaseSettings
 _dotenv_path = find_dotenv()
 if _dotenv_path:
     load_dotenv(_dotenv_path)
+
+
+# BLOG_OUTLINE_MODEL: "provider" or "provider:tier". One pattern for the setting's validator and the parser in
+# src/blog/runtime.py, so a value that loads is a value that parses.
+OUTLINE_MODEL_PATTERN = r'(openai|claude|gemini|grok|deepseek)(?::(basic|advanced))?'
 
 
 class Settings(BaseSettings):
@@ -40,6 +46,15 @@ class Settings(BaseSettings):
     # Off until the frontend handles the content_replace SSE event.
     code_repair_stream_event: bool = Field(False, alias="CODE_REPAIR_STREAM_EVENT")
     text_prices_per_mtok: str = Field('{}', alias="TEXT_PRICES_PER_MTOK")
+
+    @field_validator('blog_outline_model')
+    @classmethod
+    def validate_outline_model(cls, value):
+        value = (value or '').strip().lower()
+        if value and not re.fullmatch(OUTLINE_MODEL_PATTERN, value):
+            logging.getLogger(__name__).warning('Invalid BLOG_OUTLINE_MODEL %r; using the drafting model', value)
+            return ''
+        return value
 
     @field_validator('task_route_defaults', 'task_fallback_trees', 'text_prices_per_mtok')
     @classmethod
@@ -135,6 +150,26 @@ class Settings(BaseSettings):
     email_ai_enabled: bool = Field(True, alias="EMAIL_AI_ENABLED")                # False = /agent/email/* return 503
     email_ai_repair_enabled: bool = Field(True, alias="EMAIL_AI_REPAIR_ENABLED")  # one "fix these errors" retry
     email_ai_max_variants: int = Field(3, alias="EMAIL_AI_MAX_VARIANTS")
+
+    # ------------------------------------------------------------------
+    # Visually rich blog generation (src/blog). The model writes an outline and section bodies; code decides
+    # the visuals, writes the headings and image markup, and lints the result. Ships OFF.
+    # ------------------------------------------------------------------
+    blog_ai_enabled: bool = Field(False, alias="BLOG_AI_ENABLED")                 # False = generate_blog returns 503
+    blog_image_source: str = Field("generate", alias="BLOG_IMAGE_SOURCE")          # generate | stock | none
+    blog_section_parallel: int = Field(3, ge=1, le=8, alias="BLOG_SECTION_PARALLEL")  # units in flight per request
+    blog_max_prose_run: int = Field(220, ge=60, alias="BLOG_MAX_PROSE_RUN")        # words allowed between visual breaks
+    blog_repair_enabled: bool = Field(True, alias="BLOG_REPAIR_ENABLED")           # one repair per failing unit / outline
+    # Model for the FIRST outline attempt only, "provider" or "provider:tier" (tier basic|advanced, default basic), e.g.
+    # "gemini:basic". Empty = the drafting model. The outline is ~1,000 tokens of JSON, so its time is generation speed.
+    # Used only if the request may use that provider (BYOK accounts: their own key); the repair always runs on the drafting model.
+    blog_outline_model: str = Field("", alias="BLOG_OUTLINE_MODEL")
+    # Open the post with its title and subtitle the moment the model has written them, while the rest of the outline is still
+    # streaming in (the outline is ~1,000 tokens, so first text no longer waits for all of it). The content is the same either
+    # way; False opens the post only once the whole outline has validated.
+    blog_stream_title: bool = Field(True, alias="BLOG_STREAM_TITLE")
+    blog_intent_regex_enabled: bool = Field(False, alias="BLOG_INTENT_REGEX_ENABLED")  # promote "write a blog post about..." from general
+    blog_intent_shadow_mode: bool = Field(False, alias="BLOG_INTENT_SHADOW_MODE")  # log the promotion decision only
 
     # ------------------------------------------------------------------
     # Observability (src/observability.py). Bodies contain user text, so they are OFF by default.

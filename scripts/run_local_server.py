@@ -49,6 +49,7 @@ os.environ.update({
     "WEBHOOK_SECRET": "",
     "CREDIT_PRECHECK_ENABLED": "true",
     "CREDIT_SETTLE_DELAY_SECONDS": "0",
+    "BLOG_AI_ENABLED": "true",      # type=generate_blog; the flag ships off, a local run is where it is tried
     # Reference images must live under CDN_URL. Locally the "CDN" is this server's /local-images folder,
     # so an image_ready url can be sent straight back as image_urls for a refinement.
     "CDN_URL": f"http://127.0.0.1:{os.environ.get('LOCAL_PORT', '8000')}/local-images",

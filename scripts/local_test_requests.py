@@ -30,7 +30,8 @@ def redact(body):
 def stream_request(client, body):
     t0 = time.perf_counter()
     ev, text, images, rid = [], [], [], None
-    ttfb = first_token = done = ended = None
+    ttfb = first_token = done = ended = outline = warnings = None
+    outline_at = None
     with client.stream("POST", f"{BASE}/agent/stream", json=body, timeout=240) as r:
         ttfb = time.perf_counter() - t0
         rid = r.headers.get("X-Request-ID")
@@ -47,15 +48,19 @@ def stream_request(client, body):
                 text.append(e["content"])
             elif kind == "image_ready":
                 images.append({"t": round(now, 2), "url": e["url"], "w": e.get("width"), "h": e.get("height")})
+            elif kind == "outline":
+                outline, outline_at = e, now
             elif kind == "done":
                 done = now
+                warnings = e.get("warnings")
             elif kind == "stream_end":
                 ended = now
             elif kind in ("error", "image_failed", "credit_limit_reached"):
                 ev.append({"t": round(now, 2), **e})
     total = time.perf_counter() - t0
     return {"http": 200, "rid": rid, "text": "".join(text), "images": images, "events": ev,
-            "ttfb": ttfb, "first_token": first_token, "done": done, "stream_end": ended, "total": total}
+            "ttfb": ttfb, "first_token": first_token, "done": done, "stream_end": ended, "total": total,
+            "outline": outline, "outline_at": outline_at, "warnings": warnings}
 
 
 def process_request(client, body):
@@ -81,6 +86,9 @@ def n_images(res): return len(res.get("images", []))
 def has_model(res, srv, provider, model):
     return any(i.get("provider") == provider and i.get("model") == model and i.get("status") == "done" for i in (srv or {}).get("images", []))
 def no_dead(res, srv): return "placeholder::" not in res.get("text", "")
+def blog_tables(res): return len(re.findall(r"^\|.+\|[ \t]*\n\|[\s:|-]+\|[ \t]*$", res.get("text", ""), re.M))
+def blog_quotes(res): return len(re.findall(r"^> ", res.get("text", ""), re.M))
+def blog_h2(res): return len(re.findall(r"^## ", res.get("text", ""), re.M))
 
 SCENARIOS = [
     ("health", "GET /health", None, [("200 OK", lambda r, s: r["http"] == 200)]),
@@ -162,6 +170,36 @@ SCENARIOS = [
     ("typed text operation: fix_grammar", "process",
      req(type="fix_grammar", model="gemini", query="me and him goes to the market yesterday and buyed two apple"),
      [("200", lambda r, s: r["http"] == 200), ("corrected text returned", lambda r, s: len(r["text"]) > 20)]),
+
+    ("generate_blog (stream): skeleton first, ordered sections, a table, pull quotes, 3 pictures", "stream",
+     req(type="generate_blog", model="openai", secondary_prompt="Friendly and practical, no jargon",
+         query="Write a blog post for team leads about running remote meetings that people actually want to attend.",
+         blog_options={"length": "standard"}),
+     [("200", lambda r, s: r["http"] == 200),
+      ("the title opens the post before the outline event (BLOG_STREAM_TITLE)", lambda r, s: r.get("outline") and r["first_token"] < r["outline_at"]),
+      ("one heading per outline entry", lambda r, s: blog_h2(r) == len(r["outline"]["sections"])),
+      ("at least 1 table", lambda r, s: blog_tables(r) >= 1), ("at least 2 pull quotes", lambda r, s: blog_quotes(r) >= 2),
+      ("exactly 3 pictures, all delivered", lambda r, s: n_images(r) == 3 and r["text"].count("placeholder::") == 3),
+      ("no image_failed / error events", lambda r, s: not r["events"]),
+      ("planner recorded the blog", lambda r, s: s and s.get("mode") == "blog" and s["blog"]["images"] == 3),
+      ("first content within 12 s (plan target)", lambda r, s: r["first_token"] is not None and r["first_token"] <= 12)]),
+
+    ("generate_blog (process): short post, 1 picture, real URL, warnings listed", "process",
+     req(type="generate_blog", model="gemini", query="Write a short blog post about choosing a first project management tool for a small business",
+         blog_options={"length": "short", "images": 1}),
+     [("200", lambda r, s: r["http"] == 200), ("a table", lambda r, s: blog_tables(r) >= 1),
+      ("no dead placeholders", lambda r, s: no_dead(r, s)), ("one real image URL", lambda r, s: r["text"].count("/local-images/") == 1),
+      ("warnings is a list", lambda r, s: isinstance(r["json"].get("warnings"), list))]),
+
+    ("generate_blog: 'without images' in the brief means none are generated or billed", "stream",
+     req(type="generate_blog", model="gemini", query="Write a short blog post about brewing better tea at home, without images",
+         blog_options={"length": "short"}),
+     [("200", lambda r, s: r["http"] == 200), ("no images", lambda r, s: n_images(r) == 0 and "placeholder::" not in r["text"]),
+      ("still has a table and quotes", lambda r, s: blog_tables(r) >= 1 and blog_quotes(r) >= 2)]),
+
+    ("validation: blog_options on another type -> 400", "stream",
+     req(type="general", model="gemini", query="x", blog_options={"length": "short"}),
+     [("HTTP 400", lambda r, s: r["http"] == 400)]),
 
     ("validation: unknown type -> 400", "stream", req(type="nope", model="gemini", query="x"),
      [("HTTP 400", lambda r, s: r["http"] == 400)]),

@@ -226,15 +226,23 @@ def recent_summaries(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def latency_stats() -> Dict[str, Any]:
-    """p50/p95/max of total_seconds per endpoint+route, plus per image model."""
+    """p50/p95/max of total_seconds per endpoint+route, plus per image model and per long-form mode (blog)."""
     groups: Dict[str, List[float]] = {}
     images: Dict[str, List[float]] = {}
     tasks: Dict[str, List[float]] = {}
+    modes: Dict[str, List[float]] = {}
+    first_content: Dict[str, List[float]] = {}
     for s in list(_RING):
         if s.get("status") == "ok":
             groups.setdefault(f"{s['endpoint']} | {s.get('route') or '-'}", []).append(s["total_seconds"])
             if s.get('task'):
                 tasks.setdefault(f"{s['task']} | {s.get('model_used') or s.get('chat_model')}", []).append(s['total_seconds'])
+            if s.get('mode'):
+                key = f"{s['mode']} | {s.get('model_used') or s.get('chat_model')}"
+                modes.setdefault(key, []).append(s['total_seconds'])
+                first = s.get('marks', {}).get('first_token')
+                if first is not None:
+                    first_content.setdefault(key, []).append(first)
         for img in s.get("images", []):
             if img.get("status") == "done" and img.get("seconds") is not None:
                 images.setdefault(f"{img.get('provider')}/{img.get('model')}", []).append(float(img["seconds"]))
@@ -242,4 +250,5 @@ def latency_stats() -> Dict[str, Any]:
     def fmt(d):
         return {k: {"count": len(v), "p50": _pct(v, 0.5), "p95": _pct(v, 0.95), "max": round(max(v), 3)} for k, v in d.items()}
 
-    return {"requests": fmt(groups), "tasks": fmt(tasks), "image_generation": fmt(images), "samples": len(_RING)}
+    return {"requests": fmt(groups), "tasks": fmt(tasks), "modes": fmt(modes), "mode_first_content": fmt(first_content),
+            "image_generation": fmt(images), "samples": len(_RING)}

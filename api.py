@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Literal
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 # ---------------------------------------------------------------------------
 # Third-party
@@ -23,13 +23,14 @@ from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
 
 # ---------------------------------------------------------------------------
 # Local
 # ---------------------------------------------------------------------------
 from config import settings
+from src.blog.plan import BRIEF_MAX_CHARS
 from src.code_validate import CodeValidationError
 from src.credit_manager import (
     AUTOCOMPLETE_CREDITS_SCALED,
@@ -102,7 +103,7 @@ VALID_AGENT_TYPES: frozenset[str] = frozenset({
     'fix_grammar', 'simplify', 'complete', 'emojify', 'translate',
     'make_longer', 'make_shorter', 'enhance_with_ai', 'change_tone',
     'general', 'generate_email_template', 'extract_image_text',
-    'generate_code', 'explain_code',
+    'generate_code', 'explain_code', 'generate_blog',
 })
 _SORTED_AGENT_TYPES = ', '.join(sorted(VALID_AGENT_TYPES))
 
@@ -278,6 +279,26 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 # max_length added to query/text_before fields (fixes missing input cap)
 # VALID_AGENT_TYPES error message now deterministic (sorted list)
 # ---------------------------------------------------------------------------
+class BlogOptions(BaseModel):
+    """Optional knobs for type=generate_blog. Every field is optional; a misspelt one is an error."""
+    model_config = {'extra': 'forbid'}
+    length: Optional[Literal['short', 'standard', 'long']] = None     # ~800 / ~1,450 / ~2,200 words
+    images: Optional[Union[Annotated[int, Field(ge=0, le=10)], Literal['auto']]] = None
+    tone: Optional[str] = Field(None, min_length=1, max_length=60)
+    audience: Optional[str] = Field(None, min_length=1, max_length=200)
+
+
+def check_blog_fields(request_type: str, query: str, blog_options: Optional[BlogOptions]) -> None:
+    """generate_blog takes a brief of bounded size; blog_options belongs to generate_blog and nothing else."""
+    if request_type == 'generate_blog':
+        if len(query.strip()) < 3:
+            raise ValueError('query must contain a topic or brief for the blog post')
+        if len(query) > BRIEF_MAX_CHARS:
+            raise ValueError(f'query is too long for a blog brief (at most {BRIEF_MAX_CHARS} characters)')
+    elif blog_options is not None:
+        raise ValueError('blog_options is only valid with type generate_blog')
+
+
 class ProcessRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
@@ -288,6 +309,7 @@ class ProcessRequest(BaseModel):
     image_provider: Optional[str] = Field(None, max_length=32)
     image_model: Optional[str] = Field(None, max_length=64)
     image_params: Optional[Dict[str, Any]] = None
+    blog_options: Optional[BlogOptions] = None      # generate_blog only
 
     @field_validator('image_provider')
     @classmethod
@@ -317,6 +339,11 @@ class ProcessRequest(BaseModel):
         if v.lower() not in SUPPORTED_MODELS:
             raise ValueError(f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}')
         return v.lower()
+
+    @model_validator(mode='after')
+    def validate_blog_fields(self):
+        check_blog_fields(self.type, self.query, self.blog_options)
+        return self
 
 
 class StreamRequest(BaseModel):
@@ -336,6 +363,7 @@ class StreamRequest(BaseModel):
     # Explicit image settings; they outrank anything inferred from the prompt text.
     # Keys: aspect_ratio, quality, resolution, format, transparent_bg, provider, model.
     image_params: Optional[Dict[str, Any]] = None
+    blog_options: Optional[BlogOptions] = None      # generate_blog only
 
     @field_validator('image_provider')
     @classmethod
@@ -365,6 +393,11 @@ class StreamRequest(BaseModel):
         if v.lower() not in SUPPORTED_MODELS:
             raise ValueError(f'Invalid model. Must be one of: {", ".join(SUPPORTED_MODELS)}')
         return v.lower()
+
+    @model_validator(mode='after')
+    def validate_blog_fields(self):
+        check_blog_fields(self.type, self.query, self.blog_options)
+        return self
 
 
 class AutocompleteRequest(BaseModel):
@@ -523,6 +556,8 @@ class ProcessResponse(BaseModel):
     success: bool
     markdown_response: str
     html_response: Optional[str] = None
+    # Things the server fixed or could not do (generate_blog): [{"kind", "detail", "unit"?}]. Empty when clean.
+    warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AutocompleteResponse(BaseModel):
@@ -566,6 +601,7 @@ TYPE_PREFIX_MAP: dict[str, str] = {
     'general':                '',
     'generate_email_template': '',
     'extract_image_text':     '',
+    'generate_blog':          '',
 }
 
 
@@ -816,6 +852,10 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         agent_type = request_data.type
         model_provider = request_data.model
         api_key = request_data.api_key
+        if agent_type == 'generate_blog' and not settings.blog_ai_enabled:
+            finish_trace(request_id, 'rejected', error='blog generation disabled', http_status=503)
+            return JSONResponse(status_code=503, content={'error': 'AI blog generation is disabled'},
+                                headers={"X-Request-ID": request_id})
 
         # Backend contract (see docstring): api_key is the provider key the backend
         # already resolved, and the backend bills the call. Treat it as BYOK so the
@@ -836,6 +876,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         )
 
         ai_start = time.time()
+        meta: dict = {}
         # Same routing, planner, direct image route and model selection as /agent/stream; images are
         # awaited and their URLs written into the text, so there are never dead placeholders.
         response, pending_images = await run_in_threadpool(
@@ -852,7 +893,11 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             image_routing=(agent_type == 'general'),
             image_params=merged_image_params or None,
             model_source=request_data.model_source,
+            instruction=request_data.secondary_prompt or None,
+            blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
+            meta=meta,
         )
+        warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
         trace_mark(request_id, 'pipeline_done')
 
@@ -899,6 +944,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'success': True,
                 'markdown_response': response,
                 'html_response': response,
+                'warnings': warnings,
             },
             headers={"X-Request-ID": request_id},
         )
@@ -955,6 +1001,11 @@ async def stream_text(
         agent_type = request_data.type
         model_provider = request_data.model
         license_key = request_data.api_key
+        if agent_type == 'generate_blog' and not settings.blog_ai_enabled:
+            finish_trace(request_id, 'rejected', error='blog generation disabled', http_status=503)
+            return JSONResponse(status_code=503, content={'error': 'AI blog generation is disabled'},
+                                headers={"X-Request-ID": request_id})
+
 
         # Validate licence and resolve the actual AI provider API key.
         # Uses async_validate_and_get_api_key to run Redis calls concurrently via asyncio.gather (Point 1).
@@ -999,7 +1050,15 @@ async def stream_text(
         # Upfront credit reservation (skipped for BYOK users)
         upfront_reserved_scaled = 0
         if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
-            upfront_reserved_scaled = text_credits_scaled(input_chars, 0)
+            expected_output_chars = 0
+            if agent_type == 'generate_blog':
+                # A post costs the platform its full parallel draft before the user has read a word: reserve for it.
+                from src.blog.plan import BlogRequest, plan_blog
+                expected_output_chars = 6 * plan_blog(BlogRequest.from_options(
+                    request_data.query, request_data.secondary_prompt,
+                    request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None),
+                    image_available=False).target_words
+            upfront_reserved_scaled = text_credits_scaled(input_chars, expected_output_chars)
             if image_urls:
                 upfront_reserved_scaled += IMAGE_CREDITS_SCALED * len(image_urls)
             ok, available_scaled = credit_manager.reserve(user_id, upfront_reserved_scaled)
@@ -1027,6 +1086,7 @@ async def stream_text(
             resolved_image_count = 0
             extra_reserved_scaled = 0
             credit_limit_hit = False
+            stream_warnings: list = []
 
             # Register lock-free cancellation event for this request (Point 6)
             cancel_event = register_cancellation_event(request_id)
@@ -1074,6 +1134,8 @@ async def stream_text(
                     report_model=True,
                     classifier_platform_key=DEFAULT_API_KEYS.get('anthropic_api_key') if not text_byok else None,
                     text_byok=text_byok,
+                    instruction=request_data.secondary_prompt or None,
+                    blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
@@ -1089,6 +1151,13 @@ async def stream_text(
 
                     if isinstance(chunk, dict) and '__model_used__' in chunk:
                         used_provider, used_model = chunk['__model_used__']
+                        continue
+                    if isinstance(chunk, dict) and '__event__' in chunk:
+                        # Additive events (the blog `outline`); clients that do not know a type ignore it.
+                        yield f"data: {json.dumps(chunk['__event__'])}\n\n"
+                        continue
+                    if isinstance(chunk, dict) and '__warnings__' in chunk:
+                        stream_warnings = chunk['__warnings__']
                         continue
                     replacing = isinstance(chunk, dict) and '__content_replace__' in chunk
                     if replacing:
@@ -1137,7 +1206,10 @@ async def stream_text(
                     f"[{request_id}] STREAM SUCCESS — {total_duration:.2f}s, "
                     f"pending images: {pending_count}"
                 )
-                yield f"data: {json.dumps({'type': 'done', 'duration': round(total_duration, 2), 'pending_images': pending_count})}\n\n"
+                done_event = {'type': 'done', 'duration': round(total_duration, 2), 'pending_images': pending_count}
+                if stream_warnings:
+                    done_event['warnings'] = stream_warnings
+                yield f"data: {json.dumps(done_event)}\n\n"
 
                 # Wait for background image completions via event notification (Point 7)
                 if pending_count > 0:

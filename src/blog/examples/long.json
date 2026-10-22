@@ -1,0 +1,122 @@
+{
+  "input": {
+    "brief": "Write a long-form guide for homeowners who want to switch their home to renewable energy, step by step.",
+    "plan": {
+      "target_words": 2200,
+      "sections": 6,
+      "section_words": 1840,
+      "intro_words": 180,
+      "conclusion_words": 180,
+      "images": 4,
+      "tables_at_least": 2,
+      "quotes_at_least": 3
+    },
+    "web_research": false
+  },
+  "output": {
+    "title": "Switching your home to renewable energy, step by step",
+    "subtitle": "A clear path for homeowners, from reading the bill to switching the lights on.",
+    "intro": {
+      "target_words": 180,
+      "hook": "Begin with a homeowner reading an energy bill and wondering what a realistic first move would be, then promise an order of steps that avoids expensive mistakes."
+    },
+    "sections": [
+      {
+        "id": "s1",
+        "heading": "Understand what your home uses today",
+        "angle": "Teach the reader to read their bills and find where energy goes, because every later decision depends on knowing the baseline.",
+        "target_words": 300,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A homeowner's kitchen table with a printed utility bill, a calculator and a pen in warm daylight, no people visible",
+            "alt": "A utility bill and a calculator on a kitchen table",
+            "caption": "Everything starts with knowing what the house uses",
+            "position": "after_first_paragraph"
+          },
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s2",
+        "heading": "Cut waste before you generate anything",
+        "angle": "Argue that efficiency work is the cheapest source of energy, and compare the usual measures by effort and payoff.",
+        "target_words": 310,
+        "visuals": [
+          {
+            "kind": "table",
+            "title": "Efficiency measures compared",
+            "columns": ["Measure", "Effort", "Typical payoff"],
+            "rows_hint": 5
+          }
+        ]
+      },
+      {
+        "id": "s3",
+        "heading": "Choose the right way to generate",
+        "angle": "Explain the main options for a home, such as rooftop solar, a heat pump and buying green power, and how to decide between them for a given house.",
+        "target_words": 300,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A modern house with solar panels on a pitched roof under a clear sky, photographed from the street",
+            "alt": "A house with solar panels on its roof",
+            "caption": "Rooftop generation is one option among several",
+            "position": "after_first_paragraph"
+          }
+        ]
+      },
+      {
+        "id": "s4",
+        "heading": "Work out the cost and how you will pay",
+        "angle": "Set out the main ways to finance the switch and the questions to ask installers, so the reader can compare offers on equal terms.",
+        "target_words": 310,
+        "visuals": [
+          {
+            "kind": "table",
+            "title": "Ways to pay for the switch",
+            "columns": ["Option", "Upfront cost", "Best when"],
+            "rows_hint": 4
+          },
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s5",
+        "heading": "Choose an installer you can trust",
+        "angle": "Give the reader a practical way to vet installers: credentials, references, written quotes and what a good site visit looks like.",
+        "target_words": 310,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A friendly technician in work clothes and a hard hat checking a clipboard beside an outdoor heat pump unit",
+            "alt": "A technician checking a clipboard beside an outdoor heat pump",
+            "caption": "A good installer explains the plan before touching anything",
+            "position": "after_first_paragraph"
+          },
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s6",
+        "heading": "Switch on, then keep measuring",
+        "angle": "Describe what to check after installation and how to track the results against the original baseline so the reader knows the switch worked.",
+        "target_words": 310,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A wall-mounted smart energy display in a hallway showing a simple glowing ring graphic, soft indoor light",
+            "alt": "A wall-mounted energy display showing a glowing ring",
+            "caption": "Keep measuring against the baseline",
+            "position": "after_first_paragraph"
+          }
+        ]
+      }
+    ],
+    "conclusion": {
+      "heading": "Take the first step this month",
+      "target_words": 180,
+      "takeaways": 4
+    }
+  }
+}

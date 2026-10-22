@@ -39,6 +39,7 @@ Content-Type: application/json
 | `model` | string | Yes | AI model provider: `openai`, `claude`, `grok`, `deepseek`, `gemini` |
 | `api_key` | string | Yes | API key for the selected model provider |
 | `secondary_prompt` | string | No | Additional instruction for specific operations |
+| `blog_options` | object | No | `generate_blog` only: `length`, `images`, `tone`, `audience` (see [blog generation](#visually-rich-blog-generation-generate_blog)) |
 
 #### Supported Operation Types
 
@@ -54,6 +55,7 @@ Content-Type: application/json
 | `enhance_with_ai` | Enhance and improve text quality | Yes (enhancement instructions) |
 | `change_tone` | Change the tone/style of text | Yes (tone description) |
 | `general` | General content creation (articles, images, etc.) | No |
+| `generate_blog` | A visually rich blog post: tables, pull quotes and inline images ([details](#visually-rich-blog-generation-generate_blog)) | Yes (style notes) |
 
 #### Response
 
@@ -61,9 +63,14 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "html_response": "<p>Processed HTML content...</p>"
+  "markdown_response": "Processed Markdown content...",
+  "html_response": "Processed Markdown content...",
+  "warnings": []
 }
 ```
+
+`html_response` repeats `markdown_response` (kept for existing clients). `warnings` is always present and empty unless the
+server fixed or could not do something (today only `generate_blog` reports any; see below).
 
 **Error (400/500)**
 ```json
@@ -778,8 +785,10 @@ for routing or classification.
 
 `/agent/process` always uses the submitted provider/key; the backend still owns its billing. Both endpoints
 can retry a 429 once when provider fallback is enabled, honoring Retry-After up to two seconds. Cross-provider
-fallback only occurs on streaming, for rate limits, server failures, overload and connection timeouts/resets,
-before content or background image work begins. Auth, bad requests and safety failures stop immediately.
+fallback only occurs on streaming, for rate limits, server failures, overload, connection timeouts/resets, and
+an unusable provider (401/403 invalid key or permission, 404 retired model), before content or background
+image work begins. Unusable providers are logged at error level. Bad requests and safety failures stop
+immediately because every provider would reject them.
 Streaming text is billed to the provider/model that actually answered; character-based prices are unchanged.
 
 Code validation checks fences, Python syntax, JSON syntax, HTML tags, and JS/TS/CSS structure. It never
@@ -829,3 +838,132 @@ per selected provider and saves code, validation, timing, tokens and estimated c
 `local_run/code_evaluation.json`. Use `--limit 1` for a smoke check. Generated code is never executed.
 Review those outputs side by side before production rollout. Claude IDs remain unchanged until new IDs can
 be verified against the live model list.
+
+## Visually rich blog generation (`generate_blog`)
+
+`type: "generate_blog"` on `/agent/stream` and `/agent/process` writes an editorial post with at least one table,
+several pull quotes and real inline images, instead of a wall of prose. It ships **disabled**: with
+`BLOG_AI_ENABLED=false` both endpoints answer **HTTP 503** `{"error": "AI blog generation is disabled"}`.
+
+### Request
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | string | `generate_blog` |
+| `query` | string | The topic or a short brief, at most 5,000 characters (longer: HTTP 400) |
+| `secondary_prompt` | string | Optional style notes, for example "friendly, no jargon" |
+| `blog_options` | object | Optional, only valid with this type (any other type: HTTP 400). Unknown keys: HTTP 400 |
+| `image_params`, `image_provider`, `image_model`, `document_id` | | As for chat images. They override the blog's picture defaults (16:9, medium quality) |
+
+`blog_options` (every field optional):
+
+| Field | Values | Meaning |
+|---|---|---|
+| `length` | `short` / `standard` / `long` | About 800 / 1,450 / 2,200 words (default `standard`) |
+| `images` | `0`-`10` or `"auto"` | Pictures wanted. `auto` is one plus one per 700 words. Capped by `IMAGE_MAX_PER_REQUEST` (4) and by the section count |
+| `tone`, `audience` | string | Passed to the writer as context |
+
+The user's own words in `query` win over the options, because code reads them before the model writes anything:
+"a 2,000-word guide" sets the length (clamped to 300-4,000), "with 3 images" the picture count,
+"without images" or "text-only" turns pictures off. When no image provider is usable for the account the post is
+planned with no pictures. If the user explicitly asked for more pictures than the post gets, `done.warnings` says so.
+
+### What the post contains
+
+Plain GitHub-flavoured Markdown, in this order: `# Title`, an italic subtitle line, the introduction, then one `##`
+heading per section and a final `##` conclusion. Code, not the model, decides the visuals before drafting:
+
+| Visual | Rule | Markdown |
+|---|---|---|
+| Table | at least 1 (2 from 2,000 words), every row complete | `\| a \| b \|` with a header and delimiter row |
+| Pull quote | at least 2 (3 from 2,000 words) | `> one key sentence` |
+| Image | exactly the planned count, at most one per section, after the section's first paragraph | `![alt](placeholder::<uuid>)` then a line `*caption*` |
+
+Pull quotes are the author's own unattributed sentences. A quote is attributed to a source only when the research
+tools actually read that page in this request, and then it carries a link to it; any other attribution is removed.
+URLs appear only for pages that were read. No part of the post contains more than `BLOG_MAX_PROSE_RUN` (220) words of
+prose without a visual break, unless a part could not be fixed (reported in `warnings`).
+
+### `/agent/stream` events
+
+`start` -> `content` (the title block, alone) -> **`outline`** -> `content`... -> `done` -> `image_ready` / `image_failed`... -> `stream_end`
+
+The title block opens the post the moment the model has written it, while the rest of the outline is still being generated
+(`BLOG_STREAM_TITLE`, default on; with `gpt-5.2` that is about 2 s after the request instead of 13-15 s). It is the same
+title and subtitle the finished post carries, so nothing is retracted. With `BLOG_STREAM_TITLE=false` the order is
+`start` -> `outline` -> `content`..., as before.
+
+`outline` is additive and arrives as soon as the structure is validated, so the editor can draw a skeleton at once:
+
+```json
+{"type": "outline", "title": "Remote meetings people actually want to join",
+ "sections": [{"id": "s1", "heading": "Why most remote meetings lose people early"}, {"id": "conclusion", "heading": "Make every meeting earn its place"}]}
+```
+
+`content` chunks follow in document order: first the title block, then the introduction, each section, the
+conclusion. Every chunk has already passed the checks above, so none is ever retracted. Pictures start generating
+right after the outline, in parallel with drafting, and arrive through the existing `image_ready` swap
+(`placeholder_id` is the uuid in the Markdown). `stream_end` is sent after the pictures, as for any request that
+started pictures.
+
+`done` carries `warnings` only when there is something to report:
+
+```json
+{"type": "done", "duration": 31.2, "pending_images": 3,
+ "warnings": [{"kind": "unit_lint", "unit": "s2", "detail": "table_missing: The assigned table is missing. ..."}]}
+```
+
+| `kind` | Meaning |
+|---|---|
+| `unit_lint` | A part still broke a rule after its one repair (`unit` names it) and was delivered as written |
+| `outline_filled` | A table or picture the plan requires was still missing after the repair, so code added a generic one (lossless fixes, such as an extra pull-quote directive or rescaled section lengths, cost no repair and are not reported) |
+| `outline_rules` | The outline still broke a rule after the fill (should not happen) |
+| `quota_tables`, `quota_quotes`, `heading_mismatch` | The finished post is short of the plan |
+| `image_skipped` | A picture could not be started (`unit` names the section; the text carries no placeholder for it) |
+| `images_limited` | More pictures were asked for than the post gets |
+
+Clients that ignore `outline` and `warnings` keep working unchanged. If the outline cannot be produced even after a
+repair, or a part comes back empty, the stream ends with an `error` event; nothing is billed for pictures that never
+started, and credits reserved for pictures that did are released.
+
+### `/agent/process`
+
+Same pipeline, same provider key contract as the other types (the backend owns billing). The response waits for the
+pictures (up to `IMAGE_WAIT_SECONDS`, 120 s), writes their URLs into `markdown_response`, and returns `warnings`. A post
+with pictures can take well over a minute: keep the client timeout above 3 minutes. A failed picture becomes
+`*(image could not be generated)*`, never a dead link. An unusable outline is HTTP 500 with the reason in `error`.
+
+### Billing
+
+Text is billed per streamed character exactly as before. Each picture is priced for the model that will draw it and its
+credits are reserved right after the outline (platform keys only), then settled by the existing image billing; BYOK
+accounts reserve nothing. The post is a single request: `operation_type` is `mixed` when pictures finished.
+
+### Configuration
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `BLOG_AI_ENABLED` | `false` | `generate_blog` answers 503 when off |
+| `BLOG_IMAGE_SOURCE` | `generate` | `generate` draws pictures with the image adapter; `none` (or `stock`, not built yet) means no pictures |
+| `BLOG_SECTION_PARALLEL` | `3` | Parts drafted at the same time per request (1-8) |
+| `BLOG_MAX_PROSE_RUN` | `220` | Words allowed between visual breaks |
+| `BLOG_REPAIR_ENABLED` | `true` | One repair call per failing outline or part |
+| `BLOG_STREAM_TITLE` | `true` | Open the post with its title and subtitle as soon as the model has written them, while the rest of the outline is still streaming. The post is identical either way; `false` sends the title only after the whole outline has validated (and the `outline` event first) |
+| `BLOG_OUTLINE_MODEL` | *(empty)* | Model for the **first** outline attempt only: `provider` or `provider:tier` (for example `gemini:basic`; tier `basic` or `advanced`, default `basic`). Empty means the drafting model. It is used only if the request may use that provider (a BYOK account needs its own key for it; `/agent/process` has just the one key it was given); if it is unavailable or fails, the outline falls back to the drafting providers. The outline repair and every part always run on the drafting model, and billing/attribution follow the model that writes the post. Invalid values are ignored with a warning |
+| `BLOG_INTENT_REGEX_ENABLED` | `false` | Route "write a blog post about ..." typed into `general` chat to this pipeline |
+| `BLOG_INTENT_SHADOW_MODE` | `false` | Log that decision without acting on it (run this for a week first) |
+
+The writing task defaults to OpenAI (advanced tier) with the usual fallback tree, unless the user chose a model. Each
+call runs the same retry and fallback rules as the other streams, and a provider that failed once is not retried by the
+parts that follow. Every model call states its output budget (see `get_model(max_tokens=...)`), so long outputs are not
+cut at a provider default.
+
+Run `python scripts/evaluate_blog.py` for a free check of the structure rules over 30 briefs, and
+`python scripts/evaluate_blog.py --live --providers openai claude --limit 3 --images` to compare providers on real posts
+(paid; the posts are written to `local_run/blog_eval/` for side-by-side reading and pictures to `local_run/images/`).
+
+To judge saved posts by eye, `python scripts/render_blog_preview.py --out local_run/blog_preview.html --compare "Sleep routine" old.md new.md`
+(repeat `--compare` for more briefs, or `--post LABEL post.md` for one post) writes a single self-contained page: pictures
+inlined, a page-rhythm bar and an at-a-glance table beside each post, and a table whose delimiter row is wrong shown as the
+plain text a reader would see, flagged. It uses a generic CommonMark renderer, not the editor's, so it says nothing about
+how the editor draws a picture followed by an italic caption line (open item O2 of the plan).

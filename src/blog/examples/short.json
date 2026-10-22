@@ -1,0 +1,85 @@
+{
+  "input": {
+    "brief": "Write a short blog post for small business owners about choosing their first project management tool.",
+    "plan": {
+      "target_words": 800,
+      "sections": 4,
+      "section_words": 640,
+      "intro_words": 80,
+      "conclusion_words": 80,
+      "images": 2,
+      "tables_at_least": 1,
+      "quotes_at_least": 2
+    },
+    "web_research": false
+  },
+  "output": {
+    "title": "Your first project management tool, chosen calmly",
+    "subtitle": "How a small business can pick a tool its team will actually keep using.",
+    "intro": {
+      "target_words": 80,
+      "hook": "Start with the owner staring at a long list of tools and no clear way to compare them, then promise a short, honest method."
+    },
+    "sections": [
+      {
+        "id": "s1",
+        "heading": "Start with the work, not the software",
+        "angle": "Describe how the team really tracks work today and where things slip, so the tool is chosen to fix a real problem rather than to follow a trend.",
+        "target_words": 160,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A small team's shared whiteboard covered in colourful sticky notes arranged in columns, in a bright, tidy office",
+            "alt": "A whiteboard covered in sticky notes arranged in columns",
+            "caption": "Look at how work really moves before choosing a tool",
+            "position": "after_first_paragraph"
+          }
+        ]
+      },
+      {
+        "id": "s2",
+        "heading": "What a small team really needs",
+        "angle": "Reduce the feature lists to the few capabilities a small team uses every day, and compare the common kinds of tool against them.",
+        "target_words": 160,
+        "visuals": [
+          {
+            "kind": "table",
+            "title": "Kinds of tool compared",
+            "columns": ["Kind of tool", "Best for", "Trade-off"],
+            "rows_hint": 4
+          },
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s3",
+        "heading": "Run a small trial before you commit",
+        "angle": "Explain how to test one tool on one real project with a few people, and what to watch for early on.",
+        "target_words": 160,
+        "visuals": [
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s4",
+        "heading": "Make it stick with the team",
+        "angle": "Adoption beats features: agree a few simple habits, name an owner for the tool and review later whether it is helping.",
+        "target_words": 160,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "Colleagues around a laptop in a bright meeting room, seen from behind, relaxed and collaborative",
+            "alt": "Colleagues gathered around a laptop in a bright room",
+            "caption": "A tool only helps if the team uses it together",
+            "position": "after_first_paragraph"
+          }
+        ]
+      }
+    ],
+    "conclusion": {
+      "heading": "Pick the simple option and review it",
+      "target_words": 80,
+      "takeaways": 3
+    }
+  }
+}

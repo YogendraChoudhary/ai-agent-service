@@ -58,6 +58,34 @@ BASIC_MODEL_IDS = {
     "gemini": "gemini-3.5-flash-lite",
 }
 
+# ============================================
+# OUTPUT TOKEN LIMITS
+# ============================================
+# agno's Claude defaults to 8,192 output tokens and the other providers to their own limits, so a long
+# answer was cut off silently. Callers that know how much text they expect pass max_tokens to get_model().
+# That number is the VISIBLE output wanted; output_token_budget() turns it into the provider limit.
+#
+# OUTPUT_TOKEN_CEILING and REASONING_HEADROOM_TOKENS are conservative and NOT yet checked against the
+# providers' live model cards (open item O7 of docs/rich_content_engine_plan.md): verify before raising them.
+OUTPUT_TOKEN_CEILING = 16_384
+REASONING_HEADROOM_TOKENS = 4_096
+
+
+def reasoning_headroom(model_id: str) -> int:
+    """
+    Extra tokens for models whose output limit also counts hidden reasoning tokens (OpenAI gpt-5 / o-series,
+    Grok 4 reasoning). Without it a short, well-sized answer can be cut off before the first visible word.
+    """
+    mid = (model_id or "").lower()
+    reasons = mid.startswith(("gpt-5", "o1", "o3", "o4")) or (mid.startswith("grok-4") and "non-reasoning" not in mid)
+    return REASONING_HEADROOM_TOKENS if reasons else 0
+
+
+def output_token_budget(model_id: str, visible_tokens: int) -> int:
+    """The provider output limit for `visible_tokens` of visible text from this model."""
+    return min(int(visible_tokens), OUTPUT_TOKEN_CEILING) + reasoning_headroom(model_id)
+
+
 # Inline autocomplete fires on almost every keystroke, and the user is charged a
 # flat AUTOCOMPLETE_CREDITS_SCALED rate regardless of which model serves it — so
 # the model's cost comes straight out of our margin. Always the cheapest usable

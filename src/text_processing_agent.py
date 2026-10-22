@@ -24,6 +24,7 @@ from .models import (
 )
 from .security_guardrails import sanitize_web_content
 from .observability import trace_mark, trace_set
+from .blog.prompts import section_system_prompt
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 import os
@@ -343,6 +344,28 @@ def build_agno_images(image_urls, request_id: str = None):
 
 _MODEL_CACHE: dict[tuple, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+_MAX_TOKENS_STEP = 1024
+
+
+def _round_max_tokens(max_tokens: Optional[int]) -> Optional[int]:
+    """Up to the next multiple of 1,024, so per-request budgets share a bounded set of cached models."""
+    if not max_tokens or max_tokens <= 0:
+        return None
+    return -(-int(max_tokens) // _MAX_TOKENS_STEP) * _MAX_TOKENS_STEP
+
+
+def _output_limit_kwargs(model_provider: str, model_id: str, max_tokens: Optional[int]) -> dict:
+    """The provider-specific constructor argument that caps the output (empty = the provider's own default)."""
+    if not max_tokens:
+        return {}
+    from .models import output_token_budget
+    limit = output_token_budget(model_id, max_tokens)
+    if model_provider == 'gemini':
+        return {'max_output_tokens': limit}
+    if model_provider == 'openai' and model_id.startswith('gpt-5'):
+        return {'max_completion_tokens': limit}   # gpt-5 rejects max_tokens
+    return {'max_tokens': limit}                  # Claude, Grok, DeepSeek and the older OpenAI models
+
 
 def get_model(
     model_provider: str,
@@ -353,6 +376,7 @@ def get_model(
     temperature: float = 0.0,
     cache_model: bool = True,
     managed_retries: bool = False,
+    max_tokens: Optional[int] = None,
 ):
     """
     Factory function to get or create the appropriate model instance based on provider.
@@ -365,6 +389,8 @@ def get_model(
         request_id: Request ID for logging
         needs_tools: Whether this agent needs tool/function calling support
         temperature: Sampling temperature for output determinism and creativity
+        max_tokens: Visible output tokens the caller expects (None = the provider's default, today's behaviour).
+            Rounded up to a multiple of 1,024; reasoning models get headroom on top (see models.output_token_budget).
 
     Returns:
         Model instance for agno Agent
@@ -381,13 +407,14 @@ def get_model(
         logger.error(f"{log_prefix}Unsupported model provider: {model_provider}")
         raise ValueError(f"Unsupported model provider: {model_provider}")
     ensure_allowed_model(model_id)
+    max_tokens = _round_max_tokens(max_tokens)
 
     # Check cache first
     cache_tools = needs_tools if model_provider == 'deepseek' else False
     cache_temperature = round(float(temperature), 2)
     if (model_provider == 'openai' and model_id.startswith('gpt-5')) or model_id == 'deepseek-reasoner':
         cache_temperature = 0.0
-    cache_key = (model_provider, api_key, use_advanced, cache_tools, cache_temperature, managed_retries)
+    cache_key = (model_provider, api_key, use_advanced, cache_tools, cache_temperature, managed_retries, max_tokens)
     if cache_model:
         with _MODEL_CACHE_LOCK:
             if cache_key in _MODEL_CACHE:
@@ -402,7 +429,8 @@ def get_model(
             f"{log_prefix}Creating DeepSeek model: {DEEPSEEK_TOOL_MODEL_ID} "
             f"(downgraded from {model_id} - no tool support)"
         )
-        model = DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature, client_params=client_params)
+        model = DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature, client_params=client_params,
+                         **_output_limit_kwargs(model_provider, DEEPSEEK_TOOL_MODEL_ID, max_tokens))
         if cache_model:
             with _MODEL_CACHE_LOCK:
                 _MODEL_CACHE[cache_key] = model
@@ -410,15 +438,17 @@ def get_model(
 
     logger.info(
         f"{log_prefix}Creating {model_provider} model: {model_id} "
-        f"(advanced={use_advanced}, temp={temperature})"
+        f"(advanced={use_advanced}, temp={temperature}, max_tokens={max_tokens})"
     )
+    limits = _output_limit_kwargs(model_provider, model_id, max_tokens)
 
     if model_provider == 'openai':
         if model_id.startswith("gpt-5"):
             # GPT-5 family models reject custom temperature ("Only the default (1) value is supported")
-            model = OpenAIChat(id=model_id, api_key=api_key, client_params=client_params)
+            model = OpenAIChat(id=model_id, api_key=api_key, client_params=client_params, **limits)
         else:
-            model = OpenAIChat(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params)
+            model = OpenAIChat(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params,
+                               **limits)
     elif model_provider == 'claude':
         model = Claude(
             id=model_id,
@@ -427,17 +457,20 @@ def get_model(
             cache_system_prompt=True,
             cache_tools=True,
             client_params=client_params,
+            **limits,
         )
     elif model_provider == 'grok':
-        model = xAI(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params)
+        model = xAI(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params, **limits)
     elif model_provider == 'deepseek':
         if model_id == 'deepseek-reasoner':
             # deepseek-reasoner rejects custom temperature
-            model = DeepSeek(id=model_id, api_key=api_key, client_params=client_params)
+            model = DeepSeek(id=model_id, api_key=api_key, client_params=client_params, **limits)
         else:
-            model = DeepSeek(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params)
+            model = DeepSeek(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params,
+                             **limits)
     elif model_provider == 'gemini':
-        gemini_kwargs = {"id": model_id, "api_key": api_key, "temperature": temperature, "client_params": client_params}
+        gemini_kwargs = {"id": model_id, "api_key": api_key, "temperature": temperature,
+                         "client_params": client_params, **limits}
         if model_id == "gemini-3.8-flash":
             # gemini-3.8-flash spends 2.5-3.5s calculating reasoning tokens by default;
             # disabling thinking budget drops TTFT significantly for responsive streaming.
@@ -670,7 +703,7 @@ def close_shared_web_client() -> None:
             _SHARED_WEB_CLIENT = None
 
 
-def create_web_read_tool(request_id: str = None, budget=None):
+def create_web_read_tool(request_id: str = None, budget=None, on_read=None):
     """
     A guarded page reader.
 
@@ -678,6 +711,9 @@ def create_web_read_tool(request_id: str = None, budget=None):
     so an agent asked for figures could find the right source but not read it,
     and would fall back on recalled numbers while citing a URL it never opened.
     This closes that gap.
+
+    on_read: optional callback(url), called for every page that was actually read (never for an error), so a
+    caller can tell which sources really back what the model wrote.
     """
     log_prefix = f"[{request_id}] " if request_id else ""
 
@@ -761,6 +797,8 @@ def create_web_read_tool(request_id: str = None, budget=None):
                 return "ERROR: no readable text found at that URL (it may be JavaScript-rendered or blocking automated access). Say so rather than substituting remembered figures."
             if len(text) > MAX_PAGE_CHARS:
                 text = text[:MAX_PAGE_CHARS] + "\n\n[truncated]"
+            if on_read is not None:
+                on_read(url)
             return sanitize_web_content(text, source_url=url, request_id=request_id, wrap_boundary=True)
         except Exception as e:
             logger.warning(f"{log_prefix}read_web_page failed: {type(e).__name__} ({str(e)})")
@@ -1661,6 +1699,17 @@ AGENT_CONFIGS = {
         "use_advanced": True,
         "temperature": 0.2,
     },
+    # Visually rich blog posts. Not a one-shot agent: src/blog drives it in stages (outline, then each section)
+    # and passes the instructions, temperature and output budget per call, so these are only the defaults.
+    # Web research is granted per call through the plan; the pipeline never attaches image tools to it.
+    "blog_writer": {
+        "name": "Blog Writer",
+        "role": "Write editorial blog posts with tables, quotes and images, section by section",
+        "instructions": section_system_prompt(),
+        "use_tools": True,
+        "use_advanced": True,
+        "temperature": 0.7,
+    },
 }
 
 # ============================================
@@ -1683,8 +1732,8 @@ def _image_tool_available(model_provider, api_key, is_byok, image_ctx) -> bool:
 
 
 def _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx):
-    """The plan only applies to the free-form agent, and images are dropped from it if none can be made."""
-    if plan is None or agent_type not in ("smart_global", "code_writer"):
+    """The plan only applies to the free-form agents, and images are dropped from it if none can be made."""
+    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer"):
         return None
     if plan.image_count > 0 and not _image_tool_available(model_provider, api_key, is_byok, image_ctx):
         from dataclasses import replace
@@ -1705,6 +1754,9 @@ def create_agent(
     is_byok: bool = False,
     image_ctx: dict = None,
     plan=None,
+    instructions=None,
+    temperature: float = None,
+    max_tokens: int = None,
 ):
     """
     Factory function to create an agent with the specified model.
@@ -1712,6 +1764,10 @@ def create_agent(
     plan: optional RequestPlan (src/request_plan.py) for the free-form agent. When given, the code decides
     the tools (image/web), the number of images, the call budgets and the model tier; the prompt only
     mentions what was granted. None keeps the full-capability behaviour.
+
+    instructions / temperature / max_tokens: per-call overrides of the agent's configuration, for pipelines that
+    run one agent type with different prompts (the blog writer: outline, then each section). max_tokens is the
+    visible output wanted; see get_model.
 
     Args:
         agent_type: Type of agent to create (from AGENT_CONFIGS keys)
@@ -1735,12 +1791,15 @@ def create_agent(
     config = AGENT_CONFIGS[agent_type]
     use_advanced = config.get("use_advanced", True)
     use_tools = config.get("use_tools", False)
-    temperature = config.get("temperature", 0.7)
-    instructions = config["instructions"]
+    agent_temperature = config.get("temperature", 0.7) if temperature is None else temperature
+    instructions = config["instructions"] if instructions is None else instructions
 
     if agent_type == 'code_writer' and plan is None:
         from .request_plan import RequestPlan
         plan = RequestPlan(use_web=True, advanced_model=True)
+    elif agent_type == 'blog_writer' and plan is None:
+        from .request_plan import RequestPlan
+        plan = RequestPlan(use_web=False, advanced_model=True)    # the blog pipeline grants web per call
 
     plan = _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx)
     if plan is not None:
@@ -1751,7 +1810,7 @@ def create_agent(
 
     logger.info(
         f"{log_prefix}Creating agent: {config['name']} "
-        f"(type={agent_type}, advanced={use_advanced}, tools={use_tools}, temp={temperature})"
+        f"(type={agent_type}, advanced={use_advanced}, tools={use_tools}, temp={agent_temperature})"
     )
 
     from config import settings
@@ -1761,9 +1820,10 @@ def create_agent(
         use_advanced,
         request_id,
         needs_tools=use_tools,
-        temperature=temperature,
+        temperature=agent_temperature,
         cache_model=not is_byok,
         managed_retries=settings.provider_fallback_enabled,
+        max_tokens=max_tokens,
     )
 
     agent_kwargs = {
@@ -1771,7 +1831,9 @@ def create_agent(
         "role": config["role"],
         "model": model,
         "instructions": instructions,
-        "markdown": True,
+        # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes; agno's "use markdown"
+        # nudge would only fight the prompt.
+        "markdown": agent_type != "blog_writer",
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
@@ -1780,9 +1842,9 @@ def create_agent(
         # do NOT need current time. Disabling datetime injection removes dynamic
         # microsecond timestamps from the system message, ensuring 100% byte-identical
         # static system prompts across all requests for maximum KV cache hits (OpenAI, Gemini, Claude).
-        # Only smart_global needs the date to anchor relative queries ('the last 5 years', 'this year'),
-        # and we format it as %Y-%m-%d to maintain day-long prefix stability.
-        "add_datetime_to_context": (agent_type == "smart_global"),
+        # Only the agents that can research (smart_global, blog_writer) need the date to anchor relative queries
+        # ('the last 5 years', 'this year'); it is formatted as %Y-%m-%d to maintain day-long prefix stability.
+        "add_datetime_to_context": (agent_type in ("smart_global", "blog_writer")),
         "timezone_identifier": "Etc/UTC",
         "datetime_format": "%Y-%m-%d",
     }
@@ -1809,7 +1871,9 @@ def create_agent(
             search_budget = budgets.setdefault('search', ToolBudget(settings.web_search_call_limit, "search"))
             read_budget = budgets.setdefault('read', ToolBudget(settings.web_read_call_limit, "read"))
             search_tool = DuckDuckGoWithRetry(backend="auto")
-            reader_tool = create_web_read_tool(request_id, budget=read_budget)
+            web_sources = (image_ctx or {}).get('web_sources')
+            reader_tool = create_web_read_tool(
+                request_id, budget=read_budget, on_read=web_sources.add if web_sources is not None else None)
             tools += [
                 create_parallel_search_tool(search_tool, request_id, budget=search_budget),
                 reader_tool,
@@ -1874,6 +1938,7 @@ AGENT_FOR_REQUEST_TYPE = {
     "general": FREE_FORM_AGENT,
     "generate_email_template": "email_template",
     "extract_image_text": "text_extraction",
+    "generate_blog": "blog_writer",
 }
 
 
@@ -2027,6 +2092,8 @@ def process_user_query_stream(
     report_model: bool = False,
     classifier_platform_key: str = None,
     text_byok: Optional[bool] = None,
+    instruction: Optional[str] = None,
+    blog_options: Optional[dict] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2052,9 +2119,12 @@ def process_user_query_stream(
             (fix grammar, simplify, ...) carry user text that can mention images freely.
         document_id: Optional editor document id; scopes the "previous image" memory.
         image_params: Validated explicit image parameters from the API (highest precedence).
+        instruction: The request's secondary prompt as the user wrote it (style notes for a blog post).
+        blog_options: Validated BlogOptions for the generate_blog type (length, images, tone, audience).
 
     Yields:
-        Markdown content chunks as they are generated
+        Markdown content chunks as they are generated. The blog pipeline also yields {"__event__": {...}} (an
+        additive SSE event) and {"__warnings__": [...]}; the dict chunks that already existed are unchanged.
     """
     log_prefix = f"[{request_id}] " if request_id else ""
 
@@ -2220,6 +2290,7 @@ def process_user_query_stream(
                     'explain_code' if force_agent_type == 'code_explainer' else
                     'make_longer' if force_agent_type == 'make_longer' else
                     'generate_email_template' if force_agent_type == 'email_template' else
+                    'generate_blog' if force_agent_type == 'blog_writer' else
                     'general' if force_agent_type in (None, FREE_FORM_AGENT) else 'typed')
     platform_classifier_key = classifier_platform_key or ((key_resolver.default_keys or {}).get('anthropic_api_key') if key_resolver else None)
     if request_type == 'general' and image_intent and image_intent['kind'] in ('generate', 'edit'):
@@ -2230,6 +2301,20 @@ def process_user_query_stream(
             platform_key=platform_classifier_key, request_id=request_id))
     if task == 'code' and request_type == 'general':
         force_agent_type = 'code_writer'
+    elif (request_type == 'general' and not image_urls and settings.blog_ai_enabled
+          and not (image_intent and image_intent['kind'] in ('generate', 'edit'))
+          and (settings.blog_intent_regex_enabled or settings.blog_intent_shadow_mode)):
+        # "write a blog post about ..." in free-form chat: image and code intent were checked first, as for code.
+        from .blog.intent import detect_blog_intent
+        blog_decision = detect_blog_intent(query)
+        trace_set(request_id, blog_intent=blog_decision['rule'])
+        if blog_decision['kind'] == 'blog':
+            if settings.blog_intent_shadow_mode:
+                logger.info(f"{log_prefix}[BLOG SHADOW] would route to the blog pipeline (rule: {blog_decision['rule']})")
+            else:
+                force_agent_type, request_type = 'blog_writer', 'generate_blog'
+                task, intent_attrs = task_for_request(request_type, query)
+                intent_attrs.update(intent_rule=blog_decision['rule'])
     trace_set(request_id, task=task, model_source=model_source, **intent_attrs)
 
     # Standard agent routing path
@@ -2278,7 +2363,20 @@ def process_user_query_stream(
         raise ValueError(f"Provider '{model_provider}' does not support image input")
     trace_set(request_id, candidates=[c.provider for c in candidates],
               route_reason='user_selection' if model_source == 'user' else 'task_default', fallbacks=[])
-    from .provider_errors import is_retryable, is_rate_limit, retry_delay, status_code
+
+    if agent_type == 'blog_writer':
+        # Staged pipeline (outline -> parts -> lint) instead of one agent run. It hands over `pending_images` itself,
+        # as soon as it has started a picture (billed work), so every exit path can release the reserved credits.
+        from .blog.runtime import stream_blog
+        yield from stream_blog(
+            query, instruction, blog_options, candidates=candidates,
+            key_for=key_resolver if routed else (lambda _provider: api_key), is_byok=is_byok, user_id=user_id,
+            credit_manager=credit_manager, pending_images=pending_images, image_params=image_params,
+            document_id=document_id, request_id=request_id, report_model=report_model,
+            available_providers=key_resolver.available_providers if routed else None)
+        return
+
+    from .provider_errors import can_fall_back, is_provider_unusable, is_rate_limit, retry_delay, status_code
     from .models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, DEEPSEEK_TOOL_MODEL_ID
     fallbacks = []
     sent = False
@@ -2316,8 +2414,12 @@ def process_user_query_stream(
             except Exception as error:
                 # A tool may already have started a billed image even without a text token.
                 has_images_started = any(not str(k).startswith('__') for k in pending_images)
-                if sent or has_images_started or not settings.provider_fallback_enabled or not is_retryable(error):
+                if sent or has_images_started or not settings.provider_fallback_enabled or not can_fall_back(error):
                     raise
+                if is_provider_unusable(error):
+                    # The request still succeeds on the next provider, so this log is the only sign of a dead key.
+                    logger.error('%s%s key or model unusable (%s); falling back', log_prefix, provider,
+                                 status_code(error) or type(error).__name__)
                 if is_rate_limit(error) and retry == 0:
                     retry += 1
                     delay = retry_delay(error)
@@ -2411,11 +2513,17 @@ def process_user_query_with_images(
     image_params: dict = None,
     wait_seconds: float = None,
     model_source: str = "user",
+    instruction: str = None,
+    blog_options: dict = None,
+    meta: dict = None,
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
     image route, same model selection), then waiting for the background images and writing their URLs
     into the text. Returns (text, pending_images) so the caller can settle billing.
+
+    meta: optional dict the caller passes in; it receives {"warnings": [...]} (the blog pipeline's findings) so the
+    return value stays the (text, pending_images) pair callers already unpack.
     """
     log_prefix = f"[{request_id}] " if request_id else ""
     if not api_key:
@@ -2444,9 +2552,14 @@ def process_user_query_with_images(
         image_params=image_params,
         non_streaming=True,
         model_source=model_source,
+        instruction=instruction,
+        blog_options=blog_options,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]
+        elif isinstance(chunk, dict) and "__warnings__" in chunk:
+            if meta is not None:
+                meta["warnings"] = chunk["__warnings__"]
         elif isinstance(chunk, dict) and "__content_replace__" in chunk:
             chunks = [chunk["__content_replace__"]]
         elif isinstance(chunk, str):

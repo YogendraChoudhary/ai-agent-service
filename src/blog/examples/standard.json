@@ -1,0 +1,99 @@
+{
+  "input": {
+    "brief": "Write a blog post for team leads about running remote meetings that people actually want to attend.",
+    "plan": {
+      "target_words": 1450,
+      "sections": 5,
+      "section_words": 1210,
+      "intro_words": 120,
+      "conclusion_words": 120,
+      "images": 3,
+      "tables_at_least": 1,
+      "quotes_at_least": 2
+    },
+    "web_research": false
+  },
+  "output": {
+    "title": "Remote meetings people actually want to join",
+    "subtitle": "A practical guide for team leads who are tired of calls that could have been a message.",
+    "intro": {
+      "target_words": 120,
+      "hook": "Open on the familiar scene of a calendar full of calls nobody leaves energised, then promise a practical way to fix it."
+    },
+    "sections": [
+      {
+        "id": "s1",
+        "heading": "Why most remote meetings lose people early",
+        "angle": "Meetings fail long before anyone speaks: no clear purpose, no agenda, the wrong people invited. Show the reader how to spot these signals before the invite goes out.",
+        "target_words": 230,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A bright home-office desk with a laptop showing a video call grid of small tiles, a notebook and a cup of coffee, soft morning light",
+            "alt": "A laptop on a home-office desk showing a video call",
+            "caption": "Most meeting trouble starts before the call begins",
+            "position": "after_first_paragraph"
+          }
+        ]
+      },
+      {
+        "id": "s2",
+        "heading": "Match the format to the decision",
+        "angle": "Compare the common meeting formats (live discussion, written update, working session) and say when each one earns its place on the calendar.",
+        "target_words": 250,
+        "visuals": [
+          {
+            "kind": "table",
+            "title": "Meeting formats compared",
+            "columns": ["Format", "Best for", "Watch out for"],
+            "rows_hint": 4
+          },
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s3",
+        "heading": "Design the agenda around outcomes",
+        "angle": "Replace topic lists with the decisions and outputs the meeting must produce, and show how an outcome-first agenda changes who speaks and for how long.",
+        "target_words": 270,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A hand writing short notes on a notepad next to an open laptop, flat lay, clean desk, soft natural light",
+            "alt": "A notepad and an open laptop on a clean desk",
+            "caption": "Start from the outcome, then write the agenda",
+            "position": "after_first_paragraph"
+          },
+          {"kind": "quote", "mode": "pull"}
+        ]
+      },
+      {
+        "id": "s4",
+        "heading": "Make participation fair across time zones",
+        "angle": "Practical ways to share the inconvenient hours: rotating slots, recorded context and written pre-reads that let people contribute without being live.",
+        "target_words": 230,
+        "visuals": [
+          {
+            "kind": "image",
+            "prompt": "A minimalist world map with several warm glowing dots joined by thin lines on a soft gradient background",
+            "alt": "A world map with glowing dots joined by thin lines",
+            "caption": "Sharing the inconvenient hours fairly",
+            "position": "after_first_paragraph"
+          }
+        ]
+      },
+      {
+        "id": "s5",
+        "heading": "Close the loop after the call",
+        "angle": "Capture decisions, owners and dates in writing, promptly, so the meeting leaves a trail that people who were not there can follow.",
+        "target_words": 230,
+        "visuals": []
+      }
+    ],
+    "conclusion": {
+      "heading": "Make every meeting earn its place",
+      "target_words": 120,
+      "takeaways": 3
+    }
+  }
+}

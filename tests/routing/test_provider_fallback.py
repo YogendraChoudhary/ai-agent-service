@@ -49,12 +49,31 @@ class TestProviderFallback(unittest.TestCase):
             self.run_stream(create)
         self.assertEqual(create.call_count, 1)
 
-    def test_auth_and_bad_request_never_fallback(self):
-        for failure in ('401 invalid key', '403 permission denied', '400 bad request', 'safety block'):
+    def test_dead_key_or_retired_model_falls_back_without_retry(self):
+        for failure in ("Error code: 401 - {'type': 'authentication_error', 'message': 'invalid x-api-key'}",
+                        '403 permission denied', '404 model not found'):
+            calls = []
+            def create(agent_type, provider, key, *a, **kw):
+                calls.append(provider)
+                events = [error(failure)] if provider == 'claude' else [content('```python\nx=1\n```')]
+                return SimpleNamespace(run=lambda *a, **kw: iter(events))
+            with self.subTest(failure=failure):
+                out = self.run_stream(create)
+                self.assertEqual(calls, ['claude', 'openai'])
+                self.assertEqual(out[0]['__model_used__'][0], 'openai')
+
+    def test_bad_request_and_safety_never_fallback(self):
+        for failure in ('400 bad request', 'safety block', '400 content_filter'):
             create = Mock(return_value=SimpleNamespace(run=lambda *a, **kw: iter([error(failure)])))
             with self.subTest(failure=failure), self.assertRaises(RuntimeError):
                 self.run_stream(create)
             self.assertEqual(create.call_count, 1)
+
+    def test_every_provider_unusable_raises_the_last_error(self):
+        create = Mock(return_value=SimpleNamespace(run=lambda *a, **kw: iter([error('401 invalid api key')])))
+        with self.assertRaises(RuntimeError):
+            self.run_stream(create)
+        self.assertEqual([c.args[1] for c in create.call_args_list], ['claude', 'openai', 'gemini'])
 
     def test_nonstreaming_never_switches_provider(self):
         create = Mock(return_value=SimpleNamespace(run=lambda *a, **kw: iter([error('429 rate limit')])))

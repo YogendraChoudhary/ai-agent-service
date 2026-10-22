@@ -60,6 +60,9 @@ _PREFIX = (
     r"i\s+(?:want|need|would\s+like|'d\s+like|wanna)(?:\s+you)?(?:\s+to)?)[\s,]+)*"
 )
 
+# Shared with other start-anchored routers (src/blog/intent.py) so "please", "can you"... mean one thing everywhere.
+POLITE_PREFIX = _PREFIX
+
 # Words that mean the user is producing or editing TEXT, not a picture.
 TEXT_CUES = re.compile(
     r"\b(?:summary|summari[sz]e|list|table|caption|description|text|essay|article|email|post|"

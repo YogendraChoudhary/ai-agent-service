@@ -25,6 +25,10 @@ filetype
 # Web-search backend used by agno's DuckDuckGoTools
 ddgs
 
+# Markdown block parser behind src/longform/markdown_ast.py (blog lint, structure-preserving refinement).
+# It arrives transitively today (agno -> rich); pinned because the parser is now a direct dependency.
+markdown-it-py==4.2.0
+
 # HTML parsing for agno's WebsiteReader, which backs the read_web_page tool.
 # Not pulled in by agno itself — without it every page read fails with an
 # ImportError and the agent falls back to "could not verify".

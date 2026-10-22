@@ -144,6 +144,12 @@ _LONGFORM = re.compile(
 _WORDCOUNT = re.compile(r"\b(\d[\d,]{2,5})[- ]?(?:words?|word\s+count)\b", re.I)
 
 
+def extract_word_count(text: Optional[str]) -> Optional[int]:
+    """The length the user asked for in their own words ("a 1,500-word post" -> 1500), else None."""
+    m = _WORDCOUNT.search(text or "")
+    return int(m.group(1).replace(",", "")) if m else None
+
+
 def needs_advanced_model(text: Optional[str], use_web: bool, image_count: int) -> bool:
     """
     Reasoning-grade model for tool use, long-form or code requests, long inputs; the cheap fast

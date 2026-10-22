@@ -9,7 +9,7 @@ TASK_DEFAULTS = {'code': 'claude', 'writing': 'openai', 'content': None}
 FALLBACK_TREES = {'code': ['claude', 'openai', 'gemini'], 'writing': ['openai', '<requested>', 'claude'],
                   'content': ['<requested>', 'openai', 'claude']}
 # Long-form writing actions that default to OpenAI's advanced tier. Tone and the quick edits stay on content.
-WRITING_REQUEST_TYPES = ('make_longer', 'generate_email_template')
+WRITING_REQUEST_TYPES = ('make_longer', 'generate_email_template', 'generate_blog')
 
 
 @dataclass(frozen=True)

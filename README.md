@@ -10,11 +10,15 @@ The service provides multi-provider LLM inference (OpenAI, Anthropic Claude, Gro
 api.py               Application entry point
 config.py            Application settings
 src/                 Service implementation
+  blog/              Visually rich blog generation (outline -> sections -> lint)
+  longform/          Markdown block parser and ordered parallel runner shared by the long-form modes
 tests/
+  blog/              Blog generation tests (a scripted model stands in for the providers)
   code/              Code generation and validation tests
   core/              Observability, latency, and security tests
   email/             Email template tests
   images/            Image generation and routing tests
+  longform/          Markdown parser and ordered runner tests
   routing/           Request routing, classification, and fallback tests
   fixtures/          Shared labelled evaluation cases
   conftest.py        Shared test guards
@@ -211,12 +215,21 @@ contains the words "fix grammar" still runs the simplify agent.
 | `translate` | `translation` | | `extract_image_text` | `text_extraction` |
 | `make_longer` | `make_longer` | | **`general`** | **`smart_global`** (default) |
 | `generate_code` | `code_writer` | | `explain_code` | `code_explainer` |
+| `generate_blog` | `blog_writer` | | | |
 
 `general` defaults to the free-form agent, which plans its own tools from the user's words
 (`src/request_plan.py`: image count, web access, model tier) and may take the direct image route.
 Tables, lists and summaries requested through `general` are handled by that agent; the dedicated `table`,
 `list` and `summarize` agents have no API `type` and are no longer reachable through the API.
 `determine_agent_type` (keyword matching) remains only for callers that name no agent.
+
+`generate_blog` is not one agent run: `src/blog` plans the post in code (length, sections, tables, quotes, images), has the
+model write a validated outline, drafts the sections in parallel while the pictures generate, and lints each part before
+it is streamed. It ships disabled (`BLOG_AI_ENABLED`); the contract, events and flags are in
+[the API handoff](docs/API_DOCUMENTATION.md#visually-rich-blog-generation-generate_blog). Try it locally with
+`python scripts/run_local_server.py` then `python scripts/local_test_requests.py` (the blog scenarios), or compare providers
+with `python scripts/evaluate_blog.py --live`. To read saved posts as a reader would, `python scripts/render_blog_preview.py`
+writes one self-contained HTML page; `--compare LABEL OLD.md NEW.md` puts two generations of a brief side by side.
 
 Optional code intent routing, task defaults, provider fallback, and code validation ship disabled.
 See [the API handoff](docs/API_DOCUMENTATION.md#code-generation-and-task-routing) for flags, `model_source`,
