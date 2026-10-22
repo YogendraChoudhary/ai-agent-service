@@ -1,6 +1,6 @@
 # Content Refinement & Visually Rich Blog Generation — Integration Plan
 
-*Status: **Mode 2 (visually rich blog generation) is implemented**, behind `BLOG_AI_ENABLED=false` (see §13). Mode 1 (structure-preserving refinement) is not started; only the modules both modes share exist. Date: 2026-10-21. Scope: this agent service + the Eddyter editor contract.*
+*Status: **Mode 1 (structure-preserving refinement) and Mode 2 (visually rich blog generation) are implemented**, behind `LONGFORM_REFINE_ENABLED=false` and `BLOG_AI_ENABLED=false` (see §13). Date: 2026-10-22. Scope: this agent service + the Eddyter editor contract.*
 
 Two new modes, both built on what the repo already does well (deterministic planning in code, validate → one
 repair pass, the `placeholder::<uuid>` + `image_ready` image contract):
@@ -87,7 +87,7 @@ request (type, query = document, secondary_prompt = instruction)
   ├─ 3. parse                 markdown-it (commonmark + table) → top-level blocks with line ranges
   ├─ 4. freeze                tables, blockquotes, images, fences, html, link URLs → [[TABLE_1]] ... tokens
   ├─ 5. chunk                 ~1,000 words, cut between blocks, prefer before H2/H3
-  ├─ 6. refine (parallel 3)   per chunk: system prompt (operation) + user message (instruction, context, chunk)
+  ├─ 6. refine (parallel 5)   per chunk: system prompt (operation) + user message (instruction, context, chunk)
   ├─ 7. verify + repair       tokens, headings, lists, paragraphs, word ratio → repair once → restore original
   ├─ 8. emit in order         SSE `content` per verified chunk, `refine_progress` between chunks
   ├─ 9. thaw                  tokens → original tables/quotes/images/URLs (exact bytes)
@@ -148,7 +148,7 @@ The token regex is the only thing `verify.py` and `thaw()` need: `\[\[(TABLE|QUO
 - Model: the operation's tier as today (`grammar`/`simplify`/`tone` basic, `enhance` advanced), the operation's
   temperature, no tools, `max_tokens` from D15. Provider candidates come from the same `resolve_route()` list as
   today; a retryable error before the first token of a chunk moves that chunk to the next candidate.
-- **Parallel + ordered** (`src/longform/ordered_stream.py`): submit chunks to a pool (`LONGFORM_PARALLEL`, 3);
+- **Parallel + ordered** (`src/longform/ordered_stream.py`): submit chunks to a pool (`LONGFORM_PARALLEL`, 5 — measured, §13);
   the generator yields chunk *i* only after chunks < *i* were yielded. Each chunk is buffered until verified (D5).
   Yields a `{"__progress__": {"chunk": i, "of": n}}` sentinel between chunks for the `refine_progress` event.
 
@@ -196,7 +196,9 @@ else moves.
 
 A 1,000-word chunk is ~1,400 output tokens: ~10 s on the basic tier, ~15–18 s on the advanced tier. Five chunks at
 parallel 3 → two rounds → ~25–40 s wall-clock for 5,000 words, first text at ~10–18 s, versus one 7,000-token
-response today (60–90 s when it is not truncated). Phase 5 measures p50/p95 per provider.
+response today (60–90 s when it is not truncated). Phase 5 measures p50/p95 per provider. **Measured** (§13): the basic
+OpenAI tier took ~34 s per 1,000-word chunk and the advanced tier ~12 s, so the estimate held only for the advanced tier;
+that moved the defaults to `LONGFORM_PARALLEL=5` and a 300-word first chunk.
 
 ### 3.10 Later (not v1)
 
@@ -367,7 +369,9 @@ Existing files touched:
 | `LONGFORM_REFINE_ENABLED` | `false` | Chunked, verified refinement for the Mode 1 types |
 | `LONGFORM_REFINE_MIN_WORDS` | `600` | Below this and with no structure, keep the single call |
 | `LONGFORM_CHUNK_WORDS` | `1000` | Target chunk size (600–1,400 window derived from it) |
-| `LONGFORM_PARALLEL` | `3` | Chunks in flight per request |
+| `LONGFORM_PARALLEL` | `5` | Chunks in flight per request |
+| `LONGFORM_CALL_TIMEOUT_SECONDS` | `150` | One model call; a call with no answer by then is a retryable failure (`0` = no limit) |
+| `LONGFORM_FIRST_CHUNK_WORDS` | `300` | Size of the first chunk only, so text reaches the reader sooner (`0` = off) |
 | `LONGFORM_FREEZE_QUOTES` | `true` | Blockquotes frozen (false = polished, still verified) |
 | `LONGFORM_REPAIR_ENABLED` | `true` | One repair call per failing chunk |
 | `LONGFORM_WORD_RATIO` | per operation | JSON override of the ratio windows |
@@ -605,9 +609,79 @@ with `content_replace`; stock photo backend; Mermaid diagrams; HTML input.
     cap is now 500 and anything longer is cut by code at a sentence (`outline.trim_guidance`); text the reader sees is still the model's
     to shorten.
 
+### Mode 1 — built
+
+| Plan item | Where |
+|---|---|
+| Phase 0: the four refinement prompts say what must not move (structure, length) and each call states its output budget (1.6 x the input, 4,096-16,384) | `src/text_processing_agent.py` (`REFINE_STRUCTURE_RULE`, `REFINE_LENGTH_RULES`, `refinement_max_tokens`), `tests/core/test_output_limits.py` |
+| Phase 1: normalise (§3.2), freeze / thaw (§3.3), chunk (§3.4) | `src/longform/markdown_ast.py`, `freeze.py`, `chunk.py` |
+| Phase 2: prompts (§3.5), verify / repair / restore (§3.6), the pipeline, the runtime binding, the `LONGFORM_*` flags, `refine_progress`, `warnings`, the hook (§3.8) | `src/longform/prompts.py`, `verify.py`, `refine.py`, `runtime.py`, `llm.py`; `config.py`; `api.py`; `src/text_processing_agent.py` |
+| Phase 5, longform half: trace (`mode=longform`, `longform={...}`, marks `refine_planned` / `first_chunk`), `latency_stats()` grouped by mode, `evaluate_longform.py` (offline: 10 documents x 4 operations with a well-behaved and a damaging scripted model; `--live`: real documents, spelling slips, an independent structure check) | `src/observability.py`, `scripts/evaluate_longform.py` |
+| Local end-to-end scenarios | `scripts/local_test_requests.py` (enhance over `/agent/stream`, grammar over `/agent/process`, on this repository's README), `scripts/run_local_server.py` (flag on) |
+| Docs / handoff (§9, §10) | `docs/API_DOCUMENTATION.md`, `README.md` |
+
+Tests: `tests/longform/` (`test_freeze`, `test_chunk`, `test_verify`, `test_prompts`, `test_refine`, `test_runtime`, `test_api`,
+`test_settings`, `test_evaluate_longform`). The model is a scripted stand-in; mutation checks on each rule (a missing token, a
+merged paragraph, a table typed by the model, a summary, a wrapper) confirm every test fails when its rule is removed.
+
+### Where Mode 1 goes beyond or differs from the plan
+
+18. **Bare URLs are tokens (`[[URL_n]]`), not "left in place and verified by set equality".** A model that rewrites a sentence
+    around a URL can drop a trailing `)` or lowercase the host; with a token it cannot touch the URL at all, and the check is
+    the same token check as for everything else. A horizontal rule and any other block the parser has no name for are frozen
+    as `[[HTML_n]]` for the same reason.
+19. **`LLM`, `CallSpec` and `AgnoLLM` moved to `src/longform/llm.py`** (`src/blog/llm.py` re-exports them): both pipelines make
+    the same kind of call (an agno agent per call, candidates and fallback, usage recorded), and `AgnoLLM(agent_type=...)` says
+    which `AGENT_CONFIGS` entry a pipeline's calls are made with (`longform_refiner`: no tools, the operation's own prompt).
+20. **The instruction follows the single call.** `secondary_prompt` is the instruction of `enhance_with_ai` and the tone of
+    `change_tone` (every chunk gets it on its own `INSTRUCTION:` / `TONE:` line; `professional` when no tone was given, so
+    chunks cannot choose their own); `fix_grammar` and `simplify` never used it and still do not.
+21. **Phase 0 shipped without a flag**, as §7 says, and changes the single call too: the four agents now carry the structure and
+    length rules, and a 100,000-character document is no longer cut at a provider default.
+22. **`chunk_restored` warnings** are `{"kind": "chunk_restored", "chunk": n, "detail": ...}` (§3.6 sketched `{"chunk", "kind", "detail"}`).
+23. **`/agent/process` does not strip a leading or trailing code fence from a document refined this way.** The endpoint removes
+    ```` ```markdown ```` wrappers from single-call answers; applied to a document it would eat the document's own closing fence.
+    Wrappers are already removed per chunk (`verify.unwrap`).
+24. **A smaller first chunk (`LONGFORM_FIRST_CHUNK_WORDS`, default 300).** A chunk is shown only when verified (D5), so the first
+    text arrives after the first call; making that call short moves the first text from the time of a 1,000-word call to the
+    time of a 300-word one at the price of one more call per document. Off with `0`.
+25. **HTML input, text that already looks like the tokens, and documents with reference images keep the single call**
+    (`qualifies`; open item O1 is the HTML decision).
+
+### Mode 1: found by running it live, and what changed
+
+Measured on this repository's own documents with `scripts/evaluate_longform.py --live` (OpenAI, Gemini, Grok); numbers and tables in
+`docs/LATENCY_BENCHMARK.md` (Phase 8). Against the Phase 5 targets: structural loss 0 (after 26-28), restored passages 0-1.6% (<= 5%), word ratio
+0.9-1.1 for OpenAI, p50 for 4,000+ word documents 7.7-26.6 s (<= 45 s).
+
+26. **The basic OpenAI tier is the slow one** (`gpt-4o-mini`: ~54 tokens/s, 24-29 s per 1,000-word passage; `gpt-5.2`: ~96 tokens/s, 14.7 s). §3.9's 10 s estimate held only
+    for the advanced tier. So the defaults moved: **`LONGFORM_PARALLEL` 3 -> 5** (a 4,850-word `fix_grammar`: 43.7 s -> 29.0 s) and a **300-word first passage**
+    (`LONGFORM_FIRST_CHUNK_WORDS`; first text 12-35 s -> 5-18 s). Gemini's basic tier does the same job in 2-9 s, Grok's in 4-12 s; Grok's advanced reasoning model needs 2-3 minutes.
+27. **Whitespace around a locked block is not the model's.** The independent structure check caught a `change_tone` run in which two spaces after a table token (a Markdown hard
+    break) came back as two spaces on the table's last row, a byte difference verification had not seen. `verify.snap_blocks` now restores every locked line's indent and the blank lines around
+    it before checking (a dropped blank line would glue the next paragraph to a quote).
+28. **A friendly tone adds paragraphs** ("Hey there! ..." under a heading). §3.6's paragraph tolerance let it through, so `verify` also compares the *sequence* of headings, lists,
+    locked blocks and runs of paragraphs (`order`); the repair message names a lead-in paragraph. Gemini and Grok needed the repair on a list-heavy passage 8 times in 8 and it fixed all 8.
+29. **Prompt wording matters more than the plan assumed.** Saying what a token stands for and that it moves with its sentence cut Grok's dropped tokens from 9 of 24 first answers to 0; telling
+    the model a window tighter than the enforced one (`Operation.advertised`) cut Gemini's `enhance_with_ai` drift from +5.7% to +2.6% (90-110%) or +0.4% (95-105%) without more rule breaks.
+30. **Inline HTML tags and comments, and email addresses, are tokens** (`[[HTML_n]]`, `[[URL_n]]`): a model that rewrote around `<kbd>Ctrl</kbd>` or lowercased an address changed bytes the plan's table had
+    left to instructions.
+31. **The safety net does its job on real models.** `gpt-4o-mini` answered some passages with a short summary (6 of 18 first answers on one passage): every one failed verification and the repair fixed it.
+    Repaired passages: OpenAI 9%, Grok 11%, Gemini 18% (mostly `change_tone` growing a passage past +25%); restored: 0, 0 and 1.6%.
+32. **A single call over the same 4,963 words took 135 s and changed a protected block**; the chunked path takes 25-45 s on that model (documents that contain the literal text of the
+    tokens, such as this plan, keep the single call by design).
+33. **A provider call can hang for ever**: a Gemini call stayed open and silent for minutes during the evaluation. The single call streams, so a stall shows; a chunk that is
+    never answered holds the whole request, and every passage after it. Each call is now bounded (`LONGFORM_CALL_TIMEOUT_SECONDS`, 150): the timeout is an error the
+    fallback rules already retry on the next provider (and the stuck provider is skipped by the passages that follow).
+34. **A cold Gemini model failed parallel first calls** ("Cannot send a request, as the client has been closed"): agno builds a model's client on first use with a check-then-set, `get_model`
+    stored its model after checking the cache outside the lock, and google-genai closes a Client's connection when it is garbage collected. 2 of 10 fresh processes with six parallel calls
+    failed; after the fix (one model per key, its client built once under the lock) 0 of 26. The race was in shared code: the blog parts and the chat paths had the same window on a cold start.
+35. **The Anthropic key in this environment returns 401**; provider fallback hid it behind OpenAI answers until the evaluation compared the model that served each run with the one asked for.
+    It now leaves such runs out of the numbers, so Claude is unmeasured.
+
 ### Not built (and why)
 
-- Mode 1 (`freeze`, `chunk`, `verify`, `prompts`, `refine`, the `LONGFORM_*` flags, the four prompt tweaks of Phase 0, `markdownify`).
+- Mode 1: the later items of §3.10 (table-cell polishing, live streaming of the first chunk with `content_replace` (O3), `translate` and `make_shorter` on the chunked path), and HTML input: `markdownify` is not added and an HTML document keeps the single call (O1). The chunked path is built and measured for English Markdown only.
 - Stock photo and Mermaid backends (O4, O5): `BLOG_IMAGE_SOURCE=stock` is accepted and means "no pictures" until built.
-- Live measurements for the Phase 5 targets: run `python scripts/evaluate_blog.py --live`; the targets are printed with the results.
+- Live measurements for the Phase 5 targets: Mode 1 is measured (`docs/LATENCY_BENCHMARK.md`, Phase 8; not for Claude, whose key is invalid here); Mode 2: run `python scripts/evaluate_blog.py --live`, the targets are printed with the results.
 - Frontend items O1-O3, O6, and verification of O7.

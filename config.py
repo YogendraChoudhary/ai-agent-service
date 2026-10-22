@@ -56,6 +56,25 @@ class Settings(BaseSettings):
             return ''
         return value
 
+    @field_validator('longform_word_ratio')
+    @classmethod
+    def validate_word_ratio(cls, value):
+        """{"grammar": [0.9, 1.1]}: operation -> [lowest, highest] words out / words in. Anything else is ignored."""
+        value = (value or '').strip()
+        if not value:
+            return ''
+        try:
+            data = json.loads(value)
+            ok = isinstance(data, dict) and all(
+                k in {'enhance', 'grammar', 'tone', 'simplify'} and isinstance(v, list) and len(v) == 2
+                and all(type(n) in (int, float) for n in v) and 0 < v[0] <= 1 <= v[1] for k, v in data.items())
+            if not ok:
+                raise ValueError('invalid entries')
+        except (ValueError, TypeError):
+            logging.getLogger(__name__).warning('Invalid LONGFORM_WORD_RATIO %r; using the per-operation windows', value)
+            return ''
+        return value
+
     @field_validator('task_route_defaults', 'task_fallback_trees', 'text_prices_per_mtok')
     @classmethod
     def validate_route_json(cls, value, info):
@@ -170,6 +189,21 @@ class Settings(BaseSettings):
     blog_stream_title: bool = Field(True, alias="BLOG_STREAM_TITLE")
     blog_intent_regex_enabled: bool = Field(False, alias="BLOG_INTENT_REGEX_ENABLED")  # promote "write a blog post about..." from general
     blog_intent_shadow_mode: bool = Field(False, alias="BLOG_INTENT_SHADOW_MODE")  # log the promotion decision only
+
+    # ------------------------------------------------------------------
+    # Structure-preserving refinement of long documents (src/longform) for enhance_with_ai, fix_grammar, change_tone and
+    # simplify. A qualifying document is frozen (tables, quotes, images, code and links become tokens), cut into chunks,
+    # refined in parallel, checked in code and restored where the model moved something. Ships OFF.
+    # ------------------------------------------------------------------
+    longform_refine_enabled: bool = Field(False, alias="LONGFORM_REFINE_ENABLED")
+    longform_refine_min_words: int = Field(600, ge=1, alias="LONGFORM_REFINE_MIN_WORDS")   # shorter and unstructured: the single call
+    longform_chunk_words: int = Field(1000, ge=100, le=3000, alias="LONGFORM_CHUNK_WORDS")  # target chunk size (window 0.6x-1.4x)
+    longform_first_chunk_words: int = Field(300, ge=0, le=3000, alias="LONGFORM_FIRST_CHUNK_WORDS")  # smaller first chunk = text sooner; 0 = off
+    longform_parallel: int = Field(5, ge=1, le=8, alias="LONGFORM_PARALLEL")                # chunks in flight per request (measured: 5 beats 3 by a third)
+    longform_freeze_quotes: bool = Field(True, alias="LONGFORM_FREEZE_QUOTES")             # False = quotes are polished, still verified
+    longform_repair_enabled: bool = Field(True, alias="LONGFORM_REPAIR_ENABLED")           # one repair call per failing chunk
+    longform_word_ratio: str = Field("", alias="LONGFORM_WORD_RATIO")                      # JSON override of the ratio windows
+    longform_call_timeout_seconds: float = Field(150.0, ge=0, le=900, alias="LONGFORM_CALL_TIMEOUT_SECONDS")   # one model call; 0 = no limit
 
     # ------------------------------------------------------------------
     # Observability (src/observability.py). Bodies contain user text, so they are OFF by default.

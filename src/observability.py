@@ -226,7 +226,7 @@ def recent_summaries(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def latency_stats() -> Dict[str, Any]:
-    """p50/p95/max of total_seconds per endpoint+route, plus per image model and per long-form mode (blog)."""
+    """p50/p95/max of total_seconds per endpoint+route, plus per image model and per long-form mode (blog, longform)."""
     groups: Dict[str, List[float]] = {}
     images: Dict[str, List[float]] = {}
     tasks: Dict[str, List[float]] = {}

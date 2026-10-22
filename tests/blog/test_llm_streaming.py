@@ -68,7 +68,7 @@ class TestStreamedCalls(unittest.TestCase):
     def test_a_listener_that_raises_never_fails_the_call(self):
         def broken(text):
             raise ValueError("listener bug")
-        with self.assertLogs("src.blog.llm", level="WARNING"):
+        with self.assertLogs("src.longform.llm", level="WARNING"):
             reply = self.call(self.llm(), broken)
         self.assertTrue(reply.startswith("{"))
 

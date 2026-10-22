@@ -967,3 +967,120 @@ To judge saved posts by eye, `python scripts/render_blog_preview.py --out local_
 inlined, a page-rhythm bar and an at-a-glance table beside each post, and a table whose delimiter row is wrong shown as the
 plain text a reader would see, flagged. It uses a generic CommonMark renderer, not the editor's, so it says nothing about
 how the editor draws a picture followed by an italic caption line (open item O2 of the plan).
+
+## Long-document refinement (`enhance_with_ai`, `fix_grammar`, `change_tone`, `simplify`)
+
+These four types used to send the whole text to the model in one call and hope it kept the tables, quotes, pictures and
+paragraphs where they were. A long or structured document can now go through a pipeline that **proves** it did. It ships
+**disabled** (`LONGFORM_REFINE_ENABLED=false`); with it off nothing changes, byte for byte. Request and response shapes are
+unchanged: `query` is the document, `secondary_prompt` the tone (`change_tone`) or the instruction (`enhance_with_ai`).
+
+### Which requests use it
+
+All of these must hold, otherwise the single call runs exactly as before:
+
+- the type is one of the four above, and no reference images are attached;
+- the document is Markdown, not HTML (an HTML document keeps the single call; open item O1 of the plan), and does not already
+  contain text that looks like the pipeline's own tokens (`[[TABLE_1]]`);
+- it has at least `LONGFORM_REFINE_MIN_WORDS` (600) words, **or** it contains a table, a quote, a picture or a code block.
+  A short plain paragraph does not need protecting and keeps the faster single call.
+
+### What is guaranteed
+
+The document is cut into blocks. Everything the model must not touch is replaced by a locked token before the model sees it,
+and put back, byte for byte, afterwards:
+
+| Element | The model sees | After | Model may change |
+|---|---|---|---|
+| Table, quote (any depth), picture, code block, HTML block | `[[TABLE_3]]`, `[[QUOTE_2]]`, `[[IMAGE_1]]`, `[[CODE_4]]`, `[[HTML_5]]` on a line of their own | the original bytes | nothing (`LONGFORM_FREEZE_QUOTES=false` lets it polish quotes, still checked) |
+| Picture inside a sentence | `[[IMAGE_n]]` in place | the original bytes | nothing |
+| Link `[text](url "title")` | `[text](link://12)` | the original link | the anchor text only |
+| Bare URL, autolink, email address | `[[URL_6]]` in place | the original text | nothing |
+| Inline HTML tag or comment (`<kbd>`, `<br>`, `<!-- -->`) | `[[HTML_7]]` in place | the original tag | nothing |
+| Headings, lists | as written | | the wording; never a heading's level, the number of headings, or a list's items and nesting |
+| Emphasis, inline code | as written | | kept by instruction, not checked |
+
+The document is then cut into passages of about 1,000 words (whole blocks, at headings where it can; the first one is
+shorter, about 300 words, so text reaches the editor sooner) and the passages are refined in parallel
+(`LONGFORM_PARALLEL`, 5), each by its own call with the same instructions. **Every answer is checked in
+code** before anyone sees it: the same tokens in the same order and block tokens still alone on their line, the same headings,
+the same list shapes, the paragraph count (`fix_grammar`: identical; the others: within 25%), the same sequence of headings,
+lists, locked blocks and runs of paragraphs (no greeting, lead-in or closing line added under a heading or after a list, and
+no block moved), no new table / quote / picture / code block, and a word count inside the operation's window (`enhance`, `fix_grammar`, `change_tone` 85-125% of the passage,
+`simplify` 60-110%). A passage that fails goes back to the model once with the numbered list of what it broke
+(`LONGFORM_REPAIR_ENABLED`). A passage that still fails is **kept exactly as the user wrote it** and reported as a warning:
+the document is never summarised and never loses a block. The whitespace around a locked block is not the model's either:
+a locked line comes back with the indent it had and nothing after it, and the blank lines around it are put back, in code and
+without a repair call (a model that added two spaces after a table token, a Markdown hard break, changed the table's last
+row; one that dropped the blank line under a quote would have glued the next paragraph to it).
+
+Operations use the same tiers and temperatures as the single call (`fix_grammar`, `simplify`, `change_tone`: basic tier;
+`enhance_with_ai`: advanced). `secondary_prompt` is used where it was used before: as the instruction for `enhance_with_ai`
+and as the tone for `change_tone` (every passage gets the same one; `professional` when none was given). `fix_grammar` and
+`simplify` ignore it, as before.
+
+### `/agent/stream` events
+
+`start` -> (`content`, **`refine_progress`**) x passages -> `done`
+
+Each `content` chunk is one finished, verified passage, in document order; nothing is ever retracted. The text therefore
+arrives passage by passage instead of token by token: the first passage is short (`LONGFORM_FIRST_CHUNK_WORDS`, 300 words),
+so the first text appears after one call over about 300 words, and the later passages follow as they are verified.
+`refine_progress` after every passage tells the editor how far along it is:
+
+```json
+{"type": "refine_progress", "chunk": 2, "of": 6}
+```
+
+`done` carries `warnings` only when a passage had to be restored:
+
+```json
+{"type": "done", "duration": 38.4, "pending_images": 0,
+ "warnings": [{"kind": "chunk_restored", "chunk": 3,
+               "detail": "Passage 3 of 6 was kept as written because the AI changed its structure (tokens_missing: [[TABLE_2]] is missing: ...)"}]}
+```
+
+Clients that ignore `refine_progress` and `warnings` keep working unchanged. Provider errors behave as in any other stream:
+a retryable error moves that passage to the next provider (`PROVIDER_FALLBACK_ENABLED`), anything else is an `error` event.
+
+### `/agent/process`
+
+Same pipeline; `markdown_response` is the whole refined document and `warnings` is the same list as above (empty when
+nothing was restored). The `markdown`/`md` fence stripping that `/agent/process` applies to single-call answers is skipped
+for a document refined this way: its passages are already unwrapped, and a fence at the start or end of the answer is the
+document's own.
+
+### Billing
+
+Unchanged: text is billed per streamed character, on the model that served the first passage (`fix_grammar`, `simplify`,
+`change_tone`: basic tier; `enhance_with_ai`: advanced). A repaired passage costs one more call; the response length, and
+so the billed length, is the document's. Nothing is reserved or billed for pictures: the pipeline starts none.
+
+### Configuration
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `LONGFORM_REFINE_ENABLED` | `false` | Turn the pipeline on for the four types |
+| `LONGFORM_REFINE_MIN_WORDS` | `600` | Plain text shorter than this keeps the single call (a document with structure always qualifies) |
+| `LONGFORM_CHUNK_WORDS` | `1000` | Target passage size (100-3,000; passages run from 0.6x to 1.4x of it) |
+| `LONGFORM_FIRST_CHUNK_WORDS` | `300` | Target size of the first passage only (0-3,000), so text is on screen after one short call. `0`, or a value not below `LONGFORM_CHUNK_WORDS`, makes every passage the same size |
+| `LONGFORM_PARALLEL` | `5` | Passages in flight per request (1-8). A 4,850-word document took 29 s at 5 instead of 44 s at 3 (basic tier); lower it if a provider rate-limits |
+| `LONGFORM_CALL_TIMEOUT_SECONDS` | `150` | How long one model call may take (0-900; `0` = no limit). A call that has not answered by then counts as a retryable failure: that passage moves to the next provider, or, with fallback off, the request ends with an error instead of waiting for ever |
+| `LONGFORM_FREEZE_QUOTES` | `true` | `false` lets the model polish quotes (they are still checked for structure) |
+| `LONGFORM_REPAIR_ENABLED` | `true` | One repair call per failing passage; `false` restores at the first failure |
+| `LONGFORM_WORD_RATIO` | *(empty)* | JSON override of the length windows, for example `{"grammar": [0.9, 1.1]}`. Entries that are not `[low, high]` with `0 < low <= 1 <= high` for a known operation reject the whole value, with a warning |
+
+Every request's trace records `mode=longform` and `longform={operation, chunks, parallel, repaired, restored, passthrough,
+words_in, words_out, word_ratio, frozen, repair_reasons, seconds}`; `latency_stats()` reports it as its own mode group, and
+the marks `refine_planned` and `first_chunk` show when the first passage was ready.
+
+### Evaluating it
+
+`python scripts/evaluate_longform.py` is a free check: 10 documents (800-5,000 words, every kind of locked element) x 4
+operations through the real pipeline with a scripted model that behaves, and another that damages passages; it must lose
+nothing in either case. `python scripts/evaluate_longform.py --live --providers openai --corpus docs --limit 3` makes paid
+calls on this repository's own documents (`--corpus posts` uses blog posts under `local_run/`, `--files a.md b.md` your own),
+puts a few spelling slips in each document, and records, per document, operation and provider: structural loss (judged from
+the two texts alone, not by the pipeline's own checks; the target is zero), word ratio, passages repaired and restored,
+slips left, time to the first passage and in total, tokens and cost. The refined documents and a diff against what was sent
+are written to `local_run/longform_eval/`.

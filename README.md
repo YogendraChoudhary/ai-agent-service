@@ -11,14 +11,15 @@ api.py               Application entry point
 config.py            Application settings
 src/                 Service implementation
   blog/              Visually rich blog generation (outline -> sections -> lint)
-  longform/          Markdown block parser and ordered parallel runner shared by the long-form modes
+  longform/          Structure-preserving refinement of long documents (freeze -> chunk -> refine -> verify -> restore),
+                     plus the Markdown block parser, ordered parallel runner and model call the blog modules share
 tests/
   blog/              Blog generation tests (a scripted model stands in for the providers)
   code/              Code generation and validation tests
   core/              Observability, latency, and security tests
   email/             Email template tests
   images/            Image generation and routing tests
-  longform/          Markdown parser and ordered runner tests
+  longform/          Document refinement, Markdown parser and ordered runner tests (a scripted model stands in for the providers)
   routing/           Request routing, classification, and fallback tests
   fixtures/          Shared labelled evaluation cases
   conftest.py        Shared test guards
@@ -230,6 +231,15 @@ it is streamed. It ships disabled (`BLOG_AI_ENABLED`); the contract, events and 
 `python scripts/run_local_server.py` then `python scripts/local_test_requests.py` (the blog scenarios), or compare providers
 with `python scripts/evaluate_blog.py --live`. To read saved posts as a reader would, `python scripts/render_blog_preview.py`
 writes one self-contained HTML page; `--compare LABEL OLD.md NEW.md` puts two generations of a brief side by side.
+
+`fix_grammar`, `simplify`, `change_tone` and `enhance_with_ai` keep their single model call for ordinary text (the chunked path needs Python 3.11 or newer; on an older interpreter it logs why and the single call is used). A long or
+structured document (600+ words, or one with a table, quote, picture or code block) can instead go through `src/longform`:
+tables, quotes, pictures, code and links are replaced by locked tokens, the prose is refined in ~1,000-word chunks in
+parallel, every chunk is checked in code (tokens, headings, lists, paragraphs, length), repaired once if it broke a rule,
+and restored exactly as written if it still does. It ships disabled (`LONGFORM_REFINE_ENABLED`); the contract, events and
+flags are in [the API handoff](docs/API_DOCUMENTATION.md#long-document-refinement-enhance_with_ai-fix_grammar-change_tone-simplify).
+Check it for free with `python scripts/evaluate_longform.py` (10 documents x 4 operations, scripted models), or compare
+providers on real documents with `python scripts/evaluate_longform.py --live --corpus docs`.
 
 Optional code intent routing, task defaults, provider fallback, and code validation ship disabled.
 See [the API handoff](docs/API_DOCUMENTATION.md#code-generation-and-task-routing) for flags, `model_source`,

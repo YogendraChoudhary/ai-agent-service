@@ -4,9 +4,11 @@ callers that know how much they expect now say so, and reasoning models get head
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import src.text_processing_agent as tpa
+from agno.agent import RunEvent
 from src.models import OUTPUT_TOKEN_CEILING, REASONING_HEADROOM_TOKENS, output_token_budget, reasoning_headroom
 
 
@@ -74,6 +76,63 @@ class TestGetModel(unittest.TestCase):
     def test_prewarming_still_works_with_the_blog_agent_configured(self):
         with patch.dict(tpa._MODEL_CACHE, {}, clear=True):
             self.assertGreater(tpa.prewarm_models({"openai_api_key": "k"}), 0)
+
+
+class TestRefinementBudget(unittest.TestCase):
+    """Phase 0: the four agents that polish a user's own text are given room for a whole document."""
+
+    def test_the_budget_is_a_bit_over_the_input_between_the_limits(self):
+        budget = lambda chars: tpa.refinement_max_tokens("grammar", "x" * chars)
+        self.assertEqual(budget(100), 4096)                                          # a short text still gets the floor
+        self.assertEqual(budget(30_000), 13_714)                                     # ~5,000 words: 1.6 x ~8,600 tokens
+        self.assertEqual(budget(400_000), 16_384)                                    # never above the ceiling
+        self.assertEqual(tpa.refinement_max_tokens("grammar", None), 4096)
+
+    def test_only_the_four_refinement_agents_get_one(self):
+        self.assertEqual(set(tpa.REFINEMENT_AGENTS), {"enhance", "grammar", "tone", "simplify"})
+        for agent in tpa.REFINEMENT_AGENTS:
+            self.assertIsNotNone(tpa.refinement_max_tokens(agent, "text"), agent)
+        for agent in ("translation", "make_longer", "make_shorter", "completion", "smart_global", "blog_writer", "code_writer"):
+            self.assertIsNone(tpa.refinement_max_tokens(agent, "x" * 30_000), agent)
+
+    def test_the_single_call_path_hands_the_budget_to_the_agent(self):
+        made = []
+
+        def create_agent(agent_type, provider, key, request_id=None, **kw):
+            made.append((agent_type, kw["max_tokens"]))
+            event = SimpleNamespace(event=RunEvent.run_content, content="ok", metrics=None)
+            return SimpleNamespace(model=SimpleNamespace(id="m"), run=lambda query, **k: iter([event]))
+        query = "Fix: " + "word " * 6000
+        with patch.object(tpa, "create_agent", create_agent):
+            for agent in ("grammar", "enhance", "translation"):
+                list(tpa.process_user_query_stream(query, model_provider="openai", api_key="k", force_agent_type=agent))
+        self.assertEqual(made, [("grammar", tpa.refinement_max_tokens("grammar", query)),
+                                ("enhance", tpa.refinement_max_tokens("enhance", query)), ("translation", None)])
+        self.assertGreater(made[0][1], 13_000)                                       # sized from the text, not the floor
+
+
+class TestRefinementRules(unittest.TestCase):
+    """The prompt side of Phase 0: what must not move, said in the agents' own instructions."""
+
+    def test_the_four_agents_carry_the_structure_and_their_own_length_rule(self):
+        for agent in tpa.REFINEMENT_AGENTS:
+            rules = tpa.AGENT_CONFIGS[agent]["instructions"]
+            with self.subTest(agent=agent):
+                self.assertIn(tpa.REFINE_STRUCTURE_RULE, rules)
+                self.assertIn(tpa.REFINE_LENGTH_RULES[agent], rules)
+                last_rule = next(i for i, r in enumerate(rules) if r.startswith("CRITICAL: Output ONLY"))
+                self.assertLess(rules.index(tpa.REFINE_STRUCTURE_RULE), last_rule)     # before the output-format line
+
+    def test_simplify_may_shrink_and_the_others_may_not(self):
+        self.assertIn("somewhat shorter", tpa.REFINE_LENGTH_RULES["simplify"])
+        for agent in ("grammar", "enhance", "tone"):
+            self.assertNotIn("shorter", tpa.REFINE_LENGTH_RULES[agent])
+
+    def test_no_other_agent_is_touched(self):
+        for name, config in tpa.AGENT_CONFIGS.items():
+            if name not in tpa.REFINEMENT_AGENTS:
+                with self.subTest(agent=name):
+                    self.assertNotIn(tpa.REFINE_STRUCTURE_RULE, config["instructions"] if isinstance(config["instructions"], list) else [])
 
 
 if __name__ == "__main__":

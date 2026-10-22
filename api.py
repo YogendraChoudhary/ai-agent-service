@@ -896,6 +896,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             instruction=request_data.secondary_prompt or None,
             blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
             meta=meta,
+            user_text=request_data.query,
         )
         warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
@@ -921,15 +922,19 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                     success=True, images=image_details,
                 )
 
-        # Strip markdown code-fence wrappers the model sometimes emits
-        is_code = agent_type in ('generate_code', 'explain_code') or get_trace(request_id).attrs.get('agent_type') == 'code_writer'
-        if not is_code and response.startswith('```markdown\n'):
+        # Strip markdown code-fence wrappers the model sometimes emits. Code answers are fences by nature, and a document refined
+        # in verified chunks (src/longform) had its wrappers removed there: a fence at its start or end is the document's own.
+        trace = get_trace(request_id)
+        trace_attrs = trace.attrs if trace is not None else {}
+        is_code = agent_type in ('generate_code', 'explain_code') or trace_attrs.get('agent_type') == 'code_writer'
+        keeps_fences = is_code or trace_attrs.get('mode') == 'longform'
+        if not keeps_fences and response.startswith('```markdown\n'):
             response = response[12:]
-        elif not is_code and response.startswith('```md\n'):
+        elif not keeps_fences and response.startswith('```md\n'):
             response = response[6:]
-        elif not is_code and response.startswith('```\n'):
+        elif not keeps_fences and response.startswith('```\n'):
             response = response[4:]
-        if not is_code and response.endswith('\n```'):
+        if not keeps_fences and response.endswith('\n```'):
             response = response[:-4]
 
         total_duration = time.time() - start_time
@@ -1136,6 +1141,7 @@ async def stream_text(
                     text_byok=text_byok,
                     instruction=request_data.secondary_prompt or None,
                     blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
+                    user_text=request_data.query,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():

@@ -37,6 +37,7 @@ import ipaddress
 import socket
 import http.cookiejar
 from collections import OrderedDict
+from functools import lru_cache
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -367,6 +368,20 @@ def _output_limit_kwargs(model_provider: str, model_id: str, max_tokens: Optiona
     return {'max_tokens': limit}                  # Claude, Grok, DeepSeek and the older OpenAI models
 
 
+def _warm_client(model) -> None:
+    """
+    Build a Gemini model's client now, once. agno creates it on the first call with a check-then-set, so two threads making the first
+    calls on one shared model each build one; google-genai closes a Client's HTTP connection when the Client is garbage collected,
+    and the one that lost the race is collected while its request is in flight ("Cannot send a request, as the client has been
+    closed": 2 of 10 cold starts with six parallel calls). Called under the cache lock, so every caller gets the same client.
+    """
+    if isinstance(model, Gemini) and getattr(model, "client", None) is None:
+        try:
+            model.get_client()
+        except Exception:                      # a missing key or bad option: the call itself will say so
+            logger.debug("Gemini client not built ahead of use", exc_info=True)
+
+
 def get_model(
     model_provider: str,
     api_key: str,
@@ -433,7 +448,7 @@ def get_model(
                          **_output_limit_kwargs(model_provider, DEEPSEEK_TOOL_MODEL_ID, max_tokens))
         if cache_model:
             with _MODEL_CACHE_LOCK:
-                _MODEL_CACHE[cache_key] = model
+                model = _MODEL_CACHE.setdefault(cache_key, model)        # threads that built one at once share the first
         return model
 
     logger.info(
@@ -482,7 +497,8 @@ def get_model(
 
     if cache_model:
         with _MODEL_CACHE_LOCK:
-            _MODEL_CACHE[cache_key] = model
+            model = _MODEL_CACHE.setdefault(cache_key, model)            # threads that built one at once share the first
+            _warm_client(model)
 
     return model
 
@@ -1400,6 +1416,51 @@ def build_smart_global_instructions(plan=None) -> list:
 
 
 # ============================================
+# REFINEMENT RULES (Phase 0 of docs/rich_content_engine_plan.md)
+# ============================================
+# The four agents that polish a user's own text (enhance, grammar, tone, simplify) used to rely on one line, "Preserve any
+# existing formatting". A long text came back shorter, with paragraphs merged or a table re-typed. These lines say what
+# must not move; src/longform checks it in code for the documents that qualify (LONGFORM_REFINE_ENABLED).
+REFINE_STRUCTURE_RULE = (
+    "Keep the same number of paragraphs and the same headings. Keep every table, quote, image and link exactly as "
+    "written. Never summarise, merge or drop a section."
+)
+REFINE_LENGTH_RULES = {
+    "grammar": "Keep the same length: you only fix errors.",
+    "enhance": "Keep the length about the same (within 15%).",
+    "tone": "Keep the length about the same (within 15%).",
+    "simplify": "The text may become somewhat shorter, but every point stays: simplify, do not summarise.",
+}
+REFINEMENT_AGENTS = tuple(REFINE_LENGTH_RULES)
+
+
+@lru_cache(maxsize=1)
+def _longform():
+    """
+    (qualifies, stream_refine) of src/longform, or None when they cannot be imported here (its regular expressions use possessive
+    quantifiers, which need Python 3.11): the single call then keeps working and the reason is logged once.
+    """
+    try:
+        from .longform.refine import qualifies
+        from .longform.runtime import stream_refine
+    except Exception:
+        logger.exception("Long-form refinement is unavailable on this interpreter; the single call is used instead")
+        return None
+    return qualifies, stream_refine
+
+
+def refinement_max_tokens(agent_type: str, text: str) -> Optional[int]:
+    """
+    Visible output budget for the refinement agents (D15): 1.6 x the estimated input tokens, between 4,096 and 16,384, so a
+    long document is not cut at a provider default (Claude's is 8,192). Every other agent keeps its provider default (None).
+    """
+    if agent_type not in REFINEMENT_AGENTS:
+        return None
+    estimated_tokens = len(text or "") / 3.5            # Markdown with tables runs about 3-4 characters per token
+    return int(max(4096, min(16384, 1.6 * estimated_tokens)))
+
+
+# ============================================
 # AGENT CONFIGURATIONS
 # ============================================
 
@@ -1429,6 +1490,8 @@ AGENT_CONFIGS = {
             "Do NOT change the structure or add new content.",
             "Only fix errors - don't rewrite or rephrase unnecessarily.",
             "Preserve any existing formatting in the input.",
+            REFINE_STRUCTURE_RULE,
+            REFINE_LENGTH_RULES["grammar"],
             "CRITICAL: Output ONLY the corrected text. Do NOT include any headers, labels, or prefixes like 'Corrected Text:', 'Here is the corrected version:', etc. Just output the final corrected text directly.",
             markdown_conversion_instruction,
         ],
@@ -1445,6 +1508,8 @@ AGENT_CONFIGS = {
             "Make the text more accessible to a general audience.",
             "Maintain the key information and facts.",
             "Preserve any existing formatting in the input.",
+            REFINE_STRUCTURE_RULE,
+            REFINE_LENGTH_RULES["simplify"],
             "CRITICAL: Output ONLY the simplified text. Do NOT include any headers, labels, or prefixes like 'Simplified Text:', 'Here is the simplified version:', etc. Just output the final simplified text directly.",
             markdown_conversion_instruction,
         ],
@@ -1558,6 +1623,8 @@ AGENT_CONFIGS = {
             "Maintain the core information and facts.",
             "Adjust vocabulary, sentence structure, and phrasing to match the requested tone.",
             "Preserve any existing formatting in the input.",
+            REFINE_STRUCTURE_RULE,
+            REFINE_LENGTH_RULES["tone"],
             "CRITICAL: Output ONLY the rewritten text in the new tone. Do NOT include any headers, labels, or prefixes like 'Professional Tone:', 'Casual Version:', 'Here is the text in a different tone:', etc. Just output the final text directly.",
             markdown_conversion_instruction,
         ],
@@ -1611,6 +1678,8 @@ AGENT_CONFIGS = {
             "Fix any grammar or spelling issues while enhancing.",
             "Maintain the original intent and meaning of the text.",
             "Preserve any existing formatting in the input.",
+            REFINE_STRUCTURE_RULE,
+            REFINE_LENGTH_RULES["enhance"],
             "CRITICAL: Output ONLY the enhanced text. Do NOT include any headers, labels, or prefixes like 'Enhanced Text:', 'Improved Version:', 'Here is the enhanced text:', etc. Just output the final enhanced text directly.",
             markdown_conversion_instruction,
         ],
@@ -1710,6 +1779,17 @@ AGENT_CONFIGS = {
         "use_advanced": True,
         "temperature": 0.7,
     },
+    # Structure-preserving refinement of long documents (src/longform). Like the blog writer it is not a one-shot agent:
+    # src/longform passes the operation's rules, the temperature and the output budget per call, and the tier comes from
+    # the provider candidate (grammar, tone and simplify run on the basic tier, enhance on the advanced one).
+    "longform_refiner": {
+        "name": "Long-form Refiner",
+        "role": "Refine one passage of a long document without changing its structure",
+        "instructions": ["Refine the passage you are given and return only the refined passage."],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.3,
+    },
 }
 
 # ============================================
@@ -1733,7 +1813,7 @@ def _image_tool_available(model_provider, api_key, is_byok, image_ctx) -> bool:
 
 def _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx):
     """The plan only applies to the free-form agents, and images are dropped from it if none can be made."""
-    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer"):
+    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner"):
         return None
     if plan.image_count > 0 and not _image_tool_available(model_provider, api_key, is_byok, image_ctx):
         from dataclasses import replace
@@ -1831,9 +1911,9 @@ def create_agent(
         "role": config["role"],
         "model": model,
         "instructions": instructions,
-        # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes; agno's "use markdown"
-        # nudge would only fight the prompt.
-        "markdown": agent_type != "blog_writer",
+        # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes, and the long-form refiner
+        # returns the passage it was given, polished; agno's "use markdown" nudge would only fight those prompts.
+        "markdown": agent_type not in ("blog_writer", "longform_refiner"),
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
@@ -2094,6 +2174,7 @@ def process_user_query_stream(
     text_byok: Optional[bool] = None,
     instruction: Optional[str] = None,
     blog_options: Optional[dict] = None,
+    user_text: Optional[str] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2121,6 +2202,9 @@ def process_user_query_stream(
         image_params: Validated explicit image parameters from the API (highest precedence).
         instruction: The request's secondary prompt as the user wrote it (style notes for a blog post).
         blog_options: Validated BlogOptions for the generate_blog type (length, images, tone, audience).
+        user_text: The document as the user sent it, for the four refinement types (enhance, grammar, tone, simplify): `query`
+            carries the single-call prompt ("Enhance: ..., Text: ..."), this is the text itself. A document that qualifies
+            (src/longform, LONGFORM_REFINE_ENABLED) is refined in verified chunks instead.
 
     Yields:
         Markdown content chunks as they are generated. The blog pipeline also yields {"__event__": {...}} (an
@@ -2364,6 +2448,17 @@ def process_user_query_stream(
     trace_set(request_id, candidates=[c.provider for c in candidates],
               route_reason='user_selection' if model_source == 'user' else 'task_default', fallbacks=[])
 
+    if (agent_type in REFINEMENT_AGENTS and user_text is not None and settings.longform_refine_enabled and not image_urls):
+        longform = _longform()
+        if longform is not None and longform[0](user_text, settings.longform_refine_min_words):
+            # A long or structured document: frozen, chunked, refined in parallel and verified in code, instead of one call
+            # over the whole text (src/longform). Short plain text keeps the single call below, as before.
+            yield from longform[1](
+                user_text, instruction, agent_type, candidates=candidates,
+                key_for=key_resolver if routed else (lambda _provider: api_key), is_byok=is_byok, user_id=user_id,
+                request_id=request_id, report_model=report_model)
+            return
+
     if agent_type == 'blog_writer':
         # Staged pipeline (outline -> parts -> lint) instead of one agent run. It hands over `pending_images` itself,
         # as soon as it has started a picture (billed work), so every exit path can release the reserved credits.
@@ -2393,7 +2488,8 @@ def process_user_query_stream(
                 candidate_plan = _effective_plan(plan, agent_type, provider, key, is_byok, image_ctx)
                 agent = create_agent(agent_type, provider, key, request_id, pending_images=pending_images,
                                      user_id=user_id, credit_manager=credit_manager, is_byok=is_byok,
-                                     image_ctx=image_ctx, plan=candidate_plan)
+                                     image_ctx=image_ctx, plan=candidate_plan,
+                                     max_tokens=refinement_max_tokens(agent_type, query))
                 trace_mark(request_id, 'agent_created')
                 use_tools = candidate_plan.use_tools if candidate_plan else config.get('use_tools', False)
                 model_id = (ADVANCED_MODEL_IDS if tier else BASIC_MODEL_IDS)[provider]
@@ -2516,6 +2612,7 @@ def process_user_query_with_images(
     instruction: str = None,
     blog_options: dict = None,
     meta: dict = None,
+    user_text: str = None,
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
@@ -2554,6 +2651,7 @@ def process_user_query_with_images(
         model_source=model_source,
         instruction=instruction,
         blog_options=blog_options,
+        user_text=user_text,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]

@@ -4,7 +4,8 @@ End-to-end checks against the local server (scripts/run_local_server.py).
   python scripts/local_test_requests.py            # all scenarios
   python scripts/local_test_requests.py 3 5        # only scenarios 3 and 5
 
-For every request it prints the request body (licence key redacted), the response, and the timings measured
+/agent/process takes the provider's own key, so those scenarios read the platform key from the settings (.env); the
+local server never sees the licence for them. For every request it prints the request body (licence key redacted), the response, and the timings measured
 FROM THE CLIENT (time to first byte, first token, each image, end of stream). It then pulls the server's own
 trace for the same X-Request-ID from /agent/metrics so client and server numbers can be compared, and checks
 what each scenario is supposed to prove (routing, model, image count, no dead placeholders).
@@ -32,6 +33,7 @@ def stream_request(client, body):
     ev, text, images, rid = [], [], [], None
     ttfb = first_token = done = ended = outline = warnings = None
     outline_at = None
+    progress = []
     with client.stream("POST", f"{BASE}/agent/stream", json=body, timeout=240) as r:
         ttfb = time.perf_counter() - t0
         rid = r.headers.get("X-Request-ID")
@@ -50,6 +52,8 @@ def stream_request(client, body):
                 images.append({"t": round(now, 2), "url": e["url"], "w": e.get("width"), "h": e.get("height")})
             elif kind == "outline":
                 outline, outline_at = e, now
+            elif kind == "refine_progress":
+                progress.append(e)
             elif kind == "done":
                 done = now
                 warnings = e.get("warnings")
@@ -60,11 +64,20 @@ def stream_request(client, body):
     total = time.perf_counter() - t0
     return {"http": 200, "rid": rid, "text": "".join(text), "images": images, "events": ev,
             "ttfb": ttfb, "first_token": first_token, "done": done, "stream_end": ended, "total": total,
-            "outline": outline, "outline_at": outline_at, "warnings": warnings}
+            "outline": outline, "outline_at": outline_at, "warnings": warnings, "progress": progress}
+
+
+def provider_key(model):
+    """/agent/process takes the PROVIDER's own key (the backend resolves it and bills the call), not a licence: read the platform key."""
+    sys.path.insert(0, str(RUN_DIR.parent))
+    from config import settings
+    return {"openai": settings.default_openai_api_key, "claude": settings.default_anthropic_api_key, "gemini": settings.default_gemini_api_key,
+            "grok": settings.default_grok_api_key, "deepseek": settings.default_deepseek_api_key}.get(model)
 
 
 def process_request(client, body):
     t0 = time.perf_counter()
+    body = {**body, "api_key": provider_key(body.get("model")) or body["api_key"]}
     r = client.post(f"{BASE}/agent/process", json=body, timeout=240)
     out = {"http": r.status_code, "rid": r.headers.get("X-Request-ID"), "total": time.perf_counter() - t0,
            "server_ms_header": r.headers.get("X-Response-Time-Ms")}
@@ -89,6 +102,19 @@ def no_dead(res, srv): return "placeholder::" not in res.get("text", "")
 def blog_tables(res): return len(re.findall(r"^\|.+\|[ \t]*\n\|[\s:|-]+\|[ \t]*$", res.get("text", ""), re.M))
 def blog_quotes(res): return len(re.findall(r"^> ", res.get("text", ""), re.M))
 def blog_h2(res): return len(re.findall(r"^## ", res.get("text", ""), re.M))
+
+# Mode 1 (LONGFORM_REFINE_ENABLED, on in run_local_server.py): the project's own README is the document, because it is a real
+# one: headings, lists, links, tables and code blocks. Whatever the model does to the prose, those must come back as they went.
+DOC_PATH = Path(__file__).resolve().parent.parent / "README.md"
+DOC = DOC_PATH.read_text(encoding="utf-8") if DOC_PATH.exists() else ""
+def fences(text): return re.findall(r"^```.*?^```", text, re.S | re.M)
+def tables_of(text): return re.findall(r"(?:^\|.*\|[ \t]*\n)+", text, re.M)
+def heading_levels(text):
+    outside = re.sub(r"^```.*?^```", "", text, flags=re.S | re.M)           # a # inside a code block is a comment
+    return [len(m) for m in re.findall(r"^(#{1,6}) ", outside, re.M)]
+def urls_of(text): return sorted(u.rstrip(".,;:!?") for u in re.findall(r"https?://[^\s)>\]\"']+", text))
+def kept(res, *what):
+    return all(f(res["text"]) == f(DOC) for f in what)
 
 SCENARIOS = [
     ("health", "GET /health", None, [("200 OK", lambda r, s: r["http"] == 200)]),
@@ -196,6 +222,24 @@ SCENARIOS = [
          blog_options={"length": "short"}),
      [("200", lambda r, s: r["http"] == 200), ("no images", lambda r, s: n_images(r) == 0 and "placeholder::" not in r["text"]),
       ("still has a table and quotes", lambda r, s: blog_tables(r) >= 1 and blog_quotes(r) >= 2)]),
+
+    ("enhance_with_ai (stream): a long document keeps its code blocks, tables, headings and links; progress is reported", "stream",
+     req(type="enhance_with_ai", model="openai", secondary_prompt="clearer and more direct", query=DOC),
+     [("200", lambda r, s: r["http"] == 200), ("ran the chunked pipeline", lambda r, s: s and s.get("mode") == "longform"),
+      ("one refine_progress event per passage", lambda r, s: len(r["progress"]) == s["longform"]["chunks"] >= 2),
+      ("code blocks identical, in order", lambda r, s: kept(r, fences)), ("tables identical, in order", lambda r, s: kept(r, tables_of)),
+      ("same headings at the same levels", lambda r, s: kept(r, heading_levels)), ("same URLs", lambda r, s: kept(r, urls_of)),
+      ("length within 15% of the original", lambda r, s: 0.85 <= len(r["text"]) / len(DOC) <= 1.15),
+      ("warnings only if a passage was restored", lambda r, s: (r["warnings"] or []) == [] or s["longform"]["restored"] > 0),
+      ("first text within 30 s", lambda r, s: r["first_token"] is not None and r["first_token"] <= 30)]),
+
+    ("fix_grammar (process): the same document, whole, with a warnings list", "process",
+     req(type="fix_grammar", model="gemini", query=DOC),
+     [("200", lambda r, s: r["http"] == 200), ("ran the chunked pipeline", lambda r, s: s and s.get("mode") == "longform"),
+      ("code blocks identical", lambda r, s: kept(r, fences)), ("tables identical", lambda r, s: kept(r, tables_of)),
+      ("same headings", lambda r, s: kept(r, heading_levels)), ("same URLs", lambda r, s: kept(r, urls_of)),
+      ("only fixes errors: length within 5%", lambda r, s: 0.95 <= len(r["text"]) / len(DOC) <= 1.05),
+      ("warnings is a list", lambda r, s: isinstance(r["json"].get("warnings"), list))]),
 
     ("validation: blog_options on another type -> 400", "stream",
      req(type="general", model="gemini", query="x", blog_options={"length": "short"}),

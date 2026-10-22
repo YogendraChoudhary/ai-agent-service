@@ -451,3 +451,115 @@ and 3.1-3.7K out (streaming records its usage like a plain call).
   priority tier (about 5 s) or a faster outline model (after a read of its outlines) can.
 - Priority-tier pricing was not looked up; the sweep used 2 briefs and one run per model.
 - A client that leaves after the title no longer starts pictures, but the outline call itself still runs to its end (as before).
+
+---
+
+## 📄 Phase 8: Long-document refinement (`LONGFORM_REFINE_ENABLED`)
+
+*Run: October 22, 2026. Live APIs: OpenAI, Gemini, Grok (the configured Anthropic key returns 401, see "Not verified"). Documents: this repository's own
+Markdown (README and `docs/`, sliced at section headings to 1,600-4,970 words: tables, code blocks, nested lists, links, raw HTML), with a few
+spelling slips put into the prose of each (about one per 150 words) so `fix_grammar` has something to fix.
+Plan targets (docs/rich_content_engine_plan.md, Phase 5): **0 structural loss, word ratio 0.9-1.1 for `enhance_with_ai`/`fix_grammar`, restored
+chunks <= 5%, p50 <= 45 s for 5,000 words.** Every number below is `python scripts/evaluate_longform.py --live ...` (structural loss is judged by that
+script from the two Markdown texts alone, not by the pipeline's own checks).*
+
+`fix_grammar`, `simplify`, `change_tone` and `enhance_with_ai` used to be one model call over the whole text. Reference point, the same kind of request on
+the old path: a 4,963-word document through `fix_grammar` (`gpt-4o-mini`, single call) took **135 s** and came back with a changed protected block
+(a table or code block no longer identical) and a different sequence of blocks. Through the chunked path the same size of document takes 25-45 s on the same
+model and nothing protected changes.
+
+### Time per 1,000 words, by model (OpenAI, one passage of ~1,400 output tokens)
+
+| Operation | Model (tier) | Time | Rate |
+|---|---|---|---|
+| `fix_grammar` / `simplify` / `change_tone` | `gpt-4o-mini` (basic) | 24-29 s | ~54 tokens/s |
+| `enhance_with_ai` | `gpt-5.2` (advanced) | 14.7 s | ~96 tokens/s |
+
+The plan estimated 10 s (basic) and 15-18 s (advanced); only the advanced estimate held. On OpenAI the *basic* tier is the slow one for this job. That
+decided two defaults below.
+
+### Passage size and parallelism (two 4,700-4,850-word documents, one run each; `fix_grammar` on `gpt-4o-mini`, `enhance_with_ai` on `gpt-5.2`)
+
+| Configuration | `fix_grammar` total | `fix_grammar` first text | `enhance_with_ai` total | `enhance_with_ai` first text |
+|---|---|---|---|---|
+| 3 in flight, equal passages (the plan) | 45.4 s, 56.0 s | 29.2 s, 34.4 s | 23.7 s, 22.0 s | 15.3 s, 11.7 s |
+| 3 in flight, first passage 300 words | 43.7 s, 50.4 s | 15.1 s, 11.4 s | 21.5 s, 19.0 s | 8.6 s, 4.8 s |
+| **5 in flight, first passage 300 words (the defaults)** | **29.0 s, 37.0 s** | **18.0 s, 9.0 s** | **16.2 s, 20.6 s** | **8.3 s, 5.3 s** |
+
+A passage is shown only after code has verified it, so the first text arrives when the first passage is done: making that one short (`LONGFORM_FIRST_CHUNK_WORDS`,
+300) moved it from 12-35 s to 5-18 s at the price of one more call, and five passages in flight (`LONGFORM_PARALLEL`) put a 5,000-word document in one
+round instead of two. (The 56 s and 50 s cells include one passage whose first answer was a short summary; the repair was a second 30 s generation.)
+
+### Providers on the shipped code (8 documents, 1,640-4,970 words, x 4 operations; passages 5 in flight, first 300 words)
+
+| Provider / operation | Total p50 | Total p95 | First text p50 | Passages repaired | Passages restored |
+|---|---|---|---|---|---|
+| OpenAI `fix_grammar` (`gpt-4o-mini`) | 27.6 s | 41.5 s | 8.6 s | 1 / 31 | 0 |
+| OpenAI `simplify` | 25.7 s | 33.4 s | 7.7 s | 7 / 31 | 0 |
+| OpenAI `change_tone` | 24.9 s | 43.8 s | 8.3 s | 2 / 31 | 0 |
+| OpenAI `enhance_with_ai` (`gpt-5.2`) | 15.5 s | 19.8 s | 5.2 s | 1 / 31 | 0 |
+| Gemini `fix_grammar` (`gemini-3.5-flash-lite`) | 4.6 s | 5.4 s | 2.1 s | 0 / 31 | 0 |
+| Gemini `simplify` | 6.0 s | 8.0 s | 2.1 s | 5 / 31 | 1 |
+| Gemini `change_tone` | 8.6 s | 13.2 s | 3.6 s | 16 / 31 | 1 |
+| Gemini `enhance_with_ai` (`gemini-3.8-flash`) | 13.1 s | 18.6 s | 6.1 s | 1 / 31 | 0 |
+| Grok `fix_grammar` (`grok-4.20-non-reasoning`) | 11.0 s | 13.2 s | 3.8 s | 0 / 31 | 0 |
+| Grok `simplify` | 10.4 s | 24.2 s | 3.9 s | 4 / 31 | 0 |
+| Grok `change_tone` | 11.7 s | 20.6 s | 5.5 s | 6 / 31 | 0 |
+
+Against the targets: **structural loss 0 on every run once the three defects below were fixed**; restored passages OpenAI 0 / 124, Gemini 2 / 124 (1.6%), Grok 0 / 93
+(<= 5%); word ratio within 0.9-1.1 for `enhance_with_ai`/`fix_grammar` on OpenAI 16 / 16, Grok 8 / 8 (grammar only), Gemini 14 / 16 (its `enhance_with_ai` added 11-12% on two
+documents, see the prompt note below); **p50 for the 4,000+ word documents: OpenAI 26.6 s, Grok 13.6 s, Gemini 7.7 s** (target 45 s). `gemini` finished a 5,000-word
+`fix_grammar` in under 6 s. Tokens for the 8 documents (~26,000 words) on OpenAI `fix_grammar`: 51.8K in, 29.8K out; `est_cost_usd` is empty because
+`TEXT_PRICES_PER_MTOK` is not configured in this environment.
+Grok's reasoning model (`grok-4.6`, the advanced tier, used by `enhance_with_ai`) took 138 s and 174 s for a 1,650-word document (first text after 49 s and 111 s): its hidden reasoning
+dominates, so Grok `enhance_with_ai` was not run on the full set.
+
+### What running it live found (all fixed, each with a test)
+
+1. **Two spaces after a table token changed the table.** The independent check flagged one `change_tone` run: a model had written `[[TABLE_14]]  ` (a Markdown hard break), and the
+   thawed table's last row came back with two trailing spaces. Verification looked at the token, not the whitespace around it. Now every locked line is put back exactly as it
+   was (same indent, nothing after it) and the blank lines around it are restored, in code and without a repair call (`verify.snap_blocks`). A dropped blank line under a quote
+   would have glued the next paragraph to it.
+2. **Grok dropped URL and tag tokens** in 9 of 24 first answers. The prompt now says what each token stands for (a table, a quote, a picture, code, an HTML tag, a web or email address)
+   and that a token travels with its sentence when the sentence is reworded: 0 of 24 dropped one, and Gemini/OpenAI were unchanged.
+3. **A friendly tone added paragraphs.** Grok and Gemini opened a section with "Hey there! ..." under a heading. The pipeline's own check allowed it (the paragraph count was inside
+   the 25% tolerance); the independent check did not. `verify` now also compares the sequence of headings, lists, locked blocks and runs of paragraphs ("order"). On a list-heavy
+   passage Gemini and Grok needed a repair 8 times in 8 (a lead-in, or an answer that had grown too long) and the repair fixed all 8; OpenAI's first answer was right 7 times in 8.
+4. **Models overshoot the length they are asked for.** Told "85-125%", Gemini's `enhance_with_ai` came back +5.7% on average; told 90-110% +2.6%; told 95-105% +0.4% (18 answers each, no more
+   rule breaks). The model is now told a tighter window than the one enforced (`grammar` 95-105%, `enhance`/`tone` 90-110%); the enforced windows are unchanged.
+5. **Inline HTML and email addresses were left to the model.** `<kbd>`, `<br>`, `<img ...>`, comments and `name@host.tld` are now locked tokens like URLs.
+6. **`gpt-4o-mini` sometimes answers a passage with a short summary** (10 s instead of 35 s; on one passage 6 of 18 `simplify` first answers). Verification caught every one (tokens, headings,
+   lists, length) and the repair fixed it; none reached a reader. This is what the safety net is for, and it is why repaired passages (9% on OpenAI) cost a second generation.
+7. **A document that contains the literal text of the pipeline's own tokens** (this plan, for one) keeps the single call. It is detected and declined, not mangled.
+8. **A provider call hung.** A Gemini call stayed open and silent for more than three minutes (open socket, no data, 0% CPU) and would have held the request, and every passage behind it, for ever.
+   Each model call of the pipeline is now bounded by `LONGFORM_CALL_TIMEOUT_SECONDS` (150 s); the timeout is a retryable error, so the passage moves to the next provider, or the request ends
+   with an error when fallback is off.
+9. **Parallel first calls to a cold Gemini model failed ("Cannot send a request, as the client has been closed").** agno builds a model's client on first use with a check-then-set, and
+   `get_model` stored a new model after checking the cache outside its lock; google-genai closes a Client's HTTP connection when the Client is garbage collected. Threads making the
+   first calls on one model each built their own, and the one that lost was collected while its request was running: 2 of 10 fresh processes with six parallel calls (and one evaluation row).
+   Threads now share the first model stored for a key and a Gemini model gets its client built once, under the cache lock: 0 failures in 26 fresh processes. This was in shared code, so the blog
+   pipeline and the plain chat paths had the same window on a cold start.
+10. **The evaluation script itself had two flaws**, found by reading its failures: it put spelling slips inside code blocks nested in lists (a model that never saw the code could not fix them),
+   and one slip turned "shared" into the word "shred". Slips are now only swaps and doubled letters in prose words; and runs answered by a fallback provider are listed but never counted.
+
+### The shipped code once more (all fixes in; 26 runs on the hardest documents)
+
+| Provider | Runs | Structural loss | Passages restored | Passages repaired | Notes |
+|---|---|---|---|---|---|
+| OpenAI (r04, r10 x 4 operations) | 8 | 0 | 0 / 32 | 2 | `change_tone` on the list-heavy document, the run that had leaked a changed table: clean |
+| Grok (r04, r10 x 3 operations) | 6 | 0 | 0 / 24 | 5 | the run that had leaked a "Hey there!" paragraph: repaired, then clean |
+| Gemini (r04, r05, r10 x 4 operations) | 12 | 0 | 0 / 60 | 5 | `enhance_with_ai` +4.0% on average (was +8.1% before the tighter window); first text 2.0-2.5 s (5.8-7.4 s for `enhance_with_ai`) |
+
+One Gemini `change_tone` run took 67 s where its twin runs took 7-12 s: a single call that straggled. The 150 s call timeout would only catch a call that never answers; hedging a slow
+one is not built.
+
+### Not verified
+
+- **Claude.** The configured `DEFAULT_ANTHROPIC_API_KEY` returns `401 invalid x-api-key`; with provider fallback on, the Claude runs were silently answered by OpenAI. The evaluation flags such runs
+  ("served by openai/gpt-4o-mini, not claude"), stops spending on that provider and leaves them out of the numbers, so there are no Claude figures here.
+- **Streaming granularity.** Text arrives passage by passage (first after 2-9 s, then in bursts), not token by token. Token-level streaming with a `content_replace` on a failed check needs
+  editor support (open item O3 of the plan).
+- **Documents other than English technical Markdown** (other languages, math, footnotes, right-to-left text), HTML input (O1), and very long input (the API accepts 100,000 characters, ~16,000
+  words, ~17 passages: not run; at 5 in flight that is four rounds).
+- **Quality beyond structure.** The evaluation scores structure, length and spelling slips fixed; whether `change_tone` or `enhance_with_ai` read well across passage seams was looked at in
+  the diffs (`local_run/longform_eval/*.diff`) but not scored.

@@ -192,3 +192,46 @@ def table_shape(block: Block) -> Optional[TableShape]:
         return None
     return TableShape(header=len(table_cells(lines[0])), delimiter=len(table_cells(lines[1])),
                       rows=tuple(len(table_cells(ln)) for ln in lines[2:]))
+
+
+# ---------------------------------------------------------------------------
+# Normalise: what the pipeline works on, and how the answer is put back
+# ---------------------------------------------------------------------------
+
+_HTML_LINE = re.compile(r"^\s*<(?:p|div|h[1-6]|table|ul|ol|li|blockquote|img|section|article|figure|pre|span|br|hr)\b[^>]*>",
+                        re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class Style:
+    """What normalise() took off a document, so the answer can be returned the way the document came."""
+    bom: bool = False
+    crlf: bool = False
+
+
+def normalise(text: Optional[str]) -> Tuple[str, Style]:
+    """LF line endings and no byte-order mark for the pipeline; restyle() puts both back on the way out."""
+    text = text or ""
+    bom = text.startswith("\ufeff")
+    if bom:
+        text = text[1:]
+    crlf = text.count("\r\n") * 2 > text.count("\n")                 # most of its line breaks are CRLF
+    return text.replace("\r\n", "\n").replace("\r", "\n"), Style(bom=bom, crlf=crlf)
+
+
+def restyle(text: str, style: Style, *, first: bool = False) -> str:
+    """`text` with the document's own line endings back; `first` marks the chunk that carries the byte-order mark."""
+    if style.crlf:
+        text = text.replace("\n", "\r\n")
+    return "\ufeff" + text if style.bom and first else text
+
+
+def looks_like_html(text: Optional[str]) -> bool:
+    """True when the document is HTML rather than Markdown: most of its non-blank lines open with a tag (open item O1)."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    if re.match(r"\s*<(?:!doctype|html|body)\b", text, re.IGNORECASE):
+        return True
+    return sum(bool(_HTML_LINE.match(ln)) for ln in lines) > 0.6 * len(lines)
+
