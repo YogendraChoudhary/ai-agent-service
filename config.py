@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     code_intent_regex_enabled: bool = Field(True, alias="CODE_INTENT_REGEX_ENABLED")
     code_intent_classifier_enabled: bool = Field(True, alias="CODE_INTENT_CLASSIFIER_ENABLED")
     code_intent_shadow_mode: bool = Field(False, alias="CODE_INTENT_SHADOW_MODE")
+
+    # ------------------------------------------------------------------
+    # Mode 8: Editable UI Design Engine (src/design_canvas)
+    # ------------------------------------------------------------------
+    design_canvas_enabled: bool = Field(True, alias="DESIGN_CANVAS_ENABLED")
+    design_max_repair_attempts: int = Field(2, ge=0, le=5, alias="DESIGN_MAX_REPAIR_ATTEMPTS")
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
     code_validation_enabled: bool = Field(True, alias="CODE_VALIDATION_ENABLED")
     code_repair_enabled: bool = Field(True, alias="CODE_REPAIR_ENABLED")

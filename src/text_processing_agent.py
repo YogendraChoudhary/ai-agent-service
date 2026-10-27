@@ -25,7 +25,7 @@ from .models import (
 from .security_guardrails import sanitize_web_content
 from .observability import trace_mark, trace_set
 from .blog.prompts import section_system_prompt
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from dotenv import load_dotenv
 import os
 import logging
@@ -2019,6 +2019,9 @@ AGENT_FOR_REQUEST_TYPE = {
     "generate_email_template": "email_template",
     "extract_image_text": "text_extraction",
     "generate_blog": "blog_writer",
+    # Mode 8: the free-form agent, which the operation type forces into the design canvas (src/design_intent.py)
+    "generate_design": FREE_FORM_AGENT,
+    "edit_design": FREE_FORM_AGENT,
 }
 
 
@@ -2175,6 +2178,9 @@ def process_user_query_stream(
     instruction: Optional[str] = None,
     blog_options: Optional[dict] = None,
     user_text: Optional[str] = None,
+    existing_design_ast: Optional[Union[dict, str]] = None,
+    operation_type: str = "general",
+    cancel_event: Optional[threading.Event] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2205,6 +2211,10 @@ def process_user_query_stream(
         user_text: The document as the user sent it, for the four refinement types (enhance, grammar, tone, simplify): `query`
             carries the single-call prompt ("Enhance: ..., Text: ..."), this is the text itself. A document that qualifies
             (src/longform, LONGFORM_REFINE_ENABLED) is refined in verified chunks instead.
+        existing_design_ast: The DesignDocumentAST the user is editing (Mode 8), as a dict or JSON string.
+        operation_type: The request's declared API type. `generate_design` / `edit_design` force Mode 8.
+        cancel_event: Set by /agent/abort. Watched by the design canvas, which yields nothing while it generates, so
+            the caller's per-chunk abort check would only see an abort once the design was finished and paid for.
 
     Yields:
         Markdown content chunks as they are generated. The blog pipeline also yields {"__event__": {...}} (an
@@ -2222,10 +2232,20 @@ def process_user_query_stream(
     legacy_agent_type, legacy_reason = determine_agent_type(query_lower)
     image_ctx = {"document_id": document_id, "explicit_params": image_params, "user_query": query}
 
+    # The free-form plan is made first: its Mode 8 design gate is priority 1 (zero LLM calls), so a design request
+    # never reaches the image router, the code classifier or the blog regex ("design a hero section with a banner
+    # image" is an editable design, not a raster).
+    smart_plan = None
+    if force_agent_type in (None, FREE_FORM_AGENT):
+        from src.request_plan import plan_smart_request
+        smart_plan = plan_smart_request(query, operation_type, bool(image_urls), bool(existing_design_ast))
+    design_mode = smart_plan is not None and smart_plan.execution_mode == "design_canvas"
+
     # Regex image routing (general chat only)
     image_intent, prev_ctx = None, None
     # The direct image route belongs to the free-form chat only (never to typed text operations)
-    if image_routing and force_agent_type in (None, FREE_FORM_AGENT) and getattr(settings, "image_router_regex_enabled", True):
+    if (image_routing and not design_mode and force_agent_type in (None, FREE_FORM_AGENT)
+            and getattr(settings, "image_router_regex_enabled", True)):
         image_intent, prev_ctx = _classify_image_request(
             query, bool(image_urls), user_id, document_id, request_id
         )
@@ -2377,7 +2397,9 @@ def process_user_query_stream(
                     'generate_blog' if force_agent_type == 'blog_writer' else
                     'general' if force_agent_type in (None, FREE_FORM_AGENT) else 'typed')
     platform_classifier_key = classifier_platform_key or ((key_resolver.default_keys or {}).get('anthropic_api_key') if key_resolver else None)
-    if request_type == 'general' and image_intent and image_intent['kind'] in ('generate', 'edit'):
+    if design_mode:
+        task, intent_attrs = task_for_request(request_type, query, execution_mode=smart_plan.execution_mode)
+    elif request_type == 'general' and image_intent and image_intent['kind'] in ('generate', 'edit'):
         task, intent_attrs = 'content', {'intent_rule': 'image_priority', 'classifier_used': False}
     else:
         task, intent_attrs = task_for_request(request_type, query, lambda text: classify_intent(
@@ -2385,7 +2407,7 @@ def process_user_query_stream(
             platform_key=platform_classifier_key, request_id=request_id))
     if task == 'code' and request_type == 'general':
         force_agent_type = 'code_writer'
-    elif (request_type == 'general' and not image_urls and settings.blog_ai_enabled
+    elif (request_type == 'general' and not image_urls and settings.blog_ai_enabled and not design_mode
           and not (image_intent and image_intent['kind'] in ('generate', 'edit'))
           and (settings.blog_intent_regex_enabled or settings.blog_intent_shadow_mode)):
         # "write a blog post about ..." in free-form chat: image and code intent were checked first, as for code.
@@ -2406,6 +2428,8 @@ def process_user_query_stream(
         if force_agent_type not in AGENT_CONFIGS:
             raise ValueError(f"Unknown agent type: {force_agent_type}")
         agent_type, reason = force_agent_type, "explicitly requested by caller"
+    elif design_mode:
+        agent_type, reason = FREE_FORM_AGENT, "design canvas intent"
     else:
         agent_type, reason = legacy_agent_type, legacy_reason
     logger.info(f"{log_prefix}Query routing: {reason} -> {agent_type} agent")
@@ -2424,13 +2448,11 @@ def process_user_query_stream(
     # user's own words, not from the LLM (src/request_plan.py).
     plan = None
     if agent_type == "smart_global":
-        from src.request_plan import plan_smart_request
-        plan = _effective_plan(
-            plan_smart_request(query), agent_type, model_provider, api_key, is_byok, image_ctx
-        )
-        logger.info(f"{log_prefix}Request plan: {plan.reasons} (images={plan.image_count}, web={plan.use_web})")
+        plan = _effective_plan(smart_plan, agent_type, model_provider, api_key, is_byok, image_ctx)
+        logger.info(f"{log_prefix}Request plan: {plan.reasons} (images={plan.image_count}, web={plan.use_web}, mode={plan.execution_mode})")
         trace_set(request_id, plan={"images": plan.image_count, "web": plan.use_web,
-                                    "tier": "advanced" if plan.advanced_model else "fast"})
+                                    "tier": "advanced" if plan.advanced_model else "fast",
+                                    "execution_mode": plan.execution_mode})
 
     elif agent_type == "code_writer":
         from src.request_plan import RequestPlan
@@ -2469,6 +2491,142 @@ def process_user_query_stream(
             credit_manager=credit_manager, pending_images=pending_images, image_params=image_params,
             document_id=document_id, request_id=request_id, report_model=report_model,
             available_providers=key_resolver.available_providers if routed else None)
+        return
+
+    # ------------------------------------------------------------------
+    # Mode 8: Editable UI Design Engine — delegated to design canvas harness
+    # ------------------------------------------------------------------
+    if plan is not None and getattr(plan, 'execution_mode', None) == 'design_canvas':
+        import asyncio
+        import json as _json
+        import time as _time
+        from src.design_canvas.service import execute_design_canvas_harness
+        from src.models import ADVANCED_MODEL_IDS
+
+        sub_mode = getattr(plan, 'design_sub_mode', None) or 'create_from_prompt'
+        logger.info(f"{log_prefix}Mode 8 Design Canvas activated (sub_mode={sub_mode})")
+        trace_set(request_id, route='design_canvas', design_sub_mode=sub_mode)
+        trace_mark(request_id, 'design_canvas_start')
+
+        # Primary candidate for logging and init event
+        _dc_candidate = candidates[0] if candidates else Candidate(model_provider, True)
+        _dc_model = ADVANCED_MODEL_IDS.get(_dc_candidate.provider, _dc_candidate.provider)
+
+        # Emit init event immediately (prevent proxy idle timeouts per Section 2.1/2.2)
+        yield {
+            "__event__": {
+                "event": "init",
+                "data": {
+                    "request_id": request_id,
+                    "model": _dc_model,
+                    "provider": _dc_candidate.provider,
+                    "mode": "design_canvas",
+                },
+            }
+        }
+
+        # The screenshot is the input of a vision design: fetched with the same size cap as the image route, and a
+        # failure is an error (as for a required image reference), not a design that ignores the screenshot.
+        reference_image_bytes = None
+        if image_urls and sub_mode == 'create_from_vision':
+            try:
+                reference_image_bytes = _design_reference_image(_fetch_reference_bytes(image_urls[0], request_id))
+            except Exception as fetch_err:
+                raise ValueError(f"Could not load the reference image: {fetch_err}") from fetch_err
+
+        existing_ast_str = None
+        if existing_design_ast:
+            existing_ast_str = existing_design_ast if isinstance(existing_design_ast, str) else _json.dumps(existing_design_ast)
+
+        # Provider calls run on this pool, never asyncio's default executor: asyncio.run() joins that one on exit,
+        # so an abort would wait for the call in flight. This pool is shut down without waiting.
+        from concurrent.futures import ThreadPoolExecutor
+        call_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="design_call")
+
+        class _DesignCanvasRunner:
+            """Adapter: exposes run_json_completion() backed by the existing model infrastructure."""
+            used = (_dc_candidate.provider, _dc_model)  # the provider that answered last, for billing analytics
+
+            async def run_json_completion(self, messages, image_bytes=None, temperature=0.2):
+                loop = asyncio.get_running_loop()
+                last_err = None
+                cand_list = candidates if candidates else [Candidate(model_provider, True)]
+                for cand in cand_list:
+                    k = key_resolver(cand.provider) if routed else api_key
+                    if not k:
+                        continue
+                    try:
+                        output = await loop.run_in_executor(
+                            call_pool,
+                            lambda c=cand, key=k: _run_design_json_completion(
+                                messages, image_bytes, temperature,
+                                c.provider, key, request_id
+                            ),
+                        )
+                        self.used = (cand.provider, ADVANCED_MODEL_IDS.get(cand.provider, cand.provider))
+                        return output
+                    except Exception as err:
+                        logger.warning(f"{log_prefix}Design canvas runner attempt failed on {cand.provider}: {err}")
+                        last_err = err
+                        continue
+                if last_err:
+                    raise last_err
+                raise ValueError("No eligible provider key available for design canvas")
+
+        runner = _DesignCanvasRunner()
+        harness_report: dict = {}
+
+        async def _harness_unless_aborted():
+            # The stream yields nothing until the design is ready, so the API's per-chunk abort check cannot see an
+            # abort here: watch the event and cancel the harness, which then makes no further model calls.
+            harness = asyncio.ensure_future(execute_design_canvas_harness(
+                runner,
+                user_query=query,
+                sub_mode=sub_mode,
+                reference_image_bytes=reference_image_bytes,
+                existing_ast_json=existing_ast_str,
+                report=harness_report,
+            ))
+            while not harness.done():
+                if cancel_event is not None and cancel_event.is_set():
+                    harness.cancel()
+                await asyncio.wait({harness}, timeout=_DESIGN_ABORT_POLL_SECONDS)
+            return harness.result()
+
+        t0_design = _time.perf_counter()
+        try:
+            design_ast = asyncio.run(_harness_unless_aborted())
+        except asyncio.CancelledError:
+            logger.info(f"{log_prefix}Design canvas stopped by client abort after {_time.perf_counter() - t0_design:.2f}s")
+            trace_mark(request_id, 'design_canvas_aborted')
+            return
+        except Exception as _exc:
+            logger.error(f"{log_prefix}Design canvas harness failed: {_exc}")
+            raise
+        finally:
+            call_pool.shutdown(wait=False, cancel_futures=True)  # a call in flight finishes alone; its answer is dropped
+
+        elapsed = round(_time.perf_counter() - t0_design, 3)
+        attempts = harness_report.get("attempts", [])
+        trace_set(request_id, design_elapsed_seconds=elapsed, design_attempts=attempts,
+                  design_auto_healed=harness_report.get("auto_healed", False))
+        trace_mark(request_id, 'design_canvas_done')
+        from .observability import get_trace
+        _trace = get_trace(request_id)
+        _usage = _trace.attrs if _trace is not None else {}
+        total_tokens = ((_usage.get("tokens_in") or 0) + (_usage.get("tokens_out") or 0)) or None
+
+        if report_model:
+            yield {'__model_used__': runner.used}
+
+        # Emit the design_ready SSE event payload
+        design_payload = design_ast.model_dump()
+        yield {"__event__": {"event": "design_ready", "data": design_payload}}
+        # Final complete event for the caller
+        yield {"__event__": {"event": "complete", "data": {
+            "total_tokens": total_tokens, "elapsed_seconds": elapsed, "mode": "design_canvas", "warnings": [],
+            "attempts": len(attempts), "auto_healed": harness_report.get("auto_healed", False),
+        }}}
         return
 
     from .provider_errors import can_fall_back, is_provider_unusable, is_rate_limit, retry_delay, status_code
@@ -2613,6 +2771,8 @@ def process_user_query_with_images(
     blog_options: dict = None,
     meta: dict = None,
     user_text: str = None,
+    existing_design_ast: Optional[Union[dict, str]] = None,
+    operation_type: str = "general",
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
@@ -2652,6 +2812,8 @@ def process_user_query_with_images(
         instruction=instruction,
         blog_options=blog_options,
         user_text=user_text,
+        existing_design_ast=existing_design_ast,
+        operation_type=operation_type,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]
@@ -2660,6 +2822,13 @@ def process_user_query_with_images(
                 meta["warnings"] = chunk["__warnings__"]
         elif isinstance(chunk, dict) and "__content_replace__" in chunk:
             chunks = [chunk["__content_replace__"]]
+        elif isinstance(chunk, dict) and "__event__" in chunk:
+            ev = chunk["__event__"]
+            if ev.get("event") == "design_ready":
+                import json as _json
+                chunks = [_json.dumps(ev.get("data", {}))]
+            if meta is not None:
+                meta[ev.get("event", "event")] = ev.get("data")
         elif isinstance(chunk, str):
             chunks.append(chunk)
 
@@ -2865,6 +3034,173 @@ def _get_cached_gemini_client(api_key: str):
     cache_key = ("gemini", api_key)
     from google import genai
     return _get_cached_client(cache_key, lambda: genai.Client(api_key=api_key))
+
+
+_DESIGN_MAX_OUTPUT_TOKENS = 4096
+_DESIGN_IMAGE_FORMATS = ("PNG", "JPEG", "WEBP")   # accepted as-is by Claude, OpenAI and Gemini alike
+_DESIGN_ABORT_POLL_SECONDS = 0.1
+
+
+def _design_reference_image(image_bytes: bytes) -> bytes:
+    """
+    The design screenshot in a format every design provider accepts: PNG, JPEG and WebP as sent, anything else
+    Pillow can read (GIF, BMP, TIFF, ...) re-encoded as PNG. Bytes that are not a readable image are refused rather
+    than sent under a made-up media type.
+    """
+    import io
+    from PIL import Image
+    from .s3_service import convert_image_format
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            fmt = img.format
+    except Exception as err:
+        raise ValueError(f"not a readable image ({err})") from err
+    if fmt in _DESIGN_IMAGE_FORMATS:
+        return image_bytes
+    converted, content_type, _ = convert_image_format(image_bytes, "png")
+    if content_type != "image/png":
+        raise ValueError(f"{fmt} image could not be converted to PNG")
+    return converted
+
+
+def _record_design_usage(request_id: str, model_id: str, tokens_in, tokens_out) -> None:
+    """Tokens and estimated cost of one design call, on the request trace (requests.jsonl, /agent/metrics)."""
+    if tokens_in is not None and tokens_out is not None:
+        from .observability import record_text_usage
+        record_text_usage(request_id, model_id, {"input_tokens": tokens_in, "output_tokens": tokens_out})
+
+
+def _run_design_json_completion(
+    messages: list[dict],
+    image_bytes: Optional[bytes],
+    temperature: float,
+    model_provider: str,
+    api_key: str,
+    request_id: str = "",
+) -> str:
+    """
+    Direct model call for Mode 8 Editable UI Design Engine.
+    Executes a structured JSON completion across Claude, Gemini, or OpenAI.
+    """
+    import base64
+    from src.models import ADVANCED_MODEL_IDS
+    from .s3_service import sniff_image_bytes
+
+    log_prefix = f"[{request_id}] " if request_id else ""
+    provider = (model_provider or "claude").lower()
+    model_id = ADVANCED_MODEL_IDS.get(provider, "claude-opus-5")
+    # The real type of the bytes (_design_reference_image keeps them PNG, JPEG or WebP); a JPEG labelled PNG is rejected.
+    media_type = sniff_image_bytes(image_bytes)[0] if image_bytes else None
+
+    if provider == "claude":
+        client = _get_cached_anthropic_client(api_key)
+        system_prompt = ""
+        anthropic_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_prompt = content
+                continue
+            if role == "user" and image_bytes and not any(isinstance(m.get("content"), list) for m in anthropic_messages):
+                b64_img = base64.b64encode(image_bytes).decode("utf-8")
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64_img,
+                            },
+                        },
+                        {"type": "text", "text": content},
+                    ],
+                })
+            else:
+                anthropic_messages.append({"role": role, "content": content})
+
+        resp = client.messages.create(
+            model=model_id,
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}] if system_prompt else [],
+            messages=anthropic_messages,
+            max_tokens=_DESIGN_MAX_OUTPUT_TOKENS,
+            temperature=temperature,
+        )
+        usage = getattr(resp, "usage", None)
+        _record_design_usage(request_id, model_id, usage and (
+            (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+            + (getattr(usage, "cache_creation_input_tokens", 0) or 0)), usage and usage.output_tokens)
+        return resp.content[0].text if resp.content else ""
+
+    elif provider in ("openai", "grok", "deepseek"):
+        base_url = OPENAI_COMPATIBLE_BASES.get(provider)
+        client = _get_cached_openai_client(api_key, base_url)
+        openai_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user" and image_bytes and not any(isinstance(m.get("content"), list) for m in openai_messages):
+                b64_img = base64.b64encode(image_bytes).decode("utf-8")
+                openai_messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": content},
+                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_img}"}},
+                    ],
+                })
+            else:
+                openai_messages.append({"role": role, "content": content})
+
+        kwargs = {
+            "model": model_id,
+            "messages": openai_messages,
+            "temperature": temperature,
+            **_output_limit_kwargs(provider, model_id, _DESIGN_MAX_OUTPUT_TOKENS),  # gpt-5 rejects max_tokens
+        }
+        if provider == "openai":
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = client.chat.completions.create(**kwargs)
+        usage = getattr(resp, "usage", None)
+        _record_design_usage(request_id, model_id, usage and usage.prompt_tokens, usage and usage.completion_tokens)
+        return resp.choices[0].message.content or ""
+
+    elif provider == "gemini":
+        from google.genai import types
+        client = _get_cached_gemini_client(api_key)
+        system_prompt = ""
+        conversation_turns = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_prompt = content
+            elif role == "user":
+                parts = []
+                if image_bytes and not conversation_turns:
+                    parts.append(types.Part.from_bytes(data=image_bytes, mime_type=media_type))
+                parts.append(types.Part.from_text(text=content))
+                conversation_turns.append(types.Content(role="user", parts=parts))
+            elif role == "assistant":
+                conversation_turns.append(types.Content(role="model", parts=[types.Part.from_text(text=content)]))
+
+        resp = client.models.generate_content(
+            model=model_id,
+            contents=conversation_turns,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt if system_prompt else None,
+                temperature=temperature,
+                response_mime_type="application/json",
+            ),
+        )
+        usage = getattr(resp, "usage_metadata", None)
+        _record_design_usage(request_id, model_id, usage and usage.prompt_token_count,
+                             usage and usage.candidates_token_count)
+        return resp.text or ""
+
+    raise ValueError(f"Unsupported provider for design canvas: {provider}")
 
 
 def get_autocomplete_suggestion(

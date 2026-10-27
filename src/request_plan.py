@@ -180,6 +180,8 @@ class RequestPlan:
     image_requested: int = 0      # what the user asked for before the cap
     use_web: bool = False         # web search/read tools attached
     advanced_model: bool = True   # reasoning tier vs fast tier
+    execution_mode: str = "general"  # "general" | "design_canvas" | …
+    design_sub_mode: Optional[str] = None  # "create_from_prompt" | "create_from_vision" | "edit_existing_ast"
     reasons: Dict[str, str] = field(default_factory=dict)
 
     @property
@@ -191,7 +193,62 @@ class RequestPlan:
         return self.image_requested > self.image_count
 
 
-def plan_smart_request(user_text: Optional[str]) -> RequestPlan:
+def plan_design_request(
+    user_text: Optional[str],
+    operation_type: str = "general",
+    has_image_attachment: bool = False,
+    has_existing_design_ast: bool = False,
+) -> Optional[RequestPlan]:
+    """
+    Mode 8 Design Canvas plan, or None when this is not a design request (or the engine is off).
+
+    Zero LLM calls. The stream calls it before the image router, the code classifier and the blog regex,
+    so a design request never reaches them; /agent/stream calls it again to reserve the design price.
+    Image and web tools are disabled and the model tier is forced to advanced.
+    """
+    if not settings.design_canvas_enabled:
+        return None
+    from src.design_intent import detect_design_intent
+    decision = detect_design_intent(
+        query=user_text or "",
+        operation_type=operation_type,
+        has_image_attachment=has_image_attachment,
+        has_existing_design_ast=has_existing_design_ast,
+    )
+    if not decision.is_design_request:
+        return None
+    return RequestPlan(
+        image_count=0,
+        image_requested=0,
+        use_web=False,
+        advanced_model=True,
+        execution_mode="design_canvas",
+        design_sub_mode=decision.sub_mode,
+        reasons={
+            "images": "disabled=design_canvas_mode",
+            "web": "disabled=design_canvas_mode",
+            "tier": "advanced",
+            "design_intent": decision.reason,
+            "design_sub_mode": decision.sub_mode or "",
+        },
+    )
+
+
+def plan_smart_request(
+    user_text: Optional[str],
+    operation_type: str = "general",
+    has_image_attachment: bool = False,
+    has_existing_design_ast: bool = False,
+) -> RequestPlan:
+    """
+    Deterministic request plan.
+
+    Priority 1 (before any other gate): Mode 8 Design Canvas detection (plan_design_request).
+    """
+    design = plan_design_request(user_text, operation_type, has_image_attachment, has_existing_design_ast)
+    if design is not None:
+        return design
+
     requested = image_count_requested(user_text)
     count = min(requested, max(0, int(settings.image_max_per_request)))
     web = needs_web(user_text)
@@ -201,6 +258,7 @@ def plan_smart_request(user_text: Optional[str]) -> RequestPlan:
         image_requested=requested,
         use_web=web,
         advanced_model=adv,
+        execution_mode="general",
         reasons={
             "images": f"requested={requested} granted={count}",
             "web": "cue" if web else "no freshness/research cue",

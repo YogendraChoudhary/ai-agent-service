@@ -17,7 +17,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 
 def _payload(user_id, input_chars, output_chars, operation_type, image_count, provider, model,
-             duration_ms, success, error_code, images):
+             duration_ms, success, error_code, images, design=None):
     body = {
         "user_id": user_id,
         "input_chars": input_chars,
@@ -32,6 +32,8 @@ def _payload(user_id, input_chars, output_chars, operation_type, image_count, pr
     }
     if images:
         body["images"] = images  # which model drew each image, and what it was priced at
+    if design:
+        body["design"] = design  # Mode 8 flat price: {"sub_mode", "credits_scaled"}, charged instead of the chars
     return body
 
 
@@ -48,6 +50,7 @@ def fire_credit_deduction(
     success: bool = True,
     error_code: str | None = None,
     images: list | None = None,
+    design: dict | None = None,
 ):
     """
     Send a non-blocking credit deduction webhook to the backend.
@@ -64,6 +67,7 @@ def fire_credit_deduction(
         success: Whether the call succeeded; failures are logged but don't deduct credits
         error_code: Short error identifier when success=False
         images: per generated image {"provider", "model", "credits_scaled"}; sent only when there are images
+        design: a delivered Mode 8 design {"sub_mode", "credits_scaled"}; its flat price replaces the char-based charge
     """
     if not BACKEND_WEBHOOK_URL or not WEBHOOK_SECRET:
         logger.warning("Webhook env vars missing (BACKEND_WEBHOOK_URL or WEBHOOK_SECRET) — skipping credit deduction")
@@ -74,7 +78,7 @@ def fire_credit_deduction(
             resp = requests.post(
                 BACKEND_WEBHOOK_URL,
                 json=_payload(user_id, input_chars, output_chars, operation_type, image_count, provider,
-                              model, duration_ms, success, error_code, images),
+                              model, duration_ms, success, error_code, images, design),
                 headers={
                     "Content-Type": "application/json",
                     "X-Webhook-Secret": WEBHOOK_SECRET,
@@ -111,6 +115,7 @@ def fire_credit_deduction_and_release(
     success: bool = True,
     error_code: str | None = None,
     images: list | None = None,
+    design: dict | None = None,
 ):
     """
     Streaming variant of fire_credit_deduction. POSTs the webhook, sleeps
@@ -137,7 +142,7 @@ def fire_credit_deduction_and_release(
             resp = requests.post(
                 BACKEND_WEBHOOK_URL,
                 json=_payload(user_id, input_chars, output_chars, operation_type, image_count, provider,
-                              model, duration_ms, success, error_code, images),
+                              model, duration_ms, success, error_code, images, design),
                 headers={
                     "Content-Type": "application/json",
                     "X-Webhook-Secret": WEBHOOK_SECRET,

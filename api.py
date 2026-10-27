@@ -37,11 +37,13 @@ from src.credit_manager import (
     CREDIT_SCALE,
     IMAGE_CREDITS_SCALED,
     CreditManager,
+    design_credits_scaled,
     text_credits_scaled,
 )
 from src.redis_manager import get_redis_manager
 from src.image_gen import sanitize_image_params
 from src.text_processing_agent import (
+    FREE_FORM_AGENT,
     VISION_CAPABLE_PROVIDERS,
     agent_for_request_type,
     get_autocomplete_suggestion,
@@ -104,6 +106,7 @@ VALID_AGENT_TYPES: frozenset[str] = frozenset({
     'make_longer', 'make_shorter', 'enhance_with_ai', 'change_tone',
     'general', 'generate_email_template', 'extract_image_text',
     'generate_code', 'explain_code', 'generate_blog',
+    'generate_design', 'edit_design',
 })
 _SORTED_AGENT_TYPES = ', '.join(sorted(VALID_AGENT_TYPES))
 
@@ -310,6 +313,7 @@ class ProcessRequest(BaseModel):
     image_model: Optional[str] = Field(None, max_length=64)
     image_params: Optional[Dict[str, Any]] = None
     blog_options: Optional[BlogOptions] = None      # generate_blog only
+    existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
 
     @field_validator('image_provider')
     @classmethod
@@ -364,6 +368,7 @@ class StreamRequest(BaseModel):
     # Keys: aspect_ratio, quality, resolution, format, transparent_bg, provider, model.
     image_params: Optional[Dict[str, Any]] = None
     blog_options: Optional[BlogOptions] = None      # generate_blog only
+    existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
 
     @field_validator('image_provider')
     @classmethod
@@ -558,6 +563,7 @@ class ProcessResponse(BaseModel):
     html_response: Optional[str] = None
     # Things the server fixed or could not do (generate_blog): [{"kind", "detail", "unit"?}]. Empty when clean.
     warnings: List[Dict[str, Any]] = Field(default_factory=list)
+    design: Optional[Dict[str, Any]] = None
 
 
 class AutocompleteResponse(BaseModel):
@@ -602,6 +608,8 @@ TYPE_PREFIX_MAP: dict[str, str] = {
     'generate_email_template': '',
     'extract_image_text':     '',
     'generate_blog':          '',
+    'generate_design':        '',
+    'edit_design':            '',
 }
 
 
@@ -897,6 +905,8 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
             meta=meta,
             user_text=request_data.query,
+            existing_design_ast=request_data.existing_design_ast,
+            operation_type=agent_type,
         )
         warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
@@ -950,6 +960,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'markdown_response': response,
                 'html_response': response,
                 'warnings': warnings,
+                'design': meta.get('design_ready') if meta else None,
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1052,6 +1063,15 @@ async def stream_text(
         )
         input_chars = len(request_data.query)
 
+        # Mode 8 is billed at a flat price, not by characters. Same gate, same inputs as the pipeline's priority-1
+        # design check, so the price reserved here is the price of what the pipeline runs.
+        design_plan = None
+        if agent_for_request_type(agent_type) == FREE_FORM_AGENT:
+            from src.request_plan import plan_design_request
+            design_plan = plan_design_request(
+                request_data.query, agent_type, bool(image_urls), bool(request_data.existing_design_ast))
+        design_price_scaled = design_credits_scaled(design_plan.design_sub_mode) if design_plan else 0
+
         # Upfront credit reservation (skipped for BYOK users)
         upfront_reserved_scaled = 0
         if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
@@ -1063,8 +1083,8 @@ async def stream_text(
                     request_data.query, request_data.secondary_prompt,
                     request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None),
                     image_available=False).target_words
-            upfront_reserved_scaled = text_credits_scaled(input_chars, expected_output_chars)
-            if image_urls:
+            upfront_reserved_scaled = design_price_scaled or text_credits_scaled(input_chars, expected_output_chars)
+            if image_urls and not design_plan:
                 upfront_reserved_scaled += IMAGE_CREDITS_SCALED * len(image_urls)
             ok, available_scaled = credit_manager.reserve(user_id, upfront_reserved_scaled)
             if not ok:
@@ -1092,6 +1112,7 @@ async def stream_text(
             extra_reserved_scaled = 0
             credit_limit_hit = False
             stream_warnings: list = []
+            design_billing = None   # set when a Mode 8 design is delivered: its flat price replaces the char charge
 
             # Register lock-free cancellation event for this request (Point 6)
             cancel_event = register_cancellation_event(request_id)
@@ -1142,6 +1163,9 @@ async def stream_text(
                     instruction=request_data.secondary_prompt or None,
                     blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
                     user_text=request_data.query,
+                    existing_design_ast=request_data.existing_design_ast,
+                    operation_type=agent_type,
+                    cancel_event=cancel_event,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
@@ -1159,8 +1183,14 @@ async def stream_text(
                         used_provider, used_model = chunk['__model_used__']
                         continue
                     if isinstance(chunk, dict) and '__event__' in chunk:
-                        # Additive events (the blog `outline`); clients that do not know a type ignore it.
-                        yield f"data: {json.dumps(chunk['__event__'])}\n\n"
+                        ev = chunk['__event__']
+                        if isinstance(ev, dict) and 'event' in ev and 'data' in ev:
+                            if ev['event'] == 'design_ready' and design_plan is not None:
+                                design_billing = {'sub_mode': design_plan.design_sub_mode,
+                                                  'credits_scaled': design_price_scaled}
+                            yield f"event: {ev['event']}\ndata: {json.dumps(ev['data'])}\n\n"
+                        else:
+                            yield f"data: {json.dumps(ev)}\n\n"
                         continue
                     if isinstance(chunk, dict) and '__warnings__' in chunk:
                         stream_warnings = chunk['__warnings__']
@@ -1346,6 +1376,7 @@ async def stream_text(
                             duration_ms=duration_ms,
                             success=True,
                             images=image_details,
+                            design=design_billing,
                         )
                     else:
                         fire_credit_deduction(
@@ -1353,7 +1384,7 @@ async def stream_text(
                             resolved_image_count,
                             provider=bill_provider, model=bill_model,
                             duration_ms=duration_ms, success=True,
-                            images=image_details,
+                            images=image_details, design=design_billing,
                         )
 
                 elif had_error and not is_byok:

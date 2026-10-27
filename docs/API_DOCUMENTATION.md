@@ -40,6 +40,7 @@ Content-Type: application/json
 | `api_key` | string | Yes | API key for the selected model provider |
 | `secondary_prompt` | string | No | Additional instruction for specific operations |
 | `blog_options` | object | No | `generate_blog` only: `length`, `images`, `tone`, `audience` (see [blog generation](#visually-rich-blog-generation-generate_blog)) |
+| `existing_design_ast` | object or string | No | The `DesignDocumentAST` being edited (Mode 8 editable UI design); makes a design request an edit |
 
 #### Supported Operation Types
 
@@ -56,6 +57,8 @@ Content-Type: application/json
 | `change_tone` | Change the tone/style of text | Yes (tone description) |
 | `general` | General content creation (articles, images, etc.) | No |
 | `generate_blog` | A visually rich blog post: tables, pull quotes and inline images ([details](#visually-rich-blog-generation-generate_blog)) | Yes (style notes) |
+| `generate_design` | An editable UI design (`DesignDocumentAST`), whatever the wording; from a prompt or an attached screenshot. `general` also routes here on design wording | No |
+| `edit_design` | Edit the `existing_design_ast` (a new design when none is sent) | No |
 
 #### Response
 

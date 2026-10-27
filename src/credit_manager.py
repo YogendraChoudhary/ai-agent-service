@@ -26,6 +26,11 @@ CHARS_PER_CREDIT = 1000
 IMAGE_CREDITS_SCALED = 50            # 5 credits per image
 AUTOCOMPLETE_CREDITS_SCALED = 2      # 0.2 credits per acceptance
 
+# Mode 8: Editable UI Design Engine flat prices (in scaled units). As for images, the backend computes the
+# charge; these numbers drive the agent-side reservation and are sent in the webhook's `design` field.
+DESIGN_CANVAS_GENERATION_CREDITS_SCALED = 30   # 3.0 credits — new design generation
+DESIGN_CANVAS_EDIT_CREDITS_SCALED = 5           # 0.5 credits — existing AST edit
+
 # Per-model image prices in scaled units, keyed "provider/model" or just "provider". Empty on purpose:
 # every model costs the flat IMAGE_CREDITS_SCALED until a price is set here or through the
 # IMAGE_CREDITS_BY_MODEL env var (JSON, e.g. {"openai/gpt-image-1": 80}). The backend still computes the
@@ -57,6 +62,13 @@ def image_credits_scaled(provider: str | None, model: str | None) -> int:
             except (TypeError, ValueError):
                 break
     return IMAGE_CREDITS_SCALED
+
+
+def design_credits_scaled(sub_mode: str | None) -> int:
+    """Flat Mode 8 price: an edit of an existing AST, or a new design (from a prompt or a screenshot)."""
+    if sub_mode == "edit_existing_ast":
+        return DESIGN_CANVAS_EDIT_CREDITS_SCALED
+    return DESIGN_CANVAS_GENERATION_CREDITS_SCALED
 
 
 def text_credits_scaled(input_chars: int, output_chars: int) -> int:

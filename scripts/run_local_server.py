@@ -151,10 +151,18 @@ class FakeCreditManager:
 
 
 def _simulated_backend_deduct(cm, payload):
-    """What the real backend would charge: text by characters, images by count (flat 50 until it reads images[])."""
+    """
+    What the real backend would charge: text by characters, images by count (flat 50 until it reads images[]).
+    A delivered Mode 8 design carries its flat price in `design`; that replaces the char-based text charge here, as it
+    will in the backend once it reads `design` (until then the real backend still charges the characters).
+    """
     if not cm:
         return
     text = text_credits_scaled(payload["input_chars"], payload["output_chars"]) if payload["operation_type"] in ("text", "mixed") else 0
+    if payload.get("design"):
+        log.info(f"🎨 design price {payload['design']['credits_scaled'] / CREDIT_SCALE:g} cr replaces the text charge "
+                 f"({text / CREDIT_SCALE:g} cr) — the real backend charges the text until it reads `design`")
+        text = payload["design"]["credits_scaled"]
     images = sum(i.get("credits_scaled", 0) for i in payload.get("images") or [])
     with cm._lock:
         cm.balance -= (text + images)
@@ -163,18 +171,21 @@ def _simulated_backend_deduct(cm, payload):
 
 def make_webhooks(cm_holder):
     def fire_credit_deduction(user_id, input_chars, output_chars, operation_type="text", image_count=0, *,
-                              provider=None, model=None, duration_ms=None, success=True, error_code=None, images=None):
+                              provider=None, model=None, duration_ms=None, success=True, error_code=None, images=None,
+                              design=None):
         body = webhook._payload(user_id, input_chars, output_chars, operation_type, image_count, provider, model,
-                                duration_ms, success, error_code, images)
+                                duration_ms, success, error_code, images, design)
         log.info("📨 WEBHOOK would send (NOT sent): " + json.dumps(body, ensure_ascii=False))
         if success:
             _simulated_backend_deduct(cm_holder.get("cm"), body)
 
     def fire_credit_deduction_and_release(user_id, input_chars, output_chars, operation_type, image_count,
                                           reserved_scaled, credit_manager, settle_delay_seconds, *, provider=None,
-                                          model=None, duration_ms=None, success=True, error_code=None, images=None):
+                                          model=None, duration_ms=None, success=True, error_code=None, images=None,
+                                          design=None):
         fire_credit_deduction(user_id, input_chars, output_chars, operation_type, image_count, provider=provider,
-                              model=model, duration_ms=duration_ms, success=success, error_code=error_code, images=images)
+                              model=model, duration_ms=duration_ms, success=success, error_code=error_code, images=images,
+                              design=design)
         credit_manager.release(user_id, reserved_scaled)
 
     return fire_credit_deduction, fire_credit_deduction_and_release

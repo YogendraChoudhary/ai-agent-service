@@ -59,6 +59,7 @@ class TestTable(unittest.TestCase):
             "enhance_with_ai": "enhance", "change_tone": "tone", "general": "smart_global",
             "generate_email_template": "email_template", "extract_image_text": "text_extraction",
             "generate_code": "code_writer", "explain_code": "code_explainer", "generate_blog": "blog_writer",
+            "generate_design": "smart_global", "edit_design": "smart_global",
         })
 
     def test_general_is_the_free_form_agent(self):
