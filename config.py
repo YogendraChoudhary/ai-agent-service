@@ -53,6 +53,33 @@ class Settings(BaseSettings):
     code_repair_stream_event: bool = Field(False, alias="CODE_REPAIR_STREAM_EVENT")
     text_prices_per_mtok: str = Field('{}', alias="TEXT_PRICES_PER_MTOK")
 
+    @field_validator('voice_llm_mode')
+    @classmethod
+    def validate_voice_llm_mode(cls, value):
+        value = (value or '').strip().lower()
+        if value not in {'smart', 'always'}:
+            logging.getLogger(__name__).warning('Invalid VOICE_LLM_MODE %r; using smart', value)
+            return 'smart'
+        return value
+
+    @field_validator('voice_default_style')
+    @classmethod
+    def validate_voice_style(cls, value):
+        value = (value or '').strip().lower()
+        if value not in {'clean', 'polished'}:
+            logging.getLogger(__name__).warning('Invalid VOICE_DEFAULT_STYLE %r; using clean', value)
+            return 'clean'
+        return value
+
+    @field_validator('voice_format_provider')
+    @classmethod
+    def validate_voice_provider(cls, value):
+        value = (value or '').strip().lower()
+        if value not in {'gemini', 'openai'}:
+            logging.getLogger(__name__).warning('Invalid VOICE_FORMAT_PROVIDER %r; using gemini', value)
+            return 'gemini'
+        return value
+
     @field_validator('blog_outline_model')
     @classmethod
     def validate_outline_model(cls, value):
@@ -210,6 +237,33 @@ class Settings(BaseSettings):
     longform_repair_enabled: bool = Field(True, alias="LONGFORM_REPAIR_ENABLED")           # one repair call per failing chunk
     longform_word_ratio: str = Field("", alias="LONGFORM_WORD_RATIO")                      # JSON override of the ratio windows
     longform_call_timeout_seconds: float = Field(150.0, ge=0, le=900, alias="LONGFORM_CALL_TIMEOUT_SECONDS")   # one model call; 0 = no limit
+
+    # ------------------------------------------------------------------
+    # Voice dictation (src/voice_flow). Local Whisper (faster-whisper) turns speech into text; a low-end Gemini model
+    # compiles it (lists, self-corrections, fillers, cursor-aware casing); code does the final spacing.
+    # ------------------------------------------------------------------
+    voice_flow_enabled: bool = Field(True, alias="VOICE_FLOW_ENABLED")             # True = /v1/voice/* is mounted
+    voice_flow_token: str = Field("", alias="VOICE_FLOW_TOKEN")                      # non-empty = clients must send it
+    voice_whisper_model: str = Field("small", alias="VOICE_WHISPER_MODEL")           # tiny|base|small|... or a local path
+    # float32 beat int8 on an Apple M4 (small: 675 ms vs 860-940 ms); on x86 servers int8 is the faster choice.
+    voice_whisper_compute_type: str = Field("float32", alias="VOICE_WHISPER_COMPUTE_TYPE")
+    voice_whisper_threads: int = Field(8, ge=0, le=64, alias="VOICE_WHISPER_THREADS")   # 0 = library default
+    voice_whisper_language: str = Field("en", alias="VOICE_WHISPER_LANGUAGE")         # "" = detect per utterance (slower)
+    # smart: plain sentences skip the model (it costs ~1 s per call whatever the prompt); cues, corrections, fillers, email, code go to it.
+    voice_llm_mode: str = Field("smart", alias="VOICE_LLM_MODE")                       # smart | always
+    # Writing style of the formatted text. clean: keeps the speaker's wording, removes fillers, false starts and repeats.
+    # polished: also tightens each list point to "Label: one sentence"; a dropped claim falls back to clean. Per request override: `style`.
+    voice_default_style: str = Field("clean", alias="VOICE_DEFAULT_STYLE")             # clean | polished
+    # Email / Slack / code / Markdown specific formatting. Off for now: every app_context is treated as "general".
+    voice_app_contexts_enabled: bool = Field(False, alias="VOICE_APP_CONTEXTS")
+    voice_format_provider: str = Field("gemini", alias="VOICE_FORMAT_PROVIDER")       # gemini | openai (openai: while Gemini is out)
+    voice_format_model: str = Field("", alias="VOICE_FORMAT_MODEL")                   # "" = the project's low-end model of that provider
+    voice_gemini_api_key: Optional[str] = Field(None, alias="VOICE_GEMINI_API_KEY")   # None = DEFAULT_GEMINI_API_KEY
+    voice_format_timeout_seconds: float = Field(4.0, gt=0, le=30, alias="VOICE_FORMAT_TIMEOUT_SECONDS")
+    # Hands-free mode returns ONE result for the whole dictation: it ends after this much silence (or when the client says end).
+    # 0.8 s split a two-minute monologue into nine separately formatted pieces, so thinking pauses must not end it.
+    voice_endpoint_silence_ms: int = Field(6000, ge=500, le=60000, alias="VOICE_ENDPOINT_SILENCE_MS")
+    voice_max_utterance_seconds: int = Field(600, ge=5, le=1800, alias="VOICE_MAX_UTTERANCE_SECONDS")   # memory guard, not a chunk size
 
     # ------------------------------------------------------------------
     # Observability (src/observability.py). Bodies contain user text, so they are OFF by default.

@@ -50,6 +50,7 @@ os.environ.update({
     "CREDIT_PRECHECK_ENABLED": "true",
     "CREDIT_SETTLE_DELAY_SECONDS": "0",
     "BLOG_AI_ENABLED": "true",      # type=generate_blog; the flag ships off, a local run is where it is tried
+    "VOICE_FLOW_ENABLED": "true",   # /v1/voice/*: local Whisper dictation; open http://127.0.0.1:8000/v1/voice/demo
     "LONGFORM_REFINE_ENABLED": "true",   # long documents through enhance / grammar / tone / simplify, verified chunk by chunk
     # Reference images must live under CDN_URL. Locally the "CDN" is this server's /local-images folder,
     # so an image_ready url can be sent straight back as image_urls for a refinement.

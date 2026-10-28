@@ -208,6 +208,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Model pre-warming encountered an issue (non-fatal): {e}")
 
+    if settings.voice_flow_enabled:
+        # Whisper's first decode compiles kernels and Gemini's first call opens a TLS connection; do both before a user waits.
+        from src.voice_flow.router import warm_up as warm_up_voice
+        await warm_up_voice()
+
     yield
 
     # ---- shutdown ----
@@ -230,6 +235,10 @@ async def lifespan(app: FastAPI):
 # APP
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Text Processing Agent API", lifespan=lifespan)
+
+if settings.voice_flow_enabled:       # /v1/voice/*: local Whisper dictation formatted by Gemini (src/voice_flow). Ships off.
+    from src.voice_flow.router import router as voice_router
+    app.include_router(voice_router)
 
 app.add_middleware(
     CORSMiddleware,

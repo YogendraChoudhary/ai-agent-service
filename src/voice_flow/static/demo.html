@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Flow test</title>
+<style>
+  :root { --bg:#fafaf8; --panel:#fff; --ink:#1c1c1a; --muted:#6b6b66; --line:#e3e2dc; --accent:#2f6fed; --ok:#1a7f4b; --warn:#b45309; --rec:#d93025; --soft:#f1f0ec; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --panel:#1f1f1e; --ink:#ecebe6; --muted:#9a9990; --line:#33332f; --accent:#6c9bff; --ok:#4cc38a; --warn:#f0a35e; --rec:#ff6b5e; --soft:#272725; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:24px 16px 64px; }
+  header { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; margin-bottom:4px; }
+  h1 { font-size:20px; margin:0; margin-right:auto; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  label { font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:4px; }
+  select, input[type=text] { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); }
+  textarea { width:100%; min-height:200px; font:inherit; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); resize:vertical; }
+  .pill { font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+  .pill.ok { color:var(--ok); border-color:var(--ok); } .pill.warn { color:var(--warn); border-color:var(--warn); }
+  .stage { text-align:center; }
+  #enable { font:inherit; font-weight:600; padding:12px 22px; border-radius:999px; border:0; background:var(--accent); color:#fff; cursor:pointer; }
+  #micNote { margin:10px auto 0; max-width:560px; font-size:14px; color:var(--muted); }
+  #micNote.warn { color:var(--warn); }
+  #talkWrap { display:none; flex-direction:column; align-items:center; gap:10px; }
+  #talk { width:120px; height:120px; border-radius:50%; border:0; background:var(--accent); color:#fff; cursor:pointer; display:grid; place-items:center; user-select:none; -webkit-user-select:none; touch-action:none; box-shadow:0 4px 14px rgba(47,111,237,.35); transition:transform .08s; }
+  #talk svg { width:48px; height:48px; fill:currentColor; pointer-events:none; }
+  #talk:active { transform:scale(.97); }
+  #talk.rec { background:var(--rec); animation:pulse 1.1s ease-in-out infinite; box-shadow:0 0 0 0 rgba(217,48,37,.5); }
+  #talk.busy { background:var(--muted); box-shadow:none; }
+  #talk:disabled { opacity:.45; cursor:default; box-shadow:none; }
+  @keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(217,48,37,.45); } 70% { box-shadow:0 0 0 22px rgba(217,48,37,0); } 100% { box-shadow:0 0 0 0 rgba(217,48,37,0); } }
+  #talkLabel { font-weight:600; min-height:1.5em; }
+  .meter { height:6px; width:min(320px, 80%); background:var(--line); border-radius:3px; overflow:hidden; }
+  .meter > div { height:100%; width:0; background:var(--ok); transition:width .05s linear; }
+  .controls { margin-top:16px; justify-content:center; text-align:left; }
+  .hint { font-size:13px; color:var(--muted); margin:8px 0 0; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(104px, 1fr)); gap:8px; margin:12px 0; }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:8px 10px; text-align:left; }
+  .stat b { display:block; font-size:18px; font-variant-numeric:tabular-nums; } .stat span { font-size:12px; color:var(--muted); }
+  pre { margin:6px 0 0; white-space:pre-wrap; word-break:break-word; font:13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); vertical-align:top; } th { color:var(--muted); font-weight:500; }
+  button.small { font:inherit; font-size:13px; padding:3px 10px; border-radius:8px; border:1px solid var(--line); background:var(--soft); color:var(--ink); cursor:pointer; }
+  details > summary { cursor:pointer; font-weight:600; }
+  .try td:first-child { width:46%; } .try code { white-space:pre-wrap; font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Voice Flow test</h1>
+    <span id="conn" class="pill">connecting</span>
+    <span id="model" class="pill">model: ...</span>
+  </header>
+  <p class="sub">Local Whisper hears you; a small cloud model formats it. Text lands where your cursor is in the box below.</p>
+
+  <div class="panel stage">
+    <div id="enableWrap">
+      <button id="enable" type="button">Enable microphone</button>
+      <p id="micNote">Step 1: your browser will ask to use the microphone. Choose <b>Allow</b>. Nothing is recorded until you hold the button.</p>
+    </div>
+    <div id="talkWrap">
+      <button id="talk" type="button" disabled aria-label="Hold to talk">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
+      </button>
+      <div id="talkLabel">Hold to talk</div>
+      <div class="meter" title="microphone level"><div id="level"></div></div>
+      <div class="hint" id="talkHint">Hold the button (or the <b>Ctrl</b> key), speak, release. You get <b>one result for everything you said</b>, pauses included. Click in the box below first to choose where text goes.</div>
+    </div>
+    <div class="row controls">
+      <label>Style
+        <select id="style"><option value="clean">Clean: keeps your wording</option><option value="polished">Polished: tighter points</option></select></label>
+      <label id="ctxWrap" style="display:none">App context
+        <select id="ctx">
+          <option value="general">general</option><option value="email">email</option><option value="slack_chat">slack_chat</option>
+          <option value="code_editor">code_editor</option><option value="markdown_docs">markdown_docs</option>
+        </select></label>
+      <label>Mode
+        <select id="mode"><option value="push_to_talk">hold to talk</option><option value="auto">hands-free (click Start, click Stop)</option></select></label>
+      <label id="silenceWrap" style="display:none">Finish by itself after
+        <select id="silence"><option value="3000">3 s of silence</option><option value="6000" selected>6 s of silence</option><option value="12000">12 s of silence</option><option value="0">never (I will click Stop)</option></select></label>
+      <label style="flex:1;min-width:200px">Your words (comma separated)
+        <input type="text" id="dict" placeholder="Kubernetes, Sarah Okafor, FastAPI"></label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px"><b>Your text</b><button class="small" id="clear" type="button">Clear</button></div>
+    <textarea id="doc" placeholder="Dictated text appears here, at your cursor. Type something first (for example: We need to focus on) and put the cursor at the end to check capitalization and spacing."></textarea>
+    <p class="hint">Each utterance sends up to 150 characters before and 150 after the cursor.</p>
+  </div>
+
+  <div class="panel">
+    <div class="row"><b>Last utterance</b><span id="source" class="pill">nothing yet</span></div>
+    <div class="stats" id="stats"></div>
+    <div>Heard by Whisper<pre id="raw">-</pre></div>
+    <div style="margin-top:8px">Inserted into the box (exact characters)<pre id="out">-</pre></div>
+  </div>
+
+  <div class="panel">
+    <b>Try saying</b>
+    <p class="hint" style="margin-top:2px">Speak naturally. "Result" is roughly what you should see; the model can vary a little.</p>
+    <table class="try"><thead><tr><th>Say</th><th>Result</th></tr></thead><tbody>
+      <tr><td>"We have two pending tasks. Mark it point 1, update the schema, and point 2, deploy the service."</td><td><code>We have two pending tasks:
+1. Update the schema
+2. Deploy the service</code></td></tr>
+      <tr><td>"Set the timeout to 5 seconds. Wait, no, 10 seconds."</td><td><code>Set the timeout to 10 seconds.</code></td></tr>
+      <tr><td>"How do I center a div in CSS?"</td><td><code>How do I center a div in CSS?</code> (instant: no model call)</td></tr>
+      <tr><td>"Um, so basically we we need to ship the build today, you know."</td><td><code>We need to ship the build today.</code></td></tr>
+      <tr><td>Type <i>We need to focus on</i> in the box, cursor at the end, then say "the onboarding flow."</td><td><code> the onboarding flow.</code> (lower case, joined with a space)</td></tr>
+      <tr><td>"So the point is, uh, now the point number 1 would be to build the AI inside the editor. Point number 2 is we handle the HTML rendering. And that is why it is plug and play. Point number 3 is pricing: we are three times lower. So these are the points."</td><td>One short lead-in, a numbered list, no repeated "So the point is, now the points are", the closing sentence after the list. Try <b>Polished</b> for "Label: sentence" points.</td></tr>
+    </tbody></table>
+  </div>
+
+  <div class="panel">
+    <details>
+      <summary>History <span class="pill" id="agg">-</span></summary>
+      <table style="margin-top:8px"><thead><tr><th>#</th><th>audio</th><th>whisper</th><th>model</th><th>post</th><th>total</th><th>by</th></tr></thead><tbody id="hist"></tbody></table>
+    </details>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const TARGET_RATE = 16000, PREROLL_MS = 250, POSTROLL_MS = 180, MIN_HOLD_MS = 250;
+let ws, audioCtx, micStream, recording = false, holdStart = 0, ring = [], pending = 0, connected = false, micReady = false, timer = null, recStart = 0;
+const history = [];
+let styleTouched = false;
+
+const IDLE_LABEL = () => ($("mode").value === "auto" ? "Click to start" : "Hold to talk");
+const clock = (ms) => { const s = Math.floor(ms / 1000); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+function startTimer(suffix) { recStart = performance.now(); clearInterval(timer); setLabel("Listening 0:00 " + suffix, "rec");
+  timer = setInterval(() => setLabel("Listening " + clock(performance.now() - recStart) + " " + suffix, "rec"), 250); }
+function stopTimer() { clearInterval(timer); timer = null; }
+function setConn(text, cls) { const el = $("conn"); el.textContent = text; el.className = "pill " + (cls || ""); }
+function refreshTalk() { $("talk").disabled = !(connected && micReady); }
+function setLabel(text, state) { $("talkLabel").textContent = text; $("talk").classList.toggle("rec", state === "rec"); $("talk").classList.toggle("busy", state === "busy"); }
+
+async function loadStatus() {
+  try {
+    const s = await (await fetch("/v1/voice/status")).json();
+    const ok = s.format_model_available;
+    $("model").textContent = `${s.whisper_model} + ${s.format_provider}:${s.format_model}` + (ok ? "" : " (formatter down: " + s.last_format_error + ")");
+    $("model").className = "pill " + (ok ? "ok" : "warn");
+    if (!styleTouched && s.default_style) $("style").value = s.default_style;
+    $("ctxWrap").style.display = s.app_contexts_enabled ? "flex" : "none";
+  } catch { $("model").textContent = "status unavailable"; }
+}
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/voice/stream`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { connected = true; setConn("connected", "ok"); refreshTalk(); loadStatus(); };
+  ws.onclose = () => { connected = false; recording = false; setConn("reconnecting...", "warn"); refreshTalk(); setLabel(IDLE_LABEL()); setTimeout(connect, 1500); };
+  ws.onmessage = (ev) => onFrame(JSON.parse(ev.data));
+}
+
+function caretContext() {
+  const el = $("doc"), a = el.selectionStart, b = el.selectionEnd;
+  return { preceding_text: el.value.slice(Math.max(0, a - 150), a), following_text: el.value.slice(b, b + 150) };
+}
+function startSession(rate) {
+  const words = $("dict").value.split(",").map((w) => w.trim()).filter(Boolean);
+  ws.send(JSON.stringify({ type: "start", sample_rate: rate || audioCtx.sampleRate, mode: $("mode").value, app_context: $("ctx").value, style: $("style").value,
+    cursor_context: caretContext(), custom_dictionary: words,
+    ...($("mode").value === "auto" ? { silence_ms: Number($("silence").value) } : {}) }));
+}
+
+async function initAudio() {
+  if (audioCtx) return;
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  try { audioCtx = new AudioContext({ sampleRate: TARGET_RATE }); } catch { audioCtx = new AudioContext(); }
+  const code = `class P extends AudioWorkletProcessor { process(i){ const c=i[0][0]; if(c) this.port.postMessage(c.slice(0)); return true; } }
+                registerProcessor("pcm-tap", P);`;
+  await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+  const src = audioCtx.createMediaStreamSource(micStream), tap = new AudioWorkletNode(audioCtx, "pcm-tap");
+  src.connect(tap);
+  tap.port.onmessage = (e) => onSamples(e.data);
+}
+
+async function enableMic() {
+  const note = $("micNote");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    note.className = "warn";
+    note.textContent = "This browser blocks the microphone on this address. Open the page at http://127.0.0.1:8000/v1/voice/demo or http://localhost:8000/v1/voice/demo (other http:// addresses are not allowed).";
+    return;
+  }
+  try {
+    await initAudio();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+  } catch (e) {
+    note.className = "warn";
+    note.textContent = e && e.name === "NotAllowedError"
+      ? "The microphone is blocked. Click the icon at the left of the address bar, set Microphone to Allow, then reload this page."
+      : e && e.name === "NotFoundError" ? "No microphone was found. Plug one in or pick one in your system sound settings, then reload."
+      : "Could not start the microphone: " + (e && e.message ? e.message : e);
+    return;
+  }
+  micReady = true;
+  $("enableWrap").style.display = "none"; $("talkWrap").style.display = "flex";
+  setLabel(IDLE_LABEL()); refreshTalk(); $("doc").focus();
+}
+
+function toPcm16(f32) {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) { const s = Math.max(-1, Math.min(1, f32[i])); out[i] = s < 0 ? s * 0x8000 : s * 0x7fff; }
+  return out.buffer;
+}
+let chunkBuf = [], chunkLen = 0;
+function sendChunks() {
+  if (!chunkLen || ws.readyState !== 1) { chunkBuf = []; chunkLen = 0; return; }
+  const joined = new Uint8Array(chunkLen); let o = 0; for (const c of chunkBuf) { joined.set(new Uint8Array(c), o); o += c.byteLength; }
+  ws.send(joined.buffer); chunkBuf = []; chunkLen = 0;
+}
+function onSamples(f32) {
+  let peak = 0; for (let i = 0; i < f32.length; i += 8) peak = Math.max(peak, Math.abs(f32[i]));
+  $("level").style.width = Math.min(100, peak * 140) + "%";
+  const pcm = toPcm16(f32), perMs = audioCtx.sampleRate / 1000;
+  if (!recording) {
+    if ($("mode").value === "push_to_talk") {                       // rolling pre-roll so the first syllable is not clipped
+      ring.push(pcm); let n = ring.reduce((a, b) => a + b.byteLength / 2, 0);
+      while (ring.length && n > PREROLL_MS * perMs) { n -= ring.shift().byteLength / 2; }
+    }
+    return;                                                         // nothing is sent until a session has started
+  }
+  chunkBuf.push(pcm); chunkLen += pcm.byteLength;
+  if (chunkLen >= 3200) sendChunks();                               // ~100 ms per WebSocket frame
+}
+
+function press() {
+  if (!micReady) { enableMic(); return; }
+  if (recording || !connected) return;
+  if ($("mode").value === "auto") { startSession(); recording = true; startTimer("- click to finish"); return; }
+  holdStart = performance.now(); recording = true; startTimer("- release to finish");
+  startSession();
+  for (const c of ring) ws.send(c); ring = [];
+}
+function release() {
+  if (!recording || $("mode").value === "auto") return;
+  recording = false; stopTimer(); setLabel("Processing...", "busy");
+  const held = performance.now() - holdStart;
+  setTimeout(() => {                                               // keep the tail of the last word
+    sendChunks();
+    if (held < MIN_HOLD_MS) { ws.send(JSON.stringify({ type: "cancel" })); stopTimer(); setLabel(IDLE_LABEL()); return; }
+    pending++; ws.send(JSON.stringify({ type: "end" })); $("source").textContent = "processing..."; $("source").className = "pill";
+  }, POSTROLL_MS);
+}
+function cancelRecording() {                                       // e.g. Ctrl was held for a shortcut such as Ctrl+C
+  if (!recording || $("mode").value === "auto") return;
+  recording = false; stopTimer(); chunkBuf = []; chunkLen = 0; ws.send(JSON.stringify({ type: "cancel" })); setLabel(IDLE_LABEL());
+}
+function stopAuto() { recording = false; stopTimer(); sendChunks(); ws.send(JSON.stringify({ type: "end" })); pending++; setLabel("Processing...", "busy"); $("source").textContent = "processing..."; $("source").className = "pill"; }
+
+function insertAtCaret(text) {
+  const el = $("doc"), a = el.selectionStart, b = el.selectionEnd;
+  el.value = el.value.slice(0, a) + text + el.value.slice(b);
+  el.selectionStart = el.selectionEnd = a + text.length; el.focus();
+}
+const pct = (arr, p) => { const s = [...arr].sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.ceil(p * s.length) - 1)] : 0; };
+
+function onFrame(f) {
+  if (f.type === "error") { $("source").textContent = "error: " + f.message; $("source").className = "pill warn"; pending = Math.max(0, pending - 1); if (!recording) setLabel(IDLE_LABEL()); return; }
+  if (f.type === "notice") { $("source").textContent = f.message; $("source").className = "pill warn"; return; }
+  if (f.type === "speech_start") return;
+  if (f.type !== "final") return;
+  pending = Math.max(0, pending - 1);
+  if (recording) { recording = false; chunkBuf = []; chunkLen = 0; }       // hands-free: the silence limit ended the dictation
+  stopTimer(); setLabel(IDLE_LABEL());
+  const t = f.timings;
+  $("raw").textContent = f.raw_text || "(no speech detected)";
+  $("out").textContent = f.formatted_text ? JSON.stringify(f.formatted_text) : "-";
+  $("source").textContent = f.source === "llm" ? "formatted by the model" + (f.fallback_reason ? " (" + f.fallback_reason + ")" : "") : f.source === "fast" ? "fast path (plain sentence, no model call)" : "rules fallback" + (f.fallback_reason ? ": " + f.fallback_reason : "");
+  $("source").className = "pill " + (f.source === "rules" ? "warn" : "ok");
+  const cells = [["audio", t.audio_ms], ["Whisper", t.asr_ms], ["model", t.llm_ms], ["post", t.post_ms], ["total", t.total_ms]];
+  $("stats").innerHTML = cells.map(([k, v]) => `<div class="stat"><b>${Math.round(v)} ms</b><span>${k}</span></div>`).join("");
+  if (f.formatted_text) {
+    insertAtCaret(f.formatted_text);
+    history.push({ ...t, by: f.source === "llm" ? "model" : f.source });
+    $("hist").innerHTML = history.slice(-20).reverse().map((h, i) => `<tr><td>${history.length - i}</td><td>${Math.round(h.audio_ms)}</td><td>${Math.round(h.asr_ms)}</td><td>${Math.round(h.llm_ms)}</td><td>${h.post_ms.toFixed(2)}</td><td><b>${Math.round(h.total_ms)}</b></td><td>${h.by}</td></tr>`).join("");
+    const totals = history.map((h) => h.total_ms);
+    $("agg").textContent = `n=${totals.length}  p50 ${Math.round(pct(totals, .5))} ms  p95 ${Math.round(pct(totals, .95))} ms`;
+  }
+}
+
+const talk = $("talk");
+talk.addEventListener("pointerdown", (e) => { e.preventDefault(); if ($("mode").value === "auto" && recording) stopAuto(); else press(); });
+talk.addEventListener("pointerup", release); talk.addEventListener("pointerleave", release); talk.addEventListener("pointercancel", release);
+let ctrlDown = false;
+addEventListener("keydown", (e) => {
+  if (e.key === "Control") { if (!e.repeat && !ctrlDown) { ctrlDown = true; press(); } }
+  else if (ctrlDown) cancelRecording();                             // Ctrl+C, Ctrl+V ... are shortcuts, not dictation
+});
+addEventListener("keyup", (e) => { if (e.key === "Control") { ctrlDown = false; release(); } });
+addEventListener("blur", () => { ctrlDown = false; release(); });
+$("enable").addEventListener("click", enableMic);
+$("style").addEventListener("change", () => { styleTouched = true; });
+$("clear").addEventListener("click", () => { $("doc").value = ""; $("doc").focus(); });
+$("mode").addEventListener("change", () => {
+  const auto = $("mode").value === "auto"; $("silenceWrap").style.display = auto ? "flex" : "none";
+  $("talkHint").innerHTML = auto ? "Click the button to start, talk as long as you like (pauses are fine), then click it again to finish. You get <b>one result for the whole dictation</b>."
+    : "Hold the button (or the <b>Ctrl</b> key), speak, release. You get <b>one result for everything you said</b>, pauses included. Click in the box below first to choose where text goes.";
+  if (!recording) setLabel(IDLE_LABEL());
+});
+
+window.__voiceDemo = { sendPcm(int16, rate) { startSession(rate || 16000); ws.send(int16.buffer); ws.send(JSON.stringify({ type: "end" })); pending++; } };   // test hook
+connect();
+</script>
+</body>
+</html>
