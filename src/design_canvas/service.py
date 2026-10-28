@@ -175,6 +175,33 @@ async def execute_design_canvas_harness(
         if not domain_errors:
             _record(attempt, "pass", [])
             return candidate_ast  # ✅ Clean pass — return immediately
+
+        # Deterministic domain auto-heal:
+        # If the domain errors only contain deterministic violations (WCAG contrast, duplicate IDs,
+        # max depth, SVG forbidden attributes), heal them in code without wasting an expensive LLM round-trip.
+        deterministic_prefixes = (
+            "WCAG_LOW_CONTRAST",
+            "DUPLICATE_NODE_ID",
+            "DUPLICATE_LAYER_ID",
+            "MAX_DEPTH_EXCEEDED",
+            "SVG_FORBIDDEN_ATTR",
+        )
+        if all(any(err.startswith(prefix) for prefix in deterministic_prefixes) for err in domain_errors):
+            healed = auto_heal_design_ast(
+                candidate_ast,
+                vision_meta=vision_meta,
+                existing_ast_json=existing_ast_json,
+            )
+            healed_errors = validate_design_ast(
+                healed,
+                vision_meta=vision_meta,
+                existing_ast_json=existing_ast_json,
+            )
+            if not healed_errors:
+                report["auto_healed"] = True
+                _record(attempt, "pass_auto_healed", domain_errors)
+                return healed
+
         _record(attempt, "domain_errors", domain_errors)
 
         conversation.append({"role": "assistant", "content": clean_json})

@@ -456,3 +456,39 @@ class TestAskAnythingGoldenFixture:
         layer_ids = {layer.layer_id for layer in vi.layers}  # type: ignore[union-attr]
         assert "layer_a" in layer_ids
         assert "layer_b" in layer_ids
+
+    @pytest.mark.asyncio
+    async def test_deterministic_domain_errors_auto_healed_without_llm_retry(self):
+        """Purely deterministic errors (contrast, duplicate ID) heal in code on attempt 0 without LLM retry."""
+        from src.design_canvas.service import execute_design_canvas_harness
+        from src.design_canvas.validate import validate_design_ast
+
+        bad_ast = json.loads(json.dumps(_VALID_AST_DICT))
+        # Add a low-contrast text span and a duplicate ID
+        bad_ast["root"]["style"] = {"background_color": "#000000"}
+        bad_ast["root"]["children"][0]["spans"][0]["color"] = "#111111"  # low contrast
+        bad_ast["root"]["children"].append({
+            "node_type": "text",
+            "id": "hero_title",  # duplicate ID
+            "tag": "p",
+            "spans": [{"text": "Second", "color": "#FFFFFF"}],
+        })
+
+        calls = []
+
+        async def _run(messages, image_bytes=None, temperature=0.2):
+            calls.append(messages)
+            return json.dumps(bad_ast)
+
+        runner = AsyncMock()
+        runner.run_json_completion = _run
+
+        report = {}
+        result = await execute_design_canvas_harness(
+            runner, "design a card", "create_from_prompt", max_repair_attempts=2, report=report
+        )
+        assert isinstance(result, DesignDocumentAST)
+        assert validate_design_ast(result) == []
+        # Runner was only called ONCE: no wasteful LLM retry was performed!
+        assert len(calls) == 1
+        assert report.get("auto_healed") is True

@@ -3036,9 +3036,11 @@ def _get_cached_gemini_client(api_key: str):
     return _get_cached_client(cache_key, lambda: genai.Client(api_key=api_key))
 
 
-_DESIGN_MAX_OUTPUT_TOKENS = 4096
+_DESIGN_MAX_OUTPUT_TOKENS = 8192
 _DESIGN_IMAGE_FORMATS = ("PNG", "JPEG", "WEBP")   # accepted as-is by Claude, OpenAI and Gemini alike
 _DESIGN_ABORT_POLL_SECONDS = 0.1
+MAX_DESIGN_IMAGE_DIMENSION = 1500
+MAX_DESIGN_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB pre-decode ceiling
 
 
 def _design_reference_image(image_bytes: bytes) -> bytes:
@@ -3046,16 +3048,34 @@ def _design_reference_image(image_bytes: bytes) -> bytes:
     The design screenshot in a format every design provider accepts: PNG, JPEG and WebP as sent, anything else
     Pillow can read (GIF, BMP, TIFF, ...) re-encoded as PNG. Bytes that are not a readable image are refused rather
     than sent under a made-up media type.
+    Large images exceeding MAX_DESIGN_IMAGE_DIMENSION are downscaled preserving aspect ratio and EXIF-transposed.
     """
     import io
-    from PIL import Image
+    from PIL import Image, ImageOps
     from .s3_service import convert_image_format
+
+    if len(image_bytes) > MAX_DESIGN_IMAGE_BYTES:
+        raise ValueError(f"reference image exceeds maximum size of {MAX_DESIGN_IMAGE_BYTES // (1024 * 1024)}MB")
 
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
             fmt = img.format
+            w, h = img.size
+
+            if max(w, h) > MAX_DESIGN_IMAGE_DIMENSION:
+                img = ImageOps.exif_transpose(img)
+                scale = MAX_DESIGN_IMAGE_DIMENSION / max(w, h)
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                resample = getattr(Image, "Resampling", Image).LANCZOS
+                img = img.resize((new_w, new_h), resample=resample)
+                out_buf = io.BytesIO()
+                save_fmt = fmt if fmt in _DESIGN_IMAGE_FORMATS else "PNG"
+                img.save(out_buf, format=save_fmt)
+                return out_buf.getvalue()
     except Exception as err:
         raise ValueError(f"not a readable image ({err})") from err
+
     if fmt in _DESIGN_IMAGE_FORMATS:
         return image_bytes
     converted, content_type, _ = convert_image_format(image_bytes, "png")
@@ -3129,6 +3149,9 @@ def _run_design_json_completion(
             max_tokens=_DESIGN_MAX_OUTPUT_TOKENS,
             temperature=temperature,
         )
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            logger.warning(f"{log_prefix}Claude design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
+            raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
         usage = getattr(resp, "usage", None)
         _record_design_usage(request_id, model_id, usage and (
             (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
@@ -3163,9 +3186,16 @@ def _run_design_json_completion(
         if provider == "openai":
             kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
-        usage = getattr(resp, "usage", None)
-        _record_design_usage(request_id, model_id, usage and usage.prompt_tokens, usage and usage.completion_tokens)
-        return resp.choices[0].message.content or ""
+        choices = getattr(resp, "choices", None)
+        if choices:
+            choice = choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                logger.warning(f"{log_prefix}{provider} design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
+                raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
+            usage = getattr(resp, "usage", None)
+            _record_design_usage(request_id, model_id, usage and usage.prompt_tokens, usage and usage.completion_tokens)
+            return choice.message.content or ""
+        return ""
 
     elif provider == "gemini":
         from google.genai import types
@@ -3192,13 +3222,20 @@ def _run_design_json_completion(
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt if system_prompt else None,
                 temperature=temperature,
+                max_output_tokens=_DESIGN_MAX_OUTPUT_TOKENS,
                 response_mime_type="application/json",
             ),
         )
+        candidates = getattr(resp, "candidates", None)
+        if candidates:
+            finish = str(getattr(candidates[0], "finish_reason", ""))
+            if "MAX_TOKENS" in finish.upper():
+                logger.warning(f"{log_prefix}Gemini design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
+                raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
         usage = getattr(resp, "usage_metadata", None)
         _record_design_usage(request_id, model_id, usage and usage.prompt_token_count,
                              usage and usage.candidates_token_count)
-        return resp.text or ""
+        return getattr(resp, "text", "") or ""
 
     raise ValueError(f"Unsupported provider for design canvas: {provider}")
 

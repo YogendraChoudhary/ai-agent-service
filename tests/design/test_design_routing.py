@@ -287,6 +287,56 @@ class TestReferenceScreenshot:
         _stream("Recreate this UI as an editable design", image_urls=[REFERENCE_URL])
         assert edges["images"][0].startswith(b"\x89PNG\r\n\x1a\n")
 
+    def test_oversized_images_are_downscaled_to_max_dimension(self):
+        import io
+        from PIL import Image
+        from src.text_processing_agent import _design_reference_image, MAX_DESIGN_IMAGE_DIMENSION
+
+        # Create a 3000x2000 image
+        img = Image.new("RGB", (3000, 2000), color=(100, 150, 200))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        raw_bytes = buf.getvalue()
+
+        processed = _design_reference_image(raw_bytes)
+        with Image.open(io.BytesIO(processed)) as out_img:
+            w, h = out_img.size
+            assert max(w, h) == MAX_DESIGN_IMAGE_DIMENSION
+            assert w == 1500 and h == 1000
+
+
+class TestTruncationDetection:
+    def test_claude_truncation_raises(self, monkeypatch):
+        class _Client:
+            class messages:
+                @staticmethod
+                def create(**kwargs):
+                    return type("Resp", (), {"stop_reason": "max_tokens", "content": [type("C", (), {"text": "{"})()]})()
+        monkeypatch.setattr(tpa, "_get_cached_anthropic_client", lambda *a, **k: _Client())
+        with pytest.raises(ValueError, match="Design output truncated"):
+            tpa._run_design_json_completion([{"role": "user", "content": "hi"}], None, 0.2, "claude", "key")
+
+    def test_openai_truncation_raises(self, monkeypatch):
+        class _Client:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(**kwargs):
+                        return type("Resp", (), {"choices": [type("Choice", (), {"finish_reason": "length", "message": type("M", (), {"content": "{"})()})]})()
+        monkeypatch.setattr(tpa, "_get_cached_openai_client", lambda *a, **k: _Client())
+        with pytest.raises(ValueError, match="Design output truncated"):
+            tpa._run_design_json_completion([{"role": "user", "content": "hi"}], None, 0.2, "openai", "key")
+
+    def test_gemini_truncation_raises(self, monkeypatch):
+        class _Client:
+            class models:
+                @staticmethod
+                def generate_content(**kwargs):
+                    return type("Resp", (), {"candidates": [type("Cand", (), {"finish_reason": "MAX_TOKENS"})()], "text": "{"})()
+        monkeypatch.setattr(tpa, "_get_cached_gemini_client", lambda *a, **k: _Client())
+        with pytest.raises(ValueError, match="Design output truncated"):
+            tpa._run_design_json_completion([{"role": "user", "content": "hi"}], None, 0.2, "gemini", "key")
+
 
 class _Recorder:
     """A stand-in SDK client: records the request and returns an empty JSON object."""
