@@ -20,7 +20,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple
 
 from config import settings
-from src.models import AUTOCOMPLETE_MODEL_IDS
+from src.models import AUTOCOMPLETE_MODEL_IDS, ensure_allowed_model
 from src.voice_flow.formatter.claims import CLEAN_KINDS, POLISHED_KINDS, missing_claims
 from src.voice_flow.formatter.gate import needs_model
 from src.voice_flow.formatter.patterns import GREETING_DETECT_RE
@@ -165,9 +165,10 @@ class OpenAIBackend:
     _KNOWN_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5")
     _no_temperature_models: Set[str] = set()
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None):
         self.api_key = api_key or settings.default_openai_api_key
         self.model = model or settings.voice_format_model or AUTOCOMPLETE_MODEL_IDS["openai"]
+        self.base_url = base_url
         self._client = None
         self._effort_variant = 0         # reasoning models: ask for "minimal" reasoning, fall back to the default on a 400
 
@@ -183,7 +184,7 @@ class OpenAIBackend:
             if not self.api_key:
                 raise LlmError("no OpenAI API key (DEFAULT_OPENAI_API_KEY)", permanent=True)
             from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(api_key=self.api_key, max_retries=0)    # a retry inside the SDK would hide a slow call
+            self._client = AsyncOpenAI(api_key=self.api_key, max_retries=0, base_url=self.base_url)
         return self._client
 
     async def generate(self, system: str, turns: Turns, *, max_output_tokens: int, timeout: float) -> str:
@@ -192,7 +193,8 @@ class OpenAIBackend:
         messages = to_openai_messages(system, turns)
         deadline = time.monotonic() + timeout
         while True:
-            params: Dict[str, Any] = {"model": self.model, "messages": messages, "max_completion_tokens": max_output_tokens}
+            token_param = "max_tokens" if self.base_url else "max_completion_tokens"
+            params: Dict[str, Any] = {"model": self.model, "messages": messages, token_param: max_output_tokens}
             if self._reasons and self._effort_variant == 0:
                 params["reasoning_effort"] = "minimal"
             if self._supports_temperature():
@@ -212,9 +214,9 @@ class OpenAIBackend:
                     self._effort_variant = 1          # this model does not take "minimal"; remembered
                     continue
                 quota = code == 429 and "insufficient_quota" in detail
-                raise LlmError(f"openai {code}", permanent=code in PERMANENT_CODES or quota) from None
+                raise LlmError(f"{self.name} {code}", permanent=code in PERMANENT_CODES or quota) from None
             except openai.APIConnectionError:
-                raise LlmError("openai connection error") from None
+                raise LlmError(f"{self.name} connection error") from None
             break
 
         choice = response.choices[0]
@@ -233,6 +235,47 @@ class OpenAIBackend:
 
 def build_backend() -> "LlmBackend":
     return OpenAIBackend() if settings.voice_format_provider == "openai" else GeminiBackend()
+
+
+class ClaudeBackend:
+    name = "claude"
+
+    def __init__(self, api_key: str, model: str):
+        self.api_key, self.model = api_key, model
+        self._client = None
+
+    async def generate(self, system: str, turns: Turns, *, max_output_tokens: int, timeout: float) -> str:
+        import anthropic
+        if self._client is None:
+            self._client = anthropic.AsyncAnthropic(api_key=self.api_key, max_retries=0)
+        try:
+            response = await self._client.messages.create(
+                model=self.model, system=system, messages=turns, max_tokens=max_output_tokens, temperature=0, timeout=timeout)
+        except anthropic.APIStatusError as exc:
+            raise LlmError(f"claude {exc.status_code}", permanent=exc.status_code in PERMANENT_CODES) from None
+        except anthropic.APIConnectionError:
+            raise LlmError("claude connection error") from None
+        if response.stop_reason == "max_tokens":
+            raise LlmError("truncated at max_output_tokens")
+        text = "".join(block.text for block in response.content if block.type == "text").strip()
+        if not text:
+            raise LlmError("empty response")
+        return text
+
+
+def build_backend_for(provider: str, api_key: str) -> "LlmBackend":
+    """BYOK always uses the provider's light model and an explicit personal key."""
+    if not api_key or not api_key.strip():
+        raise ValueError("A personal API key is required")
+    model = ensure_allowed_model(AUTOCOMPLETE_MODEL_IDS[provider])
+    if provider == "gemini":
+        return GeminiBackend(api_key=api_key, model=model)
+    if provider == "claude":
+        return ClaudeBackend(api_key, model)
+    from src.text_processing_agent import OPENAI_COMPATIBLE_BASES
+    backend = OpenAIBackend(api_key=api_key, model=model, base_url=OPENAI_COMPATIBLE_BASES.get(provider))
+    backend.name = provider
+    return backend
 
 
 # ---------------------------------------------------------------------------

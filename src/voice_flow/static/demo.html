@@ -52,7 +52,7 @@
 <main>
   <header>
     <h1>Voice Flow test</h1>
-    <span id="conn" class="pill">connecting</span>
+    <span id="conn" class="pill">checking server</span>
     <span id="model" class="pill">model: ...</span>
   </header>
   <p class="sub">Local Whisper hears you; a small cloud model formats it. Text lands where your cursor is in the box below.</p>
@@ -68,7 +68,7 @@
       </button>
       <div id="talkLabel">Hold to talk</div>
       <div class="meter" title="microphone level"><div id="level"></div></div>
-      <div class="hint" id="talkHint">Hold the button (or the <b>Ctrl</b> key), speak, release. You get <b>one result for everything you said</b>, pauses included. Click in the box below first to choose where text goes.</div>
+      <div class="hint" id="talkHint">Hold the button (or the <b>Ctrl</b> key), speak, release. The recording is uploaded once and you get <b>one result for everything you said</b>, pauses included. Click in the box below first to choose where text goes.</div>
     </div>
     <div class="row controls">
       <label>Style
@@ -79,9 +79,7 @@
           <option value="code_editor">code_editor</option><option value="markdown_docs">markdown_docs</option>
         </select></label>
       <label>Mode
-        <select id="mode"><option value="push_to_talk">hold to talk</option><option value="auto">hands-free (click Start, click Stop)</option></select></label>
-      <label id="silenceWrap" style="display:none">Finish by itself after
-        <select id="silence"><option value="3000">3 s of silence</option><option value="6000" selected>6 s of silence</option><option value="12000">12 s of silence</option><option value="0">never (I will click Stop)</option></select></label>
+        <select id="mode"><option value="hold">hold to talk</option><option value="toggle">click to start, click to stop</option></select></label>
       <label style="flex:1;min-width:200px">Your words (comma separated)
         <input type="text" id="dict" placeholder="Kubernetes, Sarah Okafor, FastAPI"></label>
     </div>
@@ -118,80 +116,79 @@
   <div class="panel">
     <details>
       <summary>History <span class="pill" id="agg">-</span></summary>
-      <table style="margin-top:8px"><thead><tr><th>#</th><th>audio</th><th>whisper</th><th>model</th><th>post</th><th>total</th><th>by</th></tr></thead><tbody id="hist"></tbody></table>
+      <table style="margin-top:8px"><thead><tr><th>#</th><th>audio</th><th>whisper</th><th>model</th><th>post</th><th>server</th><th>round trip</th><th>by</th></tr></thead><tbody id="hist"></tbody></table>
     </details>
   </div>
 </main>
 
 <script>
 "use strict";
+// Reference client for POST /v1/voice/dictate: MediaRecorder -> one multipart upload (audio + JSON context) -> one JSON result.
 const $ = (id) => document.getElementById(id);
-const TARGET_RATE = 16000, PREROLL_MS = 250, POSTROLL_MS = 180, MIN_HOLD_MS = 250;
-let ws, audioCtx, micStream, recording = false, holdStart = 0, ring = [], pending = 0, connected = false, micReady = false, timer = null, recStart = 0;
+const POSTROLL_MS = 180, MIN_HOLD_MS = 250;
+let micStream, recorder, chunks = [], mime = "", recording = false, holdStart = 0, micReady = false, timer = null, recStart = 0;
+let sessionCtx = null, chain = Promise.resolve(), pending = 0;
 const history = [];
 let styleTouched = false;
 
-const IDLE_LABEL = () => ($("mode").value === "auto" ? "Click to start" : "Hold to talk");
+const MODE = () => $("mode").value;                                  // "hold" | "toggle"
+const IDLE_LABEL = () => (MODE() === "toggle" ? "Click to start" : "Hold to talk");
 const clock = (ms) => { const s = Math.floor(ms / 1000); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 function startTimer(suffix) { recStart = performance.now(); clearInterval(timer); setLabel("Listening 0:00 " + suffix, "rec");
   timer = setInterval(() => setLabel("Listening " + clock(performance.now() - recStart) + " " + suffix, "rec"), 250); }
 function stopTimer() { clearInterval(timer); timer = null; }
 function setConn(text, cls) { const el = $("conn"); el.textContent = text; el.className = "pill " + (cls || ""); }
-function refreshTalk() { $("talk").disabled = !(connected && micReady); }
 function setLabel(text, state) { $("talkLabel").textContent = text; $("talk").classList.toggle("rec", state === "rec"); $("talk").classList.toggle("busy", state === "busy"); }
+function setSource(text, cls) { $("source").textContent = text; $("source").className = "pill " + (cls || ""); }
 
 async function loadStatus() {
   try {
     const s = await (await fetch("/v1/voice/status")).json();
     const ok = s.format_model_available;
+    setConn("server ready", "ok");
     $("model").textContent = `${s.whisper_model} + ${s.format_provider}:${s.format_model}` + (ok ? "" : " (formatter down: " + s.last_format_error + ")");
     $("model").className = "pill " + (ok ? "ok" : "warn");
     if (!styleTouched && s.default_style) $("style").value = s.default_style;
     $("ctxWrap").style.display = s.app_contexts_enabled ? "flex" : "none";
-  } catch { $("model").textContent = "status unavailable"; }
+  } catch { setConn("server unreachable", "warn"); $("model").textContent = "status unavailable"; }
 }
 
-function connect() {
-  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/voice/stream`);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => { connected = true; setConn("connected", "ok"); refreshTalk(); loadStatus(); };
-  ws.onclose = () => { connected = false; recording = false; setConn("reconnecting...", "warn"); refreshTalk(); setLabel(IDLE_LABEL()); setTimeout(connect, 1500); };
-  ws.onmessage = (ev) => onFrame(JSON.parse(ev.data));
+function pickMime() {
+  if (!window.MediaRecorder) return "";
+  return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
 }
+const extension = (type) => (type.includes("mp4") ? "m4a" : type.includes("ogg") ? "ogg" : "webm");
 
 function caretContext() {
   const el = $("doc"), a = el.selectionStart, b = el.selectionEnd;
   return { preceding_text: el.value.slice(Math.max(0, a - 150), a), following_text: el.value.slice(b, b + 150) };
 }
-function startSession(rate) {
+function buildContext() {                                            // read when the user starts speaking: that is where the text should land
   const words = $("dict").value.split(",").map((w) => w.trim()).filter(Boolean);
-  ws.send(JSON.stringify({ type: "start", sample_rate: rate || audioCtx.sampleRate, mode: $("mode").value, app_context: $("ctx").value, style: $("style").value,
-    cursor_context: caretContext(), custom_dictionary: words,
-    ...($("mode").value === "auto" ? { silence_ms: Number($("silence").value) } : {}) }));
+  return { app_context: $("ctx").value, style: $("style").value, cursor_context: caretContext(), custom_dictionary: words };
 }
 
-async function initAudio() {
-  if (audioCtx) return;
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
-  try { audioCtx = new AudioContext({ sampleRate: TARGET_RATE }); } catch { audioCtx = new AudioContext(); }
-  const code = `class P extends AudioWorkletProcessor { process(i){ const c=i[0][0]; if(c) this.port.postMessage(c.slice(0)); return true; } }
-                registerProcessor("pcm-tap", P);`;
-  await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
-  const src = audioCtx.createMediaStreamSource(micStream), tap = new AudioWorkletNode(audioCtx, "pcm-tap");
-  src.connect(tap);
-  tap.port.onmessage = (e) => onSamples(e.data);
+function startMeter(stream) {
+  const ctx = new AudioContext(), analyser = ctx.createAnalyser();
+  analyser.fftSize = 512; ctx.createMediaStreamSource(stream).connect(analyser);
+  const buf = new Uint8Array(analyser.fftSize);
+  setInterval(() => { analyser.getByteTimeDomainData(buf); let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $("level").style.width = Math.min(100, (peak / 128) * 140) + "%"; }, 50);
+  if (ctx.state === "suspended") ctx.resume();
 }
 
 async function enableMic() {
   const note = $("micNote");
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     note.className = "warn";
-    note.textContent = "This browser blocks the microphone on this address. Open the page at http://127.0.0.1:8000/v1/voice/demo or http://localhost:8000/v1/voice/demo (other http:// addresses are not allowed).";
+    note.textContent = "This browser blocks the microphone on this address. Open the page at http://127.0.0.1:8000/ or http://localhost:8000/ (other http:// addresses are not allowed).";
     return;
   }
+  if (!window.MediaRecorder) { note.className = "warn"; note.textContent = "This browser has no MediaRecorder. Use a current Chrome, Edge, Firefox or Safari."; return; }
   try {
-    await initAudio();
-    if (audioCtx.state === "suspended") await audioCtx.resume();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    mime = pickMime();
+    startMeter(micStream);
   } catch (e) {
     note.className = "warn";
     note.textContent = e && e.name === "NotAllowedError"
@@ -202,58 +199,56 @@ async function enableMic() {
   }
   micReady = true;
   $("enableWrap").style.display = "none"; $("talkWrap").style.display = "flex";
-  setLabel(IDLE_LABEL()); refreshTalk(); $("doc").focus();
+  $("talk").disabled = false; setLabel(IDLE_LABEL()); $("doc").focus();
 }
 
-function toPcm16(f32) {
-  const out = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) { const s = Math.max(-1, Math.min(1, f32[i])); out[i] = s < 0 ? s * 0x8000 : s * 0x7fff; }
-  return out.buffer;
+function startRecording() {
+  chunks = [];
+  recorder = new MediaRecorder(micStream, mime ? { mimeType: mime } : undefined);
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.start();
 }
-let chunkBuf = [], chunkLen = 0;
-function sendChunks() {
-  if (!chunkLen || ws.readyState !== 1) { chunkBuf = []; chunkLen = 0; return; }
-  const joined = new Uint8Array(chunkLen); let o = 0; for (const c of chunkBuf) { joined.set(new Uint8Array(c), o); o += c.byteLength; }
-  ws.send(joined.buffer); chunkBuf = []; chunkLen = 0;
-}
-function onSamples(f32) {
-  let peak = 0; for (let i = 0; i < f32.length; i += 8) peak = Math.max(peak, Math.abs(f32[i]));
-  $("level").style.width = Math.min(100, peak * 140) + "%";
-  const pcm = toPcm16(f32), perMs = audioCtx.sampleRate / 1000;
-  if (!recording) {
-    if ($("mode").value === "push_to_talk") {                       // rolling pre-roll so the first syllable is not clipped
-      ring.push(pcm); let n = ring.reduce((a, b) => a + b.byteLength / 2, 0);
-      while (ring.length && n > PREROLL_MS * perMs) { n -= ring.shift().byteLength / 2; }
-    }
-    return;                                                         // nothing is sent until a session has started
-  }
-  chunkBuf.push(pcm); chunkLen += pcm.byteLength;
-  if (chunkLen >= 3200) sendChunks();                               // ~100 ms per WebSocket frame
+function stopRecording() {                                           // resolves with the whole recording once the recorder has flushed
+  return new Promise((resolve) => {
+    recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType || mime }));
+    recorder.stop();
+  });
 }
 
 function press() {
   if (!micReady) { enableMic(); return; }
-  if (recording || !connected) return;
-  if ($("mode").value === "auto") { startSession(); recording = true; startTimer("- click to finish"); return; }
-  holdStart = performance.now(); recording = true; startTimer("- release to finish");
-  startSession();
-  for (const c of ring) ws.send(c); ring = [];
+  if (recording) return;
+  recording = true; holdStart = performance.now(); sessionCtx = buildContext();
+  startRecording();
+  startTimer(MODE() === "toggle" ? "- click to finish" : "- release to finish");
 }
-function release() {
-  if (!recording || $("mode").value === "auto") return;
+async function finish() {
   recording = false; stopTimer(); setLabel("Processing...", "busy");
-  const held = performance.now() - holdStart;
-  setTimeout(() => {                                               // keep the tail of the last word
-    sendChunks();
-    if (held < MIN_HOLD_MS) { ws.send(JSON.stringify({ type: "cancel" })); stopTimer(); setLabel(IDLE_LABEL()); return; }
-    pending++; ws.send(JSON.stringify({ type: "end" })); $("source").textContent = "processing..."; $("source").className = "pill";
-  }, POSTROLL_MS);
+  const held = performance.now() - holdStart, ctx = sessionCtx;
+  await new Promise((r) => setTimeout(r, POSTROLL_MS));              // keep the tail of the last word
+  const blob = await stopRecording();
+  if (held < MIN_HOLD_MS) { setLabel(pending ? "Processing..." : IDLE_LABEL(), pending ? "busy" : ""); return; }   // a bounce, not speech
+  upload(blob, ctx);
 }
-function cancelRecording() {                                       // e.g. Ctrl was held for a shortcut such as Ctrl+C
-  if (!recording || $("mode").value === "auto") return;
-  recording = false; stopTimer(); chunkBuf = []; chunkLen = 0; ws.send(JSON.stringify({ type: "cancel" })); setLabel(IDLE_LABEL());
+function release() { if (recording && MODE() === "hold") finish(); }
+function cancelRecording() {                                         // e.g. Ctrl was held for a shortcut such as Ctrl+C
+  if (!recording || MODE() === "toggle") return;
+  recording = false; stopTimer(); try { recorder.stop(); } catch {} chunks = []; setLabel(IDLE_LABEL());
 }
-function stopAuto() { recording = false; stopTimer(); sendChunks(); ws.send(JSON.stringify({ type: "end" })); pending++; setLabel("Processing...", "busy"); $("source").textContent = "processing..."; $("source").className = "pill"; }
+
+function upload(blob, ctx) {
+  pending++; setSource("processing...");
+  const t0 = performance.now(), form = new FormData();
+  form.append("audio", blob, "dictation." + extension(blob.type));
+  form.append("context", JSON.stringify(ctx));
+  const request = fetch("/v1/voice/dictate", { method: "POST", body: form }).then(async (r) => {
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || body.detail || "HTTP " + r.status);
+    return { body, roundTrip: performance.now() - t0, kb: blob.size / 1024 };
+  });
+  request.catch(() => {});
+  chain = chain.then(() => request).then(show, fail);                // uploads may overlap; results are shown in the order they were recorded
+}
 
 function insertAtCaret(text) {
   const el = $("doc"), a = el.selectionStart, b = el.selectionEnd;
@@ -262,37 +257,34 @@ function insertAtCaret(text) {
 }
 const pct = (arr, p) => { const s = [...arr].sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.ceil(p * s.length) - 1)] : 0; };
 
-function onFrame(f) {
-  if (f.type === "error") { $("source").textContent = "error: " + f.message; $("source").className = "pill warn"; pending = Math.max(0, pending - 1); if (!recording) setLabel(IDLE_LABEL()); return; }
-  if (f.type === "notice") { $("source").textContent = f.message; $("source").className = "pill warn"; return; }
-  if (f.type === "speech_start") return;
-  if (f.type !== "final") return;
-  pending = Math.max(0, pending - 1);
-  if (recording) { recording = false; chunkBuf = []; chunkLen = 0; }       // hands-free: the silence limit ended the dictation
-  stopTimer(); setLabel(IDLE_LABEL());
+function idleIfDone() { pending = Math.max(0, pending - 1); if (!recording && !pending) setLabel(IDLE_LABEL()); }
+function fail(e) { idleIfDone(); setSource("error: " + e.message, "warn"); loadStatus(); }
+function show({ body: f, roundTrip, kb }) {
+  idleIfDone();
   const t = f.timings;
   $("raw").textContent = f.raw_text || "(no speech detected)";
   $("out").textContent = f.formatted_text ? JSON.stringify(f.formatted_text) : "-";
-  $("source").textContent = f.source === "llm" ? "formatted by the model" + (f.fallback_reason ? " (" + f.fallback_reason + ")" : "") : f.source === "fast" ? "fast path (plain sentence, no model call)" : "rules fallback" + (f.fallback_reason ? ": " + f.fallback_reason : "");
-  $("source").className = "pill " + (f.source === "rules" ? "warn" : "ok");
-  const cells = [["audio", t.audio_ms], ["Whisper", t.asr_ms], ["model", t.llm_ms], ["post", t.post_ms], ["total", t.total_ms]];
-  $("stats").innerHTML = cells.map(([k, v]) => `<div class="stat"><b>${Math.round(v)} ms</b><span>${k}</span></div>`).join("");
+  setSource(f.source === "llm" ? "formatted by the model" + (f.fallback_reason ? " (" + f.fallback_reason + ")" : "") : f.source === "fast" ? "fast path (plain sentence, no model call)" : "rules fallback" + (f.fallback_reason ? ": " + f.fallback_reason : ""),
+            f.source === "rules" ? "warn" : "ok");
+  const cells = [["audio", t.audio_ms], ["Whisper", t.asr_ms], ["model", t.llm_ms], ["post", t.post_ms], ["server total", t.total_ms], ["round trip", roundTrip]];
+  $("stats").innerHTML = cells.map(([k, v]) => `<div class="stat"><b>${Math.round(v)} ms</b><span>${k}</span></div>`).join("")
+    + `<div class="stat"><b>${kb.toFixed(0)} KB</b><span>uploaded</span></div>`;
   if (f.formatted_text) {
     insertAtCaret(f.formatted_text);
-    history.push({ ...t, by: f.source === "llm" ? "model" : f.source });
-    $("hist").innerHTML = history.slice(-20).reverse().map((h, i) => `<tr><td>${history.length - i}</td><td>${Math.round(h.audio_ms)}</td><td>${Math.round(h.asr_ms)}</td><td>${Math.round(h.llm_ms)}</td><td>${h.post_ms.toFixed(2)}</td><td><b>${Math.round(h.total_ms)}</b></td><td>${h.by}</td></tr>`).join("");
-    const totals = history.map((h) => h.total_ms);
-    $("agg").textContent = `n=${totals.length}  p50 ${Math.round(pct(totals, .5))} ms  p95 ${Math.round(pct(totals, .95))} ms`;
+    history.push({ ...t, roundTrip, by: f.source === "llm" ? "model" : f.source });
+    $("hist").innerHTML = history.slice(-20).reverse().map((h, i) => `<tr><td>${history.length - i}</td><td>${Math.round(h.audio_ms)}</td><td>${Math.round(h.asr_ms)}</td><td>${Math.round(h.llm_ms)}</td><td>${h.post_ms.toFixed(2)}</td><td>${Math.round(h.total_ms)}</td><td><b>${Math.round(h.roundTrip)}</b></td><td>${h.by}</td></tr>`).join("");
+    const totals = history.map((h) => h.roundTrip);
+    $("agg").textContent = `n=${totals.length}  round trip p50 ${Math.round(pct(totals, .5))} ms  p95 ${Math.round(pct(totals, .95))} ms`;
   }
 }
 
 const talk = $("talk");
-talk.addEventListener("pointerdown", (e) => { e.preventDefault(); if ($("mode").value === "auto" && recording) stopAuto(); else press(); });
+talk.addEventListener("pointerdown", (e) => { e.preventDefault(); if (MODE() === "toggle" && recording) finish(); else press(); });
 talk.addEventListener("pointerup", release); talk.addEventListener("pointerleave", release); talk.addEventListener("pointercancel", release);
 let ctrlDown = false;
 addEventListener("keydown", (e) => {
   if (e.key === "Control") { if (!e.repeat && !ctrlDown) { ctrlDown = true; press(); } }
-  else if (ctrlDown) cancelRecording();                             // Ctrl+C, Ctrl+V ... are shortcuts, not dictation
+  else if (ctrlDown) cancelRecording();                              // Ctrl+C, Ctrl+V ... are shortcuts, not dictation
 });
 addEventListener("keyup", (e) => { if (e.key === "Control") { ctrlDown = false; release(); } });
 addEventListener("blur", () => { ctrlDown = false; release(); });
@@ -300,14 +292,14 @@ $("enable").addEventListener("click", enableMic);
 $("style").addEventListener("change", () => { styleTouched = true; });
 $("clear").addEventListener("click", () => { $("doc").value = ""; $("doc").focus(); });
 $("mode").addEventListener("change", () => {
-  const auto = $("mode").value === "auto"; $("silenceWrap").style.display = auto ? "flex" : "none";
-  $("talkHint").innerHTML = auto ? "Click the button to start, talk as long as you like (pauses are fine), then click it again to finish. You get <b>one result for the whole dictation</b>."
-    : "Hold the button (or the <b>Ctrl</b> key), speak, release. You get <b>one result for everything you said</b>, pauses included. Click in the box below first to choose where text goes.";
-  if (!recording) setLabel(IDLE_LABEL());
+  $("talkHint").innerHTML = MODE() === "toggle" ? "Click the button to start, talk as long as you like (pauses are fine), then click it again to finish. You get <b>one result for the whole dictation</b>."
+    : "Hold the button (or the <b>Ctrl</b> key), speak, release. The recording is uploaded once and you get <b>one result for everything you said</b>, pauses included. Click in the box below first to choose where text goes.";
+  if (!recording && !pending) setLabel(IDLE_LABEL());
 });
 
-window.__voiceDemo = { sendPcm(int16, rate) { startSession(rate || 16000); ws.send(int16.buffer); ws.send(JSON.stringify({ type: "end" })); pending++; } };   // test hook
-connect();
+// test hook: upload a recording (a Blob) without the microphone
+window.__voiceDemo = { upload(blob) { sessionCtx = buildContext(); upload(blob, sessionCtx); } };
+loadStatus();
 </script>
 </body>
 </html>

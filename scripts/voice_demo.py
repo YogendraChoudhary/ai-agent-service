@@ -1,13 +1,14 @@
 """
 Start voice dictation on its own and open the test page in your browser.
 
-  python scripts/voice_demo.py                 # Whisper small + Gemini, opens http://127.0.0.1:8000/v1/voice/demo
+  python scripts/voice_demo.py                 # Whisper small + Gemini, opens http://127.0.0.1:8000/
   python scripts/voice_demo.py --gpt           # format with GPT (gpt-4o-mini) instead of Gemini
   python scripts/voice_demo.py --whisper base  # faster speech recognition, less accurate
   python scripts/voice_demo.py --always-model  # send every utterance to the model (default: plain sentences skip it)
   python scripts/voice_demo.py --no-open       # do not open a browser
 
-Only the /v1/voice routes are served (no Redis, credits or other endpoints), on this machine only. Press Ctrl+C to stop.
+Only the /v1/voice routes and the test page at / are served (no Redis, credits or other endpoints), on this machine only.
+The test page is part of this script, not of the API: the service itself has no demo endpoint. Press Ctrl+C to stop.
 """
 
 import argparse
@@ -54,13 +55,14 @@ def main() -> int:
     import uvicorn
     from contextlib import asynccontextmanager
     from fastapi import FastAPI
-    from fastapi.responses import RedirectResponse
+    from fastapi.responses import HTMLResponse
 
     from config import settings
     from src.voice_flow.router import get_service, router, warm_up
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
-    url = f"http://127.0.0.1:{args.port}/v1/voice/demo"
+    url = f"http://127.0.0.1:{args.port}/"
+    page = ROOT / "src" / "voice_flow" / "static" / "demo.html"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -78,8 +80,8 @@ def main() -> int:
     app.include_router(router)
 
     @app.get("/", include_in_schema=False)
-    async def home() -> RedirectResponse:
-        return RedirectResponse("/v1/voice/demo")
+    async def home() -> HTMLResponse:
+        return HTMLResponse(page.read_text(encoding="utf-8"))
 
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
     return 0

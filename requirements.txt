@@ -45,4 +45,5 @@ google-genai          # Google GenAI SDK — used for Gemini autocomplete and im
 # numpy. voice_flow decodes uploaded audio with PyAV itself (faster-whisper 1.2.1's own file decoding fails on PyAV 19).
 # Models download from Hugging Face on first use (small ~480 MB) and are cached under ~/.cache/huggingface.
 faster-whisper
+python-multipart  # POST /v1/voice/dictate takes the recording as multipart/form-data (FastAPI refuses to start the route without it)
 Pillow                # Image processing, dimension sniffing, and format conversion

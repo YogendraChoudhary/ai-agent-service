@@ -10,7 +10,7 @@ scope cut "remove email, Slack, code and Markdown formats from the prompt for no
 
 ## B. Repetition and better points
 - [x] B1 Prompt rules: false starts, one lead-in only, restated sentences, filler sentence openers (keeping the rest of the sentence), greetings kept
-- [x] B2 "Polished" style (short label + one tight sentence per point): `style` in REST and WebSocket, `VOICE_DEFAULT_STYLE`, selector on the page
+- [x] B2 "Polished" style (short label + one tight sentence per point): `style` in the `context` part of the upload, `VOICE_DEFAULT_STYLE`, selector on the page
 - [x] B3 Claim-retention check: Polished must keep hyphenated terms and numbers, Clean must keep acronyms and hyphenated terms; one repair that names what was lost, then Clean
 - [x] B4 Long-form eval cases (`lf-01`..`lf-04`) from your dictation: item count = spoken cues, no stacked lead-in, key terms kept, closing line outside the list
 
@@ -42,7 +42,7 @@ scope cut "remove email, Slack, code and Markdown formats from the prompt for no
 
 ## G. Phase 5: router and audio
 - [x] G1 `_verify_bearer_token` (constant-time, UTF-8) [7.1]
-- [x] G2 An empty or bounced utterance never reaches Whisper; the utterance queue holds 8 and answers `rate_limited` beyond that [7.3 7.4]
+- [x] G2 An empty or bounced utterance never reaches Whisper; at most 8 dictations are in flight and the next gets 429 [7.3 7.4] (was a per-connection queue answering `rate_limited` until the WebSocket was replaced by `POST /dictate`)
 - [x] G3 Anti-aliased resampling [8.3]
 
 ## H. Verification

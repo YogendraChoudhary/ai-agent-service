@@ -3,22 +3,17 @@ Regression matrix for the review (docs/VOICE_FLOW_CHECKLIST.md). Each test names
 Rows that belong to the email / Slack / code / Markdown formats are covered where the code is kept, but those formats are off.
 """
 
-import asyncio
 import json
 import logging
-import threading
 
 import numpy as np
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from config import Settings, settings
 from src.voice_flow import router as router_module
 from src.voice_flow.asr import vocabulary
 from src.voice_flow.asr.audio import resample_audio, resample_linear
-from src.voice_flow.asr.whisper_client import AsrResult
 from src.voice_flow.evals import run_evals as ev
 from src.voice_flow.formatter import gate, patterns, post_processor
 from src.voice_flow.formatter.claims import check_claims, key_terms
@@ -26,8 +21,7 @@ from src.voice_flow.formatter.engine import (
     Breaker, LlmError, OpenAIBackend, VoiceFormattingService, _max_output_tokens, check_output)
 from src.voice_flow.formatter.post_processor import PostProcessor
 from src.voice_flow.formatter.rules import detect_list, rule_format
-from src.voice_flow.schemas import (
-    AppContext, ContextUpdateFrame, CursorContext, FormatRequest, StartFrame, effective_context)
+from src.voice_flow.schemas import AppContext, CursorContext, DictateContext, effective_context
 from tests.voice_flow.test_engine import FakeBackend
 
 RATE = 16000
@@ -173,30 +167,29 @@ class TestSchemas:
 
     def test_app_context_is_general_while_formats_are_off(self):
         assert effective_context("email") is AppContext.GENERAL and effective_context(AppContext.CODE_COMMENT) is AppContext.GENERAL
-        assert FormatRequest(raw_text="hi", app_context="slack_chat").app_context is AppContext.GENERAL
-        assert StartFrame(app_context="markdown_docs").app_context is AppContext.GENERAL
+        assert DictateContext(app_context="slack_chat").app_context is AppContext.GENERAL
+        assert DictateContext(app_context="markdown_docs").app_context is AppContext.GENERAL
 
     def test_app_context_is_kept_when_formats_are_on(self, monkeypatch):
         monkeypatch.setattr(settings, "voice_app_contexts_enabled", True)
         assert effective_context("email") is AppContext.EMAIL
-        assert FormatRequest(raw_text="hi", app_context="slack_chat").app_context is AppContext.SLACK
+        assert DictateContext(app_context="slack_chat").app_context is AppContext.SLACK
 
     def test_every_context_is_documented(self):
         assert AppContext.__doc__ and "SWITCHED OFF" in AppContext.__doc__
 
-    def test_context_update_frame_carries_only_what_changed_7_2(self):
-        u = ContextUpdateFrame.model_validate({"type": "context", "cursor_context": {"preceding_text": "Hello "}})
-        assert u.custom_dictionary is None and u.language is None and u.app_context is None and u.style is None
-        assert u.cursor_context.preceding_text == "Hello "
-        assert ContextUpdateFrame.model_validate({"type": "context", "custom_dictionary": ["A", "a", " B "]}).custom_dictionary == ["A", "B"]
-        with pytest.raises(ValidationError):
-            ContextUpdateFrame.model_validate({"type": "context", "language": "english-us!"})
-
     def test_style_and_language_are_validated(self):
-        assert StartFrame(style="polished", language="en-US").style == "polished"
+        assert DictateContext(style="polished", language="en-US").style == "polished"
         with pytest.raises(ValidationError):
-            StartFrame(style="fancy")
-        assert FormatRequest(raw_text="hi").style is None
+            DictateContext(style="fancy")
+        with pytest.raises(ValidationError):
+            DictateContext(language="english-us!")
+        assert DictateContext().style is None and DictateContext().language is None
+
+    def test_the_dictionary_is_cleaned_and_capped(self):
+        assert DictateContext(custom_dictionary=["A", "a", " B "]).custom_dictionary == ["A", "B"]
+        assert len(DictateContext(custom_dictionary=[f"term{i}" for i in range(500)]).custom_dictionary) == 100
+        assert len(DictateContext(custom_dictionary=["x" * 500]).custom_dictionary[0]) == 60
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -485,127 +478,6 @@ class TestLongFormChecks:
 # ---------------------------------------------------------------------------------------------------------------------
 # Phase 5: router and audio
 # ---------------------------------------------------------------------------------------------------------------------
-class FakeTranscriber:
-    model_name, compute_type, _model = "fake-whisper", "float32", object()
-
-    def __init__(self, text="we have two tasks mark it point 1 update the schema and point to deploy the service"):
-        self.text, self.calls, self.languages = text, [], []
-        self.release = threading.Event()
-        self.block = False
-
-    async def transcribe(self, audio, custom_vocab=(), language=None):
-        self.calls.append((audio.size, tuple(custom_vocab)))
-        self.languages.append(language)
-        while self.block and not self.release.is_set():
-            await asyncio.sleep(0.01)
-        return AsrResult(self.text if audio.size else "", audio.size / RATE * 1000, 12.0, "en")
-
-
-def pcm(seconds=1.0):
-    t = np.arange(int(seconds * RATE)) / RATE
-    return (np.sin(2 * np.pi * 220 * t) * 0.1 * 32767).astype("<i2").tobytes()
-
-
-START = {"type": "start", "sample_rate": RATE, "mode": "push_to_talk"}
-
-
-@pytest.fixture
-def ws_setup(monkeypatch):
-    backend = FakeBackend("We have two tasks:\n1. Update the schema\n2. Deploy the service")
-    service = VoiceFormattingService(backend=backend, timeout=1.0, breaker=Breaker(), mode="always")
-    transcriber = FakeTranscriber()
-    monkeypatch.setattr(router_module, "_service", service)
-    monkeypatch.setattr(router_module, "get_transcriber", lambda: transcriber)
-    monkeypatch.setattr(settings, "voice_flow_token", "")
-    app = FastAPI()
-    app.include_router(router_module.router)
-    return TestClient(app), backend, transcriber
-
-
-class TestPartialContextUpdates:
-    def test_a_cursor_only_update_keeps_the_dictionary_7_2(self, ws_setup):
-        client, backend, transcriber = ws_setup
-        with client.websocket_connect("/v1/voice/stream") as ws:
-            ws.send_json({**START, "custom_dictionary": ["Redis", "Kubernetes"], "language": "en", "style": "polished"})
-            ws.receive_json()
-            ws.send_json({"type": "context", "cursor_context": {"preceding_text": "Please check ", "following_text": " tomorrow"}})
-            ws.send_bytes(pcm(0.5))
-            ws.send_json({"type": "end"})
-            assert ws.receive_json()["type"] == "final"
-        assert transcriber.calls == [(RATE // 2, ("Redis", "Kubernetes"))] and transcriber.languages == ["en"]
-        system, turns = backend.calls[0][0], backend.calls[0][1]
-        assert "Polished style" in system                                   # the style set at start survived the update
-        assert "<preceding_text>Please check </preceding_text>" in turns[-1]["content"] and "<dictionary>Redis, Kubernetes</dictionary>" in turns[-1]["content"]
-
-    def test_a_dictionary_update_keeps_the_cursor(self, ws_setup):
-        client, backend, _ = ws_setup
-        with client.websocket_connect("/v1/voice/stream") as ws:
-            ws.send_json({**START, "cursor_context": {"preceding_text": "Hello "}})
-            ws.receive_json()
-            ws.send_json({"type": "context", "custom_dictionary": ["Pydantic"], "language": "es"})
-            ws.send_bytes(pcm(0.5))
-            ws.send_json({"type": "end"})
-            ws.receive_json()
-        content = backend.calls[0][1][-1]["content"]
-        assert "<preceding_text>Hello </preceding_text>" in content and "<dictionary>Pydantic</dictionary>" in content
-
-    def test_an_invalid_update_changes_nothing_and_is_reported(self, ws_setup):
-        client, _, transcriber = ws_setup
-        with client.websocket_connect("/v1/voice/stream") as ws:
-            ws.send_json({**START, "custom_dictionary": ["Redis"]})
-            ws.receive_json()
-            ws.send_json({"type": "context", "language": "english-us!"})
-            assert ws.receive_json()["code"] == "bad_context"
-            ws.send_bytes(pcm(0.5))
-            ws.send_json({"type": "end"})
-            ws.receive_json()
-        assert transcriber.calls[0][1] == ("Redis",) and transcriber.languages == [None]
-
-
-class TestEmptyUtterancesAndBackpressure:
-    def test_an_end_with_no_audio_never_reaches_whisper_7_3(self, ws_setup):
-        client, _, transcriber = ws_setup
-        with client.websocket_connect("/v1/voice/stream") as ws:
-            ws.send_json(START)
-            ws.receive_json()
-            ws.send_json({"type": "end"})
-            final = ws.receive_json()
-            ws.send_bytes(b"\x00\x01" * 100)                                  # 6 ms: a key bounce
-            ws.send_json({"type": "end"})
-            bounce = ws.receive_json()
-        assert final["raw_text"] == "" and final["fallback_reason"] == "no speech detected" and bounce["raw_text"] == ""
-        assert transcriber.calls == []
-
-    def test_empty_results_keep_their_place_in_line(self, ws_setup):
-        client, _, transcriber = ws_setup
-        with client.websocket_connect("/v1/voice/stream") as ws:
-            ws.send_json(START)
-            ws.receive_json()
-            ws.send_bytes(pcm(0.5))
-            ws.send_json({"type": "end"})
-            ws.send_json({"type": "end"})                                     # nothing left: answered after the first, not before
-            first, second = ws.receive_json(), ws.receive_json()
-        assert first["raw_text"] != "" and second["raw_text"] == ""
-
-    def test_the_utterance_queue_is_bounded_7_4(self, ws_setup):
-        client, _, transcriber = ws_setup
-        transcriber.block = True                                              # the speech model is stuck on the first utterance
-        with client.websocket_connect("/v1/voice/stream") as ws:
-            ws.send_json(START)
-            ws.receive_json()
-            for _ in range(router_module.MAX_QUEUED_UTTERANCES + 2):         # 1 in the worker + 8 waiting = 9 accepted, the 10th refused
-                ws.send_bytes(pcm(0.2))
-                ws.send_json({"type": "end"})
-            refused = ws.receive_json()
-            assert refused["type"] == "error" and refused["code"] == "rate_limited"
-            transcriber.release.set()
-            finals = [ws.receive_json() for _ in range(router_module.MAX_QUEUED_UTTERANCES + 1)]
-        assert all(f["type"] == "final" for f in finals)
-
-    def test_limits_are_what_the_review_asked_for(self):
-        assert router_module.MAX_QUEUED_UTTERANCES == 8 and router_module.MIN_UTTERANCE_SECONDS == 0.05
-
-
 class TestBearerToken:
     def test_constant_time_and_utf8_safe_7_1(self):
         v = router_module._verify_bearer_token

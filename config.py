@@ -260,10 +260,7 @@ class Settings(BaseSettings):
     voice_format_model: str = Field("", alias="VOICE_FORMAT_MODEL")                   # "" = the project's low-end model of that provider
     voice_gemini_api_key: Optional[str] = Field(None, alias="VOICE_GEMINI_API_KEY")   # None = DEFAULT_GEMINI_API_KEY
     voice_format_timeout_seconds: float = Field(4.0, gt=0, le=30, alias="VOICE_FORMAT_TIMEOUT_SECONDS")
-    # Hands-free mode returns ONE result for the whole dictation: it ends after this much silence (or when the client says end).
-    # 0.8 s split a two-minute monologue into nine separately formatted pieces, so thinking pauses must not end it.
-    voice_endpoint_silence_ms: int = Field(6000, ge=500, le=60000, alias="VOICE_ENDPOINT_SILENCE_MS")
-    voice_max_utterance_seconds: int = Field(600, ge=5, le=1800, alias="VOICE_MAX_UTTERANCE_SECONDS")   # memory guard, not a chunk size
+    voice_max_utterance_seconds: int = Field(600, ge=5, le=1800, alias="VOICE_MAX_UTTERANCE_SECONDS")   # a longer recording is refused (413)
 
     # ------------------------------------------------------------------
     # Observability (src/observability.py). Bodies contain user text, so they are OFF by default.

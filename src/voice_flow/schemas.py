@@ -1,5 +1,5 @@
 """
-Data contracts for voice dictation: the REST bodies and the WebSocket frames.
+Data contracts for voice dictation: the `context` part of the upload and the response.
 
 Free-text fields are capped, the way api.py caps `query`: the formatter runs once per utterance on a small model, so an
 unbounded body is a cost and latency hole.
@@ -8,16 +8,14 @@ unbounded body is a cost and latency hole.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, List, Literal, Optional
 
 from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
 from config import settings
 
-RAW_TEXT_MAX_CHARS = 8000          # ~1,400 words: far beyond one dictated utterance
 DICTIONARY_MAX_TERMS = 100
 DICTIONARY_TERM_MAX_CHARS = 60
-AUDIO_B64_MAX_CHARS = 14_000_000   # ~10 MB of audio
 MAX_CURSOR_CHARS = 150
 
 Style = Literal["clean", "polished"]
@@ -70,8 +68,8 @@ def _clean_dictionary(terms: List[str]) -> List[str]:
     return out[:DICTIONARY_MAX_TERMS]
 
 
-class _DictationContext(BaseModel):
-    """Fields every dictation request carries."""
+class DictateContext(BaseModel):
+    """The optional `context` part of a dictation upload (JSON). Every field may be left out."""
     app_context: AppContext = AppContext.GENERAL
     cursor_context: Optional[CursorContext] = None
     custom_dictionary: List[str] = Field(default_factory=list)
@@ -89,11 +87,15 @@ class _DictationContext(BaseModel):
         return _clean_dictionary(value)
 
 
-class FormatRequest(_DictationContext):
-    raw_text: str = Field(max_length=RAW_TEXT_MAX_CHARS)
+class Timings(BaseModel):
+    audio_ms: float = 0.0       # length of the speech uploaded
+    asr_ms: float = 0.0         # Whisper
+    llm_ms: float = 0.0         # the model (0 when rules answered)
+    post_ms: float = 0.0        # deterministic post-processing
+    total_ms: float = 0.0       # server time: from the upload being received to the response being ready (the upload itself is not counted)
 
 
-class FormatResponse(BaseModel):
+class DictateResponse(BaseModel):
     raw_text: str
     # Exactly what to insert at the caret. It already starts with a space when `leading_space_required` is true and ends
     # with one when `trailing_space_required` is true; the flags only say why.
@@ -104,78 +106,4 @@ class FormatResponse(BaseModel):
     # rules = the model was down, too slow or rejected; see fallback_reason
     source: Literal["llm", "fast", "rules"] = "llm"
     fallback_reason: Optional[str] = None
-    asr_latency_ms: float = 0.0
-    llm_latency_ms: float
-    total_latency_ms: float
-
-
-class DictateRequest(_DictationContext):
-    """Audio in, formatted text out. For clients that record a whole utterance (and for scripted tests)."""
-    audio_b64: str = Field(max_length=AUDIO_B64_MAX_CHARS, description="Any container PyAV can decode (wav, webm, m4a, ...)")
-
-
-class DictateResponse(FormatResponse):
-    audio_ms: float = 0.0
-
-
-# ---------------------------------------------------------------------------
-# WebSocket frames. Client -> server: one JSON "start", then binary PCM16 frames, then JSON "end" (or "cancel").
-# ---------------------------------------------------------------------------
-class StartFrame(_DictationContext):
-    type: Literal["start"] = "start"
-    sample_rate: int = Field(16000, ge=8000, le=48000)
-    # push_to_talk: the utterance ends when the client sends "end". auto: the server also ends it after a pause.
-    mode: Literal["push_to_talk", "auto"] = "push_to_talk"
-    token: str = ""
-    # auto mode: how long a silence ends the dictation. None = the server setting, 0 = never (the client sends "end").
-    silence_ms: Optional[int] = Field(None, ge=0, le=60000)
-
-    @field_validator("silence_ms")
-    @classmethod
-    def _silence(cls, value: Optional[int]) -> Optional[int]:
-        if value is not None and 0 < value < 500:
-            raise ValueError("silence_ms must be 0 or at least 500")
-        return value
-
-
-class ContextUpdateFrame(BaseModel):
-    """Send only what changed, e.g. the cursor moved: fields left out keep their value (the dictionary is not resent)."""
-    type: Literal["context"] = "context"
-    app_context: Optional[AppContext] = None
-    cursor_context: Optional[CursorContext] = None
-    custom_dictionary: Optional[List[str]] = None
-    style: Optional[Style] = None
-    language: Optional[str] = Field(None, pattern=_LANGUAGE_PATTERN)
-
-    @field_validator("app_context")
-    @classmethod
-    def _context(cls, value: Optional[AppContext]) -> Optional[AppContext]:
-        return None if value is None else effective_context(value)
-
-    @field_validator("custom_dictionary")
-    @classmethod
-    def _dictionary(cls, value: Optional[List[str]]) -> Optional[List[str]]:
-        return None if value is None else _clean_dictionary(value)
-
-
-class Timings(BaseModel):
-    audio_ms: float = 0.0       # length of the speech sent
-    asr_ms: float = 0.0         # Whisper
-    llm_ms: float = 0.0         # the model (0 when rules answered)
-    post_ms: float = 0.0        # deterministic post-processing
-    total_ms: float = 0.0       # from "end" (or the pause) to the final frame
-
-
-class FinalFrame(BaseModel):
-    type: Literal["final"] = "final"
-    raw_text: str
-    formatted_text: str
-    leading_space_required: bool
-    trailing_space_required: bool = False
-    source: Literal["llm", "fast", "rules"] = "llm"
-    fallback_reason: Optional[str] = None
     timings: Timings
-
-
-def error_frame(message: str, code: str = "error") -> Dict[str, str]:
-    return {"type": "error", "code": code, "message": message}

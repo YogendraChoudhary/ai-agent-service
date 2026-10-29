@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -236,8 +237,10 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Text Processing Agent API", lifespan=lifespan)
 
-if settings.voice_flow_enabled:       # /v1/voice/*: local Whisper dictation formatted by Gemini (src/voice_flow). Ships off.
-    from src.voice_flow.router import router as voice_router
+if settings.voice_flow_enabled:       # /v1/voice/*: local Whisper dictation with licence validation and text billing
+    from src.voice_flow.access import LicenceGate
+    from src.voice_flow.router import router as voice_router, set_gate
+    set_gate(LicenceGate(sys.modules[__name__]))      # licence key + credits, like /agent/stream
     app.include_router(voice_router)
 
 app.add_middleware(
@@ -282,8 +285,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(exc.detail, dict):
-        return JSONResponse(status_code=exc.status_code, content=exc.detail)
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+        return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=exc.headers)
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail}, headers=exc.headers)
 
 
 # ---------------------------------------------------------------------------
