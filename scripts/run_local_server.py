@@ -52,6 +52,7 @@ os.environ.update({
     "BLOG_AI_ENABLED": "true",      # type=generate_blog; the flag ships off, a local run is where it is tried
     "VOICE_FLOW_ENABLED": "true",   # /v1/voice/*: local Whisper dictation; for a microphone test page run scripts/voice_demo.py
     "LONGFORM_REFINE_ENABLED": "true",   # long documents through enhance / grammar / tone / simplify, verified chunk by chunk
+    "CHART_SUGGESTIONS_ENABLED": "true", # optional editable graph preview after Enhance (not inserted into the prose)
     # Reference images must live under CDN_URL. Locally the "CDN" is this server's /local-images folder,
     # so an image_ready url can be sent straight back as image_urls for a refinement.
     "CDN_URL": f"http://127.0.0.1:{os.environ.get('LOCAL_PORT', '8000')}/local-images",

@@ -155,7 +155,8 @@ class AgnoLLM:
                         self._failed.add((candidate.provider, candidate.advanced))
                         self.fallbacks.append({"from": candidate.provider, "to": chain[index + 1].provider,
                                                "error": reason})
-                        trace_set(self.request_id, fallbacks=list(self.fallbacks))
+                        trace_set(self.request_id, **{
+                            "graph_fallbacks" if self.agent_type == "chart_extractor" else "fallbacks": list(self.fallbacks)})
                     logger.warning("%sProvider fallback %s -> %s (%s)", log, candidate.provider,
                                    chain[index + 1].provider, reason)
                     break
@@ -175,7 +176,8 @@ class AgnoLLM:
             entry["error"] = str(status_code(error) or type(error).__name__)
         with self._lock:
             self.calls.append(entry)
-            trace_set(self.request_id, llm_calls=list(self.calls))
+            trace_set(self.request_id, **{
+                "graph_llm_calls" if self.agent_type == "chart_extractor" else "llm_calls": list(self.calls)})
 
     def _run(self, candidate, key: str, system: str, messages: List[dict], spec: CallSpec) -> str:
         from agno.models.message import Message
@@ -210,7 +212,9 @@ class AgnoLLM:
                 # Attribution (billing, latency groups) follows the model that WRITES the post, not a fast first pass.
                 first_part = self.used is None
                 self.used = served
-                if first_part:
+                if self.agent_type == "chart_extractor":
+                    trace_set(self.request_id, graph_model_used=f"{served[0]}/{served[1]}")
+                elif first_part:
                     trace_set(self.request_id, model_used=f"{served[0]}/{served[1]}")
         return content if isinstance(content, str) else str(content or "")
 

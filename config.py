@@ -228,6 +228,10 @@ class Settings(BaseSettings):
     # simplify. A qualifying document is frozen (tables, quotes, images, code and links become tokens), cut into chunks,
     # refined in parallel, checked in code and restored where the model moved something. Ships OFF.
     # ------------------------------------------------------------------
+    # Additive graph suggestions for Enhance. Enable when the editor handles graph_suggestion events and persists
+    # eddyter_chart JSON (docs/GRAPH_API_HANDOFF.md); no charts are automatically inserted into the prose.
+    chart_suggestions_enabled: bool = Field(False, alias="CHART_SUGGESTIONS_ENABLED")
+    chart_extraction_timeout_seconds: float = Field(25.0, gt=0, le=60, alias="CHART_EXTRACTION_TIMEOUT_SECONDS")
     longform_refine_enabled: bool = Field(False, alias="LONGFORM_REFINE_ENABLED")
     longform_refine_min_words: int = Field(600, ge=1, alias="LONGFORM_REFINE_MIN_WORDS")   # shorter and unstructured: the single call
     longform_chunk_words: int = Field(1000, ge=100, le=3000, alias="LONGFORM_CHUNK_WORDS")  # target chunk size (window 0.6x-1.4x)

@@ -1666,6 +1666,14 @@ AGENT_CONFIGS = {
         "use_advanced": False,
         "temperature": 0.2,
     },
+    "chart_extractor": {
+        "name": "Graph Data Extractor",
+        "role": "Extract explicit comparable values with source evidence",
+        "instructions": ["Return only source-grounded graph data as JSON."],
+        "use_tools": False,
+        "use_advanced": True,
+        "temperature": 0.0,
+    },
     "enhance": {
         "name": "AI Enhancer",
         "role": "Enhance and improve text quality using AI",
@@ -1813,7 +1821,7 @@ def _image_tool_available(model_provider, api_key, is_byok, image_ctx) -> bool:
 
 def _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx):
     """The plan only applies to the free-form agents, and images are dropped from it if none can be made."""
-    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner"):
+    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor"):
         return None
     if plan.image_count > 0 and not _image_tool_available(model_provider, api_key, is_byok, image_ctx):
         from dataclasses import replace
@@ -1913,7 +1921,7 @@ def create_agent(
         "instructions": instructions,
         # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes, and the long-form refiner
         # returns the passage it was given, polished; agno's "use markdown" nudge would only fight those prompts.
-        "markdown": agent_type not in ("blog_writer", "longform_refiner"),
+        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor"),
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
@@ -2181,6 +2189,7 @@ def process_user_query_stream(
     existing_design_ast: Optional[Union[dict, str]] = None,
     operation_type: str = "general",
     cancel_event: Optional[threading.Event] = None,
+    suggest_graphs: bool = True,
 ):
     """
     Stream query processor for text editor integration.
@@ -2470,6 +2479,13 @@ def process_user_query_stream(
     trace_set(request_id, candidates=[c.provider for c in candidates],
               route_reason='user_selection' if model_source == 'user' else 'task_default', fallbacks=[])
 
+    def graph_suggestions():
+        if agent_type == 'enhance' and user_text and suggest_graphs and settings.chart_suggestions_enabled and not image_urls:
+            from .charts.runtime import stream_graph_suggestion
+            yield from stream_graph_suggestion(
+                user_text, candidates=candidates, key_for=key_resolver if routed else (lambda _provider: api_key),
+                is_byok=is_byok, user_id=user_id, request_id=request_id, cancel_event=cancel_event)
+
     if (agent_type in REFINEMENT_AGENTS and user_text is not None and settings.longform_refine_enabled and not image_urls):
         longform = _longform()
         if longform is not None and longform[0](user_text, settings.longform_refine_min_words):
@@ -2479,6 +2495,7 @@ def process_user_query_stream(
                 user_text, instruction, agent_type, candidates=candidates,
                 key_for=key_resolver if routed else (lambda _provider: api_key), is_byok=is_byok, user_id=user_id,
                 request_id=request_id, report_model=report_model)
+            yield from graph_suggestions()
             return
 
     if agent_type == 'blog_writer':
@@ -2644,10 +2661,14 @@ def process_user_query_stream(
         while True:
             try:
                 candidate_plan = _effective_plan(plan, agent_type, provider, key, is_byok, image_ctx)
+                prose_only = (agent_type == 'enhance' and suggest_graphs and settings.chart_suggestions_enabled)
+                graph_instructions = ([*config['instructions'],
+                    "Graphs are offered separately as optional suggestions. Return only the improved document; "
+                    "do not add a graph, SVG, Mermaid or chart code to the prose."] if prose_only else None)
                 agent = create_agent(agent_type, provider, key, request_id, pending_images=pending_images,
                                      user_id=user_id, credit_manager=credit_manager, is_byok=is_byok,
                                      image_ctx=image_ctx, plan=candidate_plan,
-                                     max_tokens=refinement_max_tokens(agent_type, query))
+                                     max_tokens=refinement_max_tokens(agent_type, query), instructions=graph_instructions)
                 trace_mark(request_id, 'agent_created')
                 use_tools = candidate_plan.use_tools if candidate_plan else config.get('use_tools', False)
                 model_id = (ADVANCED_MODEL_IDS if tier else BASIC_MODEL_IDS)[provider]
@@ -2715,6 +2736,8 @@ def process_user_query_stream(
                 from .code_validate import CodeValidationError
                 raise CodeValidationError(errors)
 
+    yield from graph_suggestions()
+
     if any(not str(k).startswith('__') for k in pending_images):
         yield {'__pending_images__': pending_images}
 
@@ -2773,6 +2796,7 @@ def process_user_query_with_images(
     user_text: str = None,
     existing_design_ast: Optional[Union[dict, str]] = None,
     operation_type: str = "general",
+    suggest_graphs: bool = True,
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
@@ -2814,6 +2838,7 @@ def process_user_query_with_images(
         user_text=user_text,
         existing_design_ast=existing_design_ast,
         operation_type=operation_type,
+        suggest_graphs=suggest_graphs,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]

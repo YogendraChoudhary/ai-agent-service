@@ -32,6 +32,8 @@ from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
 # ---------------------------------------------------------------------------
 from config import settings
 from src.blog.plan import BRIEF_MAX_CHARS
+from src.charts.router import router as chart_router
+from src.charts.schema import GraphSuggestion
 from src.code_validate import CodeValidationError
 from src.credit_manager import (
     AUTOCOMPLETE_CREDITS_SCALED,
@@ -236,6 +238,7 @@ async def lifespan(app: FastAPI):
 # APP
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Text Processing Agent API", lifespan=lifespan)
+app.include_router(chart_router)
 
 if settings.voice_flow_enabled:       # /v1/voice/*: local Whisper dictation with licence validation and text billing
     from src.voice_flow.access import LicenceGate
@@ -326,6 +329,7 @@ class ProcessRequest(BaseModel):
     image_params: Optional[Dict[str, Any]] = None
     blog_options: Optional[BlogOptions] = None      # generate_blog only
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
+    suggest_graphs: bool = True       # Enhance only; also requires CHART_SUGGESTIONS_ENABLED
 
     @field_validator('image_provider')
     @classmethod
@@ -381,6 +385,7 @@ class StreamRequest(BaseModel):
     image_params: Optional[Dict[str, Any]] = None
     blog_options: Optional[BlogOptions] = None      # generate_blog only
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
+    suggest_graphs: bool = True
 
     @field_validator('image_provider')
     @classmethod
@@ -576,6 +581,8 @@ class ProcessResponse(BaseModel):
     # Things the server fixed or could not do (generate_blog): [{"kind", "detail", "unit"?}]. Empty when clean.
     warnings: List[Dict[str, Any]] = Field(default_factory=list)
     design: Optional[Dict[str, Any]] = None
+    graph_suggestions: List[GraphSuggestion] = Field(default_factory=list)
+    graph_suggestion_error: Optional[Dict[str, str]] = None
 
 
 class AutocompleteResponse(BaseModel):
@@ -919,6 +926,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             user_text=request_data.query,
             existing_design_ast=request_data.existing_design_ast,
             operation_type=agent_type,
+            suggest_graphs=request_data.suggest_graphs,
         )
         warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
@@ -973,6 +981,8 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'html_response': response,
                 'warnings': warnings,
                 'design': meta.get('design_ready') if meta else None,
+                'graph_suggestions': [meta['graph_suggestion']] if meta.get('graph_suggestion') else [],
+                'graph_suggestion_error': meta.get('graph_suggestion_unavailable'),
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1178,6 +1188,7 @@ async def stream_text(
                     existing_design_ast=request_data.existing_design_ast,
                     operation_type=agent_type,
                     cancel_event=cancel_event,
+                    suggest_graphs=request_data.suggest_graphs,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():

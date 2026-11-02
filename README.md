@@ -222,6 +222,13 @@ contains the words "fix grammar" still runs the simplify agent.
 (`src/request_plan.py`: image count, web access, model tier) and may take the direct image route.
 Tables, lists and summaries requested through `general` are handled by that agent; the dedicated `table`,
 `list` and `summarize` agents have no API `type` and are no longer reachable through the API.
+
+`enhance_with_ai` can additionally suggest an editable graph from the original text or Markdown table when
+`CHART_SUGGESTIONS_ENABLED=true` (off until the editor supports it). Suggestions are separate from the improved prose
+and require the writer to choose Insert. The graph stores exact decimal values separately from its appearance;
+`POST /agent/charts/edit` changes only explicit fields, and `POST /agent/charts/preview` renders a saved graph.
+Type/color changes preserve the full dataset. See [the frontend handoff](docs/GRAPH_API_HANDOFF.md) for the SSE/JSON
+contracts and editor changes. Run `python scripts/demo_editable_graph.py` for a provider-free demonstration.
 `determine_agent_type` (keyword matching) remains only for callers that name no agent.
 
 `generate_blog` is not one agent run: `src/blog` plans the post in code (length, sections, tables, quotes, images), has the
