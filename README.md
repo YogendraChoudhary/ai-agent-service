@@ -229,6 +229,13 @@ and require the writer to choose Insert. The graph stores exact decimal values s
 `POST /agent/charts/edit` changes only explicit fields, and `POST /agent/charts/preview` renders a saved graph.
 Type/color changes preserve the full dataset. See [the frontend handoff](docs/GRAPH_API_HANDOFF.md) for the SSE/JSON
 contracts and editor changes. Run `python scripts/demo_editable_graph.py` for a provider-free demonstration.
+
+To edit parts of a document without a selection, send `document_text` with the full current Markdown/plain text
+and use `query` for the editing instruction (`general` or `enhance_with_ai`). The backend locates the relevant
+paragraphs, returns verified patches and preserves every untargeted source region exactly. Proposals require
+frontend review and stale-snapshot checks; `/agent/documents/apply` replays accepted patches without model calls.
+See [the document-editing handoff](docs/DOCUMENT_EDIT_API_HANDOFF.md) and run `python scripts/demo_document_edit.py`
+for a provider-free example, or add `--live` to test the configured OpenAI model on synthetic documents.
 `determine_agent_type` (keyword matching) remains only for callers that name no agent.
 
 `generate_blog` is not one agent run: `src/blog` plans the post in code (length, sections, tables, quotes, images), has the

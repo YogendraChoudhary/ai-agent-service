@@ -1666,6 +1666,14 @@ AGENT_CONFIGS = {
         "use_advanced": False,
         "temperature": 0.2,
     },
+    "document_editor": {
+        "name": "Document Section Editor",
+        "role": "Locate and refine only the requested source paragraphs",
+        "instructions": ["Return the exact source-bound edit requested by this stage."],
+        "use_tools": False,
+        "use_advanced": True,
+        "temperature": 0.0,
+    },
     "chart_extractor": {
         "name": "Graph Data Extractor",
         "role": "Extract explicit comparable values with source evidence",
@@ -1821,7 +1829,7 @@ def _image_tool_available(model_provider, api_key, is_byok, image_ctx) -> bool:
 
 def _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx):
     """The plan only applies to the free-form agents, and images are dropped from it if none can be made."""
-    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor"):
+    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor", "document_editor"):
         return None
     if plan.image_count > 0 and not _image_tool_available(model_provider, api_key, is_byok, image_ctx):
         from dataclasses import replace
@@ -1921,7 +1929,7 @@ def create_agent(
         "instructions": instructions,
         # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes, and the long-form refiner
         # returns the passage it was given, polished; agno's "use markdown" nudge would only fight those prompts.
-        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor"),
+        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor", "document_editor"),
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
@@ -2190,6 +2198,7 @@ def process_user_query_stream(
     operation_type: str = "general",
     cancel_event: Optional[threading.Event] = None,
     suggest_graphs: bool = True,
+    document_text: Optional[str] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2221,6 +2230,7 @@ def process_user_query_stream(
             carries the single-call prompt ("Enhance: ..., Text: ..."), this is the text itself. A document that qualifies
             (src/longform, LONGFORM_REFINE_ENABLED) is refined in verified chunks instead.
         existing_design_ast: The DesignDocumentAST the user is editing (Mode 8), as a dict or JSON string.
+        document_text: Full current document snapshot for selection-free edits; query/user_text is the instruction.
         operation_type: The request's declared API type. `generate_design` / `edit_design` force Mode 8.
         cancel_event: Set by /agent/abort. Watched by the design canvas, which yields nothing while it generates, so
             the caller's per-chunk abort check would only see an abort once the design was finished and paid for.
@@ -2236,6 +2246,18 @@ def process_user_query_stream(
         raise ValueError("API key is required")
 
     from config import settings
+
+    if document_text is not None:
+        from .document_edit.runtime import stream_document_edit
+        from .task_router import Candidate, resolve_route
+        routed = key_resolver is not None and (settings.task_routing_enabled or settings.provider_fallback_enabled)
+        candidates = resolve_route('writing', model_provider, model_source, key_resolver.available_providers, True) if routed else [Candidate(model_provider, True)]
+        if not candidates:
+            raise ValueError('No API key configured for an eligible provider')
+        yield from stream_document_edit(document_text, user_text if user_text is not None else query,
+            candidates=candidates, key_for=key_resolver if routed else (lambda _provider: api_key),
+            is_byok=is_byok, user_id=user_id, request_id=request_id, report_model=report_model, cancel_event=cancel_event)
+        return
 
     query_lower = query.lower()
     legacy_agent_type, legacy_reason = determine_agent_type(query_lower)
@@ -2797,6 +2819,7 @@ def process_user_query_with_images(
     existing_design_ast: Optional[Union[dict, str]] = None,
     operation_type: str = "general",
     suggest_graphs: bool = True,
+    document_text: Optional[str] = None,
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
@@ -2839,6 +2862,7 @@ def process_user_query_with_images(
         existing_design_ast=existing_design_ast,
         operation_type=operation_type,
         suggest_graphs=suggest_graphs,
+        document_text=document_text,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]

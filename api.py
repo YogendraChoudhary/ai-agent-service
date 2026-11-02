@@ -34,6 +34,8 @@ from config import settings
 from src.blog.plan import BRIEF_MAX_CHARS
 from src.charts.router import router as chart_router
 from src.charts.schema import GraphSuggestion
+from src.document_edit.router import router as document_router
+from src.document_edit.schema import DocumentEditResult
 from src.code_validate import CodeValidationError
 from src.credit_manager import (
     AUTOCOMPLETE_CREDITS_SCALED,
@@ -239,6 +241,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Text Processing Agent API", lifespan=lifespan)
 app.include_router(chart_router)
+app.include_router(document_router)
 
 if settings.voice_flow_enabled:       # /v1/voice/*: local Whisper dictation with licence validation and text billing
     from src.voice_flow.access import LicenceGate
@@ -317,6 +320,19 @@ def check_blog_fields(request_type: str, query: str, blog_options: Optional[Blog
         raise ValueError('blog_options is only valid with type generate_blog')
 
 
+def check_document_fields(request) -> None:
+    if request.document_text is None:
+        return
+    if request.type not in ('general', 'enhance_with_ai'):
+        raise ValueError('document_text is only valid with type general or enhance_with_ai')
+    if not request.query.strip() or len(request.query) > 2000 or request.secondary_prompt:
+        raise ValueError('With document_text, query must be the editing instruction (1–2,000 characters); omit secondary_prompt')
+    if request.existing_design_ast is not None or getattr(request, 'image_urls', None) or request.image_params or request.image_provider or request.image_model:
+        raise ValueError('Document edits do not accept design or image-generation inputs')
+    from src.document_edit.blocks import document_blocks
+    document_blocks(request.document_text)
+
+
 class ProcessRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
@@ -330,6 +346,7 @@ class ProcessRequest(BaseModel):
     blog_options: Optional[BlogOptions] = None      # generate_blog only
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
     suggest_graphs: bool = True       # Enhance only; also requires CHART_SUGGESTIONS_ENABLED
+    document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
 
     @field_validator('image_provider')
     @classmethod
@@ -363,6 +380,7 @@ class ProcessRequest(BaseModel):
     @model_validator(mode='after')
     def validate_blog_fields(self):
         check_blog_fields(self.type, self.query, self.blog_options)
+        check_document_fields(self)
         return self
 
 
@@ -386,6 +404,7 @@ class StreamRequest(BaseModel):
     blog_options: Optional[BlogOptions] = None      # generate_blog only
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
     suggest_graphs: bool = True
+    document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
 
     @field_validator('image_provider')
     @classmethod
@@ -419,6 +438,7 @@ class StreamRequest(BaseModel):
     @model_validator(mode='after')
     def validate_blog_fields(self):
         check_blog_fields(self.type, self.query, self.blog_options)
+        check_document_fields(self)
         return self
 
 
@@ -583,6 +603,7 @@ class ProcessResponse(BaseModel):
     design: Optional[Dict[str, Any]] = None
     graph_suggestions: List[GraphSuggestion] = Field(default_factory=list)
     graph_suggestion_error: Optional[Dict[str, str]] = None
+    document_edit: Optional[DocumentEditResult] = None
 
 
 class AutocompleteResponse(BaseModel):
@@ -927,6 +948,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             existing_design_ast=request_data.existing_design_ast,
             operation_type=agent_type,
             suggest_graphs=request_data.suggest_graphs,
+            document_text=request_data.document_text,
         )
         warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
@@ -957,7 +979,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         trace = get_trace(request_id)
         trace_attrs = trace.attrs if trace is not None else {}
         is_code = agent_type in ('generate_code', 'explain_code') or trace_attrs.get('agent_type') == 'code_writer'
-        keeps_fences = is_code or trace_attrs.get('mode') == 'longform'
+        keeps_fences = is_code or trace_attrs.get('mode') in ('longform', 'document_edit')
         if not keeps_fences and response.startswith('```markdown\n'):
             response = response[12:]
         elif not keeps_fences and response.startswith('```md\n'):
@@ -983,6 +1005,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'design': meta.get('design_ready') if meta else None,
                 'graph_suggestions': [meta['graph_suggestion']] if meta.get('graph_suggestion') else [],
                 'graph_suggestion_error': meta.get('graph_suggestion_unavailable'),
+                'document_edit': meta.get('document_edit_ready'),
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1083,12 +1106,12 @@ async def stream_text(
         full_query = build_full_query(
             agent_type, request_data.query, request_data.secondary_prompt or ""
         )
-        input_chars = len(request_data.query)
+        input_chars = len(request_data.query) + len(request_data.document_text or '')
 
         # Mode 8 is billed at a flat price, not by characters. Same gate, same inputs as the pipeline's priority-1
         # design check, so the price reserved here is the price of what the pipeline runs.
         design_plan = None
-        if agent_for_request_type(agent_type) == FREE_FORM_AGENT:
+        if request_data.document_text is None and agent_for_request_type(agent_type) == FREE_FORM_AGENT:
             from src.request_plan import plan_design_request
             design_plan = plan_design_request(
                 request_data.query, agent_type, bool(image_urls), bool(request_data.existing_design_ast))
@@ -1098,6 +1121,8 @@ async def stream_text(
         upfront_reserved_scaled = 0
         if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
             expected_output_chars = 0
+            if request_data.document_text is not None:
+                expected_output_chars = len(request_data.document_text)
             if agent_type == 'generate_blog':
                 # A post costs the platform its full parallel draft before the user has read a word: reserve for it.
                 from src.blog.plan import BlogRequest, plan_blog
@@ -1106,6 +1131,11 @@ async def stream_text(
                     request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None),
                     image_available=False).target_words
             upfront_reserved_scaled = design_price_scaled or text_credits_scaled(input_chars, expected_output_chars)
+            if request_data.document_text is not None and upfront_reserved_scaled > MAX_RESERVATION_PER_REQUEST_SCALED:
+                finish_trace(request_id, 'rejected', error='document request exceeds credit limit', http_status=402)
+                return JSONResponse(status_code=402, content={
+                    'error': 'This document exceeds the per-request credit limit. Use a smaller document.',
+                    'code': 'REQUEST_CREDIT_LIMIT'})
             if image_urls and not design_plan:
                 upfront_reserved_scaled += IMAGE_CREDITS_SCALED * len(image_urls)
             ok, available_scaled = credit_manager.reserve(user_id, upfront_reserved_scaled)
@@ -1189,6 +1219,7 @@ async def stream_text(
                     operation_type=agent_type,
                     cancel_event=cancel_event,
                     suggest_graphs=request_data.suggest_graphs,
+                    document_text=request_data.document_text,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
