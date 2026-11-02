@@ -47,6 +47,7 @@ Content-Type: application/json
 | Type | Description | Uses `secondary_prompt` |
 |------|-------------|------------------------|
 | `fix_grammar` | Fix grammar, spelling, and punctuation errors | No |
+| `highlight_key_points` | Select exact key phrases and return in-place highlight ranges without changing the text ([handoff](KEY_POINTS_API_HANDOFF.md)) | No |
 | `simplify` | Simplify complex text for easier understanding | No |
 | `complete` | Complete partial sentences and paragraphs | No |
 | `emojify` | Add relevant emojis to text | No |

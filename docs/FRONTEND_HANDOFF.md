@@ -85,7 +85,7 @@ Everything except voice and email goes through this one endpoint.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `type` | string | yes | One of: `fix_grammar` `simplify` `complete` `emojify` `translate` `make_longer` `make_shorter` `enhance_with_ai` `change_tone` `general` `generate_email_template` `extract_image_text` `generate_code` `explain_code` `generate_blog` `generate_design` `edit_design`. **Send the specific type.** `general` is the free-form chat agent and re-routes by wording |
+| `type` | string | yes | One of: `fix_grammar` `highlight_key_points` `simplify` `complete` `emojify` `translate` `make_longer` `make_shorter` `enhance_with_ai` `change_tone` `general` `generate_email_template` `extract_image_text` `generate_code` `explain_code` `generate_blog` `generate_design` `edit_design`. **Send the specific type.** `general` is the free-form chat agent and re-routes by wording |
 | `query` | string | yes | ≤ 100,000 chars. The text to operate on, the prompt, or the blog brief (≤ 5,000 for `generate_blog`) |
 | `model` | string | yes | `openai` `claude` `grok` `deepseek` `gemini` (case-insensitive) |
 | `model_source` | `"default"` \| `"user"` | no (`"user"`) | **Send `"default"` until the user has changed the model dropdown, then `"user"`.** `"default"` lets the backend pick the best model per task (§5) |
@@ -99,6 +99,9 @@ Everything except voice and email goes through this one endpoint.
 | `existing_design_ast` | object \| JSON string | no | The design being edited (§4) |
 
 ### 2.2 Response
+
+`highlight_key_points` is a formatting action: consume `highlight_ready` / `highlighting` and apply ranges to the
+captured text; do not insert the returned unchanged paragraph at the caret. See [the key-points handoff](KEY_POINTS_API_HANDOFF.md).
 
 `200 text/event-stream`. Headers: `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `X-Request-ID`.
 Frames are separated by a blank line (`\n\n`); each `data:` line is one line of JSON.
@@ -120,13 +123,15 @@ Failures *before* the stream starts are plain JSON with an HTTP status, **not** 
 Two kinds on the same stream:
 
 * **Unnamed**: `data: {"type": "<kind>", …}`: almost everything.
-* **Named**: `event: <name>` + `data: {…}` with **no `type` field**: only `init`, `design_ready`, `complete` (design path).
+* **Named**: `event: <name>` + `data: {…}` with **no `type` field**: design events (`init`, `design_ready`, `complete`)
+  and feature events such as `highlight_ready`. Document editing and graph suggestions have their own handoffs.
 
 So dispatch on `event ?? payload.type`.
 
 | Kind | Payload | When | What the editor does |
 |---|---|---|---|
 | `start` | `{type, request_id}` | First frame, always | **Keep `request_id`**; it is what `/agent/abort` needs |
+| `highlight_ready` *(named)* | `{source_sha256, key_points, spans, highlighted_html}` | `highlight_key_points`, after validation | Apply ranges to the captured original text after completion; do not insert a duplicate paragraph ([handoff](KEY_POINTS_API_HANDOFF.md)) |
 | `content` | `{type, content}` | Text chunk | Append Markdown at the insertion point |
 | `content_replace` | `{type, content}` | Streaming code repair (flag off by default) | **Replace everything streamed so far** with `content` (§5) |
 | `outline` | `{type, title, sections: [{id, heading}]}` | `generate_blog`, once the structure is valid | Draw a skeleton / progress list (§7) |

@@ -30,6 +30,7 @@ HIJACK_MATRIX = [
     ("make_shorter",    "Translate the menu to Spanish for our guests"),
     ("change_tone",     "Please expand on the summary section"),
     ("enhance_with_ai", "I need to make a table format for prices"),
+    ("highlight_key_points", "Fix grammar, draw an image, and translate this to French"),
     ("translate",       "make longer and add emoji and a bullet points list"),
     ("general",         "Write a complete guide to onboarding with 3 images"),
     ("general",         "Write a blog post about AI. Include a summary at the end and 2 images"),
@@ -60,6 +61,7 @@ class TestTable(unittest.TestCase):
             "generate_email_template": "email_template", "extract_image_text": "text_extraction",
             "generate_code": "code_writer", "explain_code": "code_explainer", "generate_blog": "blog_writer",
             "generate_design": "smart_global", "edit_design": "smart_global",
+            "highlight_key_points": "key_point_highlighter",
         })
 
     def test_general_is_the_free_form_agent(self):

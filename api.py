@@ -36,6 +36,7 @@ from src.charts.router import router as chart_router
 from src.charts.schema import GraphSuggestion
 from src.document_edit.router import router as document_router
 from src.document_edit.schema import DocumentEditResult
+from src.key_points import HighlightResult, KeyPointValidationError, MAX_TEXT_CHARS
 from src.code_validate import CodeValidationError
 from src.credit_manager import (
     AUTOCOMPLETE_CREDITS_SCALED,
@@ -111,7 +112,7 @@ VALID_AGENT_TYPES: frozenset[str] = frozenset({
     'make_longer', 'make_shorter', 'enhance_with_ai', 'change_tone',
     'general', 'generate_email_template', 'extract_image_text',
     'generate_code', 'explain_code', 'generate_blog',
-    'generate_design', 'edit_design',
+    'generate_design', 'edit_design', 'highlight_key_points',
 })
 _SORTED_AGENT_TYPES = ', '.join(sorted(VALID_AGENT_TYPES))
 
@@ -333,6 +334,16 @@ def check_document_fields(request) -> None:
     document_blocks(request.document_text)
 
 
+def check_highlight_fields(request) -> None:
+    if request.type != 'highlight_key_points':
+        return
+    if not request.query.strip() or len(request.query) > MAX_TEXT_CHARS:
+        raise ValueError(f'highlight_key_points needs a non-empty text portion of at most {MAX_TEXT_CHARS} characters')
+    request.query.encode('utf-8')
+    if request.secondary_prompt or request.existing_design_ast is not None or getattr(request, 'image_urls', None) or request.image_params or request.image_provider or request.image_model:
+        raise ValueError('highlight_key_points accepts text only; omit secondary_prompt and image/design inputs')
+
+
 class ProcessRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
@@ -381,6 +392,7 @@ class ProcessRequest(BaseModel):
     def validate_blog_fields(self):
         check_blog_fields(self.type, self.query, self.blog_options)
         check_document_fields(self)
+        check_highlight_fields(self)
         return self
 
 
@@ -439,6 +451,7 @@ class StreamRequest(BaseModel):
     def validate_blog_fields(self):
         check_blog_fields(self.type, self.query, self.blog_options)
         check_document_fields(self)
+        check_highlight_fields(self)
         return self
 
 
@@ -604,6 +617,7 @@ class ProcessResponse(BaseModel):
     graph_suggestions: List[GraphSuggestion] = Field(default_factory=list)
     graph_suggestion_error: Optional[Dict[str, str]] = None
     document_edit: Optional[DocumentEditResult] = None
+    highlighting: Optional[HighlightResult] = None
 
 
 class AutocompleteResponse(BaseModel):
@@ -636,6 +650,7 @@ TYPE_PREFIX_MAP: dict[str, str] = {
     'generate_code': '',
     'explain_code': '',
     'fix_grammar':            'Fix grammar: ',
+    'highlight_key_points':   '',
     'simplify':               'Simplify: ',
     'complete':               'Complete: ',
     'emojify':                'Emojify: ',
@@ -979,7 +994,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         trace = get_trace(request_id)
         trace_attrs = trace.attrs if trace is not None else {}
         is_code = agent_type in ('generate_code', 'explain_code') or trace_attrs.get('agent_type') == 'code_writer'
-        keeps_fences = is_code or trace_attrs.get('mode') in ('longform', 'document_edit')
+        keeps_fences = is_code or agent_type == 'highlight_key_points' or trace_attrs.get('mode') in ('longform', 'document_edit')
         if not keeps_fences and response.startswith('```markdown\n'):
             response = response[12:]
         elif not keeps_fences and response.startswith('```md\n'):
@@ -1006,10 +1021,14 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'graph_suggestions': [meta['graph_suggestion']] if meta.get('graph_suggestion') else [],
                 'graph_suggestion_error': meta.get('graph_suggestion_unavailable'),
                 'document_edit': meta.get('document_edit_ready'),
+                'highlighting': meta.get('highlight_ready'),
             },
             headers={"X-Request-ID": request_id},
         )
 
+    except KeyPointValidationError as exc:
+        finish_trace(request_id, 'rejected', error=str(exc), http_status=422)
+        return JSONResponse(status_code=422, content={'error': str(exc)}, headers={'X-Request-ID': request_id})
     except CodeValidationError as exc:
         finish_trace(request_id, 'rejected', error=str(exc), http_status=422)
         return JSONResponse(status_code=422, content={'error': str(exc), 'issues': exc.errors},

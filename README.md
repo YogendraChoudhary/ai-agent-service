@@ -210,6 +210,7 @@ contains the words "fix grammar" still runs the simplify agent.
 | `type` | Agent | | `type` | Agent |
 |---|---|---|---|---|
 | `fix_grammar` | `grammar` | | `make_shorter` | `make_shorter` |
+| `highlight_key_points` | `key_point_highlighter` | | | |
 | `simplify` | `simplify` | | `enhance_with_ai` | `enhance` |
 | `complete` | `completion` | | `change_tone` | `tone` |
 | `emojify` | `emojify` | | `generate_email_template` | `email_template` |
@@ -222,6 +223,11 @@ contains the words "fix grammar" still runs the simplify agent.
 (`src/request_plan.py`: image count, web access, model tier) and may take the direct image route.
 Tables, lists and summaries requested through `general` are handled by that agent; the dedicated `table`,
 `list` and `summarize` agents have no API `type` and are no longer reachable through the API.
+
+`highlight_key_points` accepts a paragraph/small text portion (up to 10,000 characters). It returns the exact
+original text plus extracted key phrases, safe HTML preview and source-bound ranges for highlighting in the
+editor; it never rewrites the paragraph. See [the frontend handoff](docs/KEY_POINTS_API_HANDOFF.md) or run
+`python scripts/demo_key_points.py` for a provider-free example (`--live` uses the configured OpenAI key).
 
 `enhance_with_ai` can additionally suggest an editable graph from the original text or Markdown table when
 `CHART_SUGGESTIONS_ENABLED=true` (off until the editor supports it). Suggestions are separate from the improved prose

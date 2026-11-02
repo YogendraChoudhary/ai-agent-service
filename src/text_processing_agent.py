@@ -1481,6 +1481,14 @@ AGENT_CONFIGS = {
         "instructions": ["Explain the supplied code and answer the user's question in clear Markdown. Include snippets when useful."],
         "use_advanced": True, "use_tools": False, "temperature": 0.3,
     },
+    "key_point_highlighter": {
+        "name": "Key Point Highlighter",
+        "role": "Select important source phrases without rewriting the text",
+        "instructions": ["Return only exact source excerpts as JSON."],
+        "use_tools": False,
+        "use_advanced": False,
+        "temperature": 0.0,
+    },
     "grammar": {
         "name": "Grammar Corrector",
         "role": "Fix grammar, spelling, and punctuation errors",
@@ -1829,7 +1837,7 @@ def _image_tool_available(model_provider, api_key, is_byok, image_ctx) -> bool:
 
 def _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx):
     """The plan only applies to the free-form agents, and images are dropped from it if none can be made."""
-    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor", "document_editor"):
+    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor", "document_editor", "key_point_highlighter"):
         return None
     if plan.image_count > 0 and not _image_tool_available(model_provider, api_key, is_byok, image_ctx):
         from dataclasses import replace
@@ -1929,7 +1937,7 @@ def create_agent(
         "instructions": instructions,
         # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes, and the long-form refiner
         # returns the passage it was given, polished; agno's "use markdown" nudge would only fight those prompts.
-        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor", "document_editor"),
+        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor", "document_editor", "key_point_highlighter"),
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
@@ -2023,6 +2031,7 @@ AGENT_FOR_REQUEST_TYPE = {
     "generate_code": "code_writer",
     "explain_code": "code_explainer",
     "fix_grammar": "grammar",
+    "highlight_key_points": "key_point_highlighter",
     "simplify": "simplify",
     "complete": "completion",
     "emojify": "emojify",
@@ -2500,6 +2509,13 @@ def process_user_query_stream(
         raise ValueError(f"Provider '{model_provider}' does not support image input")
     trace_set(request_id, candidates=[c.provider for c in candidates],
               route_reason='user_selection' if model_source == 'user' else 'task_default', fallbacks=[])
+
+    if agent_type == 'key_point_highlighter':
+        from .key_points import stream_key_points
+        yield from stream_key_points(user_text if user_text is not None else query,
+            candidates=candidates, key_for=key_resolver if routed else (lambda _provider: api_key),
+            is_byok=is_byok, request_id=request_id, user_id=user_id, report_model=report_model, cancel_event=cancel_event)
+        return
 
     def graph_suggestions():
         if agent_type == 'enhance' and user_text and suggest_graphs and settings.chart_suggestions_enabled and not image_urls:
