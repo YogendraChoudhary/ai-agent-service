@@ -100,8 +100,9 @@ Everything except voice and email goes through this one endpoint.
 
 ### 2.2 Response
 
-`highlight_key_points` is a formatting action: consume `highlight_ready` / `highlighting` and apply ranges to the
-captured text; do not insert the returned unchanged paragraph at the caret. See [the key-points handoff](KEY_POINTS_API_HANDOFF.md).
+`highlight_key_points` returns a concise summary as a lead sentence and bullet points. Consume `content` /
+`markdown_response` as the generated text; `highlight_ready` / `highlighting` contains the structured summary
+and evidence. Do not apply colored highlighting or source ranges. See [the key-points handoff](KEY_POINTS_API_HANDOFF.md).
 
 `200 text/event-stream`. Headers: `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `X-Request-ID`.
 Frames are separated by a blank line (`\n\n`); each `data:` line is one line of JSON.
@@ -131,7 +132,7 @@ So dispatch on `event ?? payload.type`.
 | Kind | Payload | When | What the editor does |
 |---|---|---|---|
 | `start` | `{type, request_id}` | First frame, always | **Keep `request_id`**; it is what `/agent/abort` needs |
-| `highlight_ready` *(named)* | `{source_sha256, key_points, spans, highlighted_html}` | `highlight_key_points`, after validation | Apply ranges to the captured original text after completion; do not insert a duplicate paragraph ([handoff](KEY_POINTS_API_HANDOFF.md)) |
+| `highlight_ready` *(named)* | `{source_sha256, lead, key_points, summary_markdown, evidence}` | `highlight_key_points`, after validation | Structured summary metadata; use normal content output for lead + bullets ([handoff](KEY_POINTS_API_HANDOFF.md)) |
 | `content` | `{type, content}` | Text chunk | Append Markdown at the insertion point |
 | `content_replace` | `{type, content}` | Streaming code repair (flag off by default) | **Replace everything streamed so far** with `content` (§5) |
 | `outline` | `{type, title, sections: [{id, heading}]}` | `generate_blog`, once the structure is valid | Draw a skeleton / progress list (§7) |

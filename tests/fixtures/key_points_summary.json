@@ -1,0 +1,29 @@
+{
+  "source": "The majority of respondents continue to identify rich text editors as key components of their applications, with 73% rating them as extremely or very important. That figure, however, shifts significantly with company size.\n\nFor organisations with 100 people or fewer, 71% rated RTEs at the top two levels of importance. Among mid-sized companies of up to 1,000 employees, that number dips to 68%. But at the enterprise level — organisations with more than 1,000 people — it jumps to 80%.\n\nThe pattern is clear: while RTEs matter to everyone, they become nearly indispensable as companies scale. Larger organisations need consistent, reliable content tools across more teams and products, making the choice of editor a strategic decision, not just a technical one.",
+  "selection": {
+    "lead": "73% of respondents rate rich text editors as extremely or very important.",
+    "key_points": [
+      {
+        "text": "Importance is 71% among organisations with 100 or fewer employees.",
+        "evidence": "For organisations with 100 people or fewer, 71% rated RTEs at the top two levels of importance."
+      },
+      {
+        "text": "The figure falls to 68% among organisations with up to 1,000 employees.",
+        "evidence": "Among mid-sized companies of up to 1,000 employees, that number dips to 68%."
+      },
+      {
+        "text": "Importance rises to 80% among enterprises with more than 1,000 employees.",
+        "evidence": "But at the enterprise level — organisations with more than 1,000 people — it jumps to 80%."
+      },
+      {
+        "text": "As organisations scale, reliable content tools become increasingly essential across teams and products.",
+        "evidence": "The pattern is clear: while RTEs matter to everyone, they become nearly indispensable as companies scale. Larger organisations need consistent, reliable content tools across more teams and products, making the choice of editor a strategic decision, not just a technical one."
+      },
+      {
+        "text": "Choosing an editor becomes a strategic rather than purely technical decision for larger organisations.",
+        "evidence": "Larger organisations need consistent, reliable content tools across more teams and products, making the choice of editor a strategic decision, not just a technical one."
+      }
+    ],
+    "lead_evidence": "The majority of respondents continue to identify rich text editors as key components of their applications, with 73% rating them as extremely or very important."
+  }
+}

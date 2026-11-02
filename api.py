@@ -994,7 +994,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         trace = get_trace(request_id)
         trace_attrs = trace.attrs if trace is not None else {}
         is_code = agent_type in ('generate_code', 'explain_code') or trace_attrs.get('agent_type') == 'code_writer'
-        keeps_fences = is_code or agent_type == 'highlight_key_points' or trace_attrs.get('mode') in ('longform', 'document_edit')
+        keeps_fences = is_code or trace_attrs.get('mode') in ('longform', 'document_edit')
         if not keeps_fences and response.startswith('```markdown\n'):
             response = response[12:]
         elif not keeps_fences and response.startswith('```md\n'):

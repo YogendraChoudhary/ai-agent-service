@@ -1483,8 +1483,8 @@ AGENT_CONFIGS = {
     },
     "key_point_highlighter": {
         "name": "Key Point Highlighter",
-        "role": "Select important source phrases without rewriting the text",
-        "instructions": ["Return only exact source excerpts as JSON."],
+        "role": "Summarize key takeaways as a lead sentence and concise supporting points",
+        "instructions": ["Return a concise source-grounded key-point summary as JSON."],
         "use_tools": False,
         "use_advanced": False,
         "temperature": 0.0,
