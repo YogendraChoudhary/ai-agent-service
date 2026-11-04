@@ -158,8 +158,10 @@ The placeholder array above represents objects, not strings. Response:
 
 1. Import an uploaded document through the existing application flow. Serialize its authorized full current
    content to stable Markdown/plain text and capture the current editor/document version.
-2. When the user prompts without a selection, send `document_text` plus the prompt as `query`; send no cursor or
-   selection fields. Keep legacy selection-based operations unchanged when this field is omitted.
+2. For an instruction to edit existing prose without a selection, send `document_text` plus the instruction as
+   `query`; send no cursor or selection fields on this legacy edit path. Questions and new drafting use the separate
+   [document-context contract](DOCUMENT_CONTEXT_API_HANDOFF.md), which is enabled by default. New
+   `document_action="edit"` requests also use this same patch flow. Keep legacy selection-based operations unchanged.
 3. Buffer document-mode output. Show targeted paragraph highlights, before/after text and reasons. Display
    clarifications in the chat. Provide Accept and Dismiss; proposals do not save automatically.
 4. Before acceptance, confirm the current serialized document still matches `base_sha256`. Call `/apply` through
@@ -185,3 +187,11 @@ The placeholder array above represents objects, not strings. Response:
   replays accepted patches and verifies a changed source is rejected with HTTP 409.
 
 These examples verify specific inputs and invariants; they are not a statistical benchmark of intent accuracy.
+
+## Style reference for explicit context Edit
+
+New `document_context` + `document_action="edit"` requests give the existing block writer up to three
+read-only untargeted prose samples (2,000 serialized UTF-8 bytes total), preferring the same section and
+excluding protected/excluded sections. Samples guide tone and sentence style only. Target selection,
+source hashes, protected structures, numeric checks, exact replay and apply behavior are unchanged.
+Legacy `document_text` requests keep their existing prompts without the additional style samples.

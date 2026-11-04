@@ -180,11 +180,17 @@ def finish_trace(
 
 def log_request_body(request_id: str, endpoint: str, payload: Dict[str, Any]) -> None:
     if settings.log_request_bodies:
+        if payload.get('document_context') is not None:
+            payload = {k: payload.get(k) for k in ('type', 'model', 'document_action')}
+            payload['document_context'] = '[document source and task excluded]'
         logger.info(f"📥 [{request_id}] {endpoint} REQUEST  {_clip(redact(payload))}")
 
 
 def log_response_body(request_id: str, endpoint: str, body: Any) -> None:
     if settings.log_request_bodies:
+        trace = get_trace(request_id)
+        if trace is not None and trace.attrs.get('document_context_request'):
+            body = {'document_response': '[content excluded]'}
         logger.info(f"📤 [{request_id}] {endpoint} RESPONSE {_clip(redact(body))}")
 
 

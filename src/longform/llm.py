@@ -85,9 +85,10 @@ class AgnoLLM:
     def __init__(self, candidates: Sequence, key_for: Callable[[str], Optional[str]], *,
                  outline_candidates: Optional[Sequence] = None, request_id: Optional[str] = None,
                  user_id: Optional[str] = None, is_byok: bool = False, image_ctx: Optional[dict] = None,
-                 agent_type: str = "blog_writer", timeout: Optional[float] = None):
+                 agent_type: str = "blog_writer", timeout: Optional[float] = None, cancel_event=None):
         self.agent_type = agent_type                         # the AGENT_CONFIGS entry every call is made with
         self.timeout = timeout                               # seconds one call may take before it counts as a retryable failure
+        self.cancel_event = cancel_event
         self.candidates = list(candidates)
         self.outline_candidates = list(outline_candidates) if outline_candidates else None
         self.key_for = key_for
@@ -193,6 +194,11 @@ class AgnoLLM:
             instructions=system, temperature=spec.temperature, max_tokens=spec.max_tokens,
         )
         history = [Message(role=m["role"], content=m["content"]) for m in messages]
+        if self.agent_type == 'document_editor':
+            from src.document_edit.service import EditCancelled
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise EditCancelled()
+            trace_set(self.request_id, document_model_started=True)
         if spec.on_text is None:
             response = agent.run(history, stream=False)
             # agno does not raise on provider failures: the run comes back failed with the error text as content.

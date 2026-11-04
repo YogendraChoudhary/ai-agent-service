@@ -60,6 +60,60 @@ def test_only_target_blocks_change_and_all_other_bytes_are_original():
     assert metadata.result_sha256 == fingerprint(result)
 
 
+@pytest.mark.parametrize('fence', ['```json', '```'])
+def test_fenced_planner_json_keeps_schema_scope_and_exact_patch_validation(fence):
+    instruction = 'Remove repeated words in Introduction. Leave Pricing and Conclusion unchanged.'
+    block = prose()[0]
+    editor = ScriptedEditor(instruction, [block], {block.id: block.text.replace('very very', 'very')})
+    def wrapped(system, messages, spec):
+        reply = editor(system, messages, spec)
+        return fence + '\n' + reply + '\n```' if spec.stage == 'document_plan' else reply
+    text, metadata = edit_document(DOC, instruction, wrapped)
+    assert metadata.status == 'proposed'
+    assert {p.block_id for p in metadata.patches} == {block.id}
+    assert text == DOC.replace('very very', 'very')
+    assert apply_document_patches(DOC, metadata.base_sha256, metadata.patches) == text
+
+
+def test_fenced_plan_with_unknown_schema_fields_is_still_rejected_before_rewriting():
+    calls = []
+    def malformed(system, messages, spec):
+        calls.append(spec.stage)
+        return '```json\n{"status":"no_change","message":"No change","targets":[],"unsafe":true}\n```'
+    with pytest.raises(ValueError):
+        edit_document(DOC, 'Improve Introduction', malformed)
+    assert calls == ['document_plan']
+
+
+@pytest.mark.parametrize('match_style', [False, True])
+def test_style_reference_is_bounded_read_only_and_excludes_targets_and_protected_sections(match_style):
+    source = ('## Voice\n\nWe write plainly. We keep each point brief.\n\n'
+        '## Introduction\n\nThis introduction is very very useful for readers.\n\n'
+        '## Pricing\n\nUSD 27 must stay unchanged.\n\n## Conclusion\n\nProtected final recommendation.\n')
+    instruction = 'Make Introduction fit the rest. Leave Pricing and Conclusion unchanged.'
+    block = next(b for b in document_blocks(source) if b.editable and b.section[-1:] == ('Introduction',))
+    editor = ScriptedEditor(instruction, [block], {block.id: block.text.replace('very very', 'very')})
+    seen = []
+    def llm(system, messages, spec):
+        if spec.stage == 'document_block':
+            seen.append((system, json.loads(messages[0]['content'])))
+        return editor(system, messages, spec)
+    text, metadata = edit_document(source, instruction, llm, match_style=match_style)
+    assert metadata.status == 'proposed'
+    assert text == source.replace('very very', 'very')
+    system, data = seen[0]
+    if match_style:
+        refs = data['STYLE_REFERENCE']
+        assert 'We write plainly' in json.dumps(refs)
+        assert 'USD' not in json.dumps(refs) and 'Protected final' not in json.dumps(refs)
+        assert block.text not in json.dumps(refs)
+        assert len(json.dumps(refs, ensure_ascii=False).encode('utf8')) <= 2000
+        assert 'read-only' in system and 'Only TARGET may change' in system
+    else:
+        from src.document_edit.service import EDIT_SYSTEM
+        assert 'STYLE_REFERENCE' not in data and system == EDIT_SYSTEM
+
+
 @pytest.mark.parametrize("instruction,expected", [
     ("Only improve the Introduction", ["Introduction"]),
     ("Improve Introduction and Benefits; keep Pricing unchanged.", ["Introduction", "Benefits"]),

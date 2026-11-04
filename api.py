@@ -36,6 +36,9 @@ from src.charts.router import router as chart_router
 from src.charts.schema import GraphSuggestion
 from src.document_edit.router import router as document_router
 from src.document_edit.schema import DocumentEditResult
+from src.document_context import AnalysisMode, DocumentAction, DocumentScope, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context
+from src.document_analysis import AnalysisResult
+from src.document_intent import IntentSuggestion, suggest_document_intent
 from src.key_points import HighlightResult, KeyPointValidationError, MAX_TEXT_CHARS
 from src.code_validate import CodeValidationError
 from src.credit_manager import (
@@ -71,6 +74,8 @@ from src.webhook import (
     fire_credit_deduction,
     fire_credit_deduction_and_release,
     fire_prompt_history_save,
+    start_billing_delivery,
+    stop_billing_delivery,
 )
 
 # ---------------------------------------------------------------------------
@@ -201,6 +206,7 @@ async def lifespan(app: FastAPI):
     if redis_manager is not None:
         try:
             credit_manager = CreditManager(redis_manager.redis_client)
+            start_billing_delivery(redis_manager.redis_client)
             logger.info("✅ CreditManager initialised successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialise CreditManager: {e}")
@@ -222,6 +228,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # ---- shutdown ----
+    stop_billing_delivery()
     if redis_manager is not None:
         try:
             redis_manager.close()
@@ -322,6 +329,37 @@ def check_blog_fields(request_type: str, query: str, blog_options: Optional[Blog
 
 
 def check_document_fields(request) -> None:
+    if request.document_context is None and (request.document_action is not None or request.document_scope is not None or request.document_analysis is not None or request.suggest_document_intent):
+        raise ValueError('Document actions, scope, analysis and intent suggestions require document_context')
+    if request.document_context is not None:
+        if request.document_text is not None:
+            raise ValueError('Supply only one of document_context and document_text')
+        if request.type != 'general':
+            raise ValueError('document_context is only valid with type general')
+        action, scope = request.document_action or 'ask', request.document_scope or 'document'
+        if scope != 'document' and action != 'ask':
+            raise ValueError('Scoped retrieval is only available for Ask')
+        if scope == 'selection' and (request.document_context.selection is None or request.document_context.selection.start_utf16 == request.document_context.selection.end_utf16):
+            raise ValueError('Selection scope requires a nonempty selection')
+        if request.document_analysis is not None and (action != 'ask' or scope != 'document'):
+            raise ValueError('Analysis requires Ask with document scope')
+        limit = 2000 if request.document_action == 'edit' else 8000
+        if not request.query.strip() or len(request.query) > limit or request.secondary_prompt:
+            raise ValueError(f'With document_context, query must contain 1–{limit} characters; omit secondary_prompt')
+        try:
+            request.query.encode('utf-8')
+        except UnicodeEncodeError:
+            raise ValueError('query must contain valid Unicode') from None
+        if '\x00' in request.query:
+            raise ValueError('query must not contain NUL characters')
+        if request.document_analysis is not None and len(json.dumps(request.query, ensure_ascii=False).encode('utf-8')) > 2000:
+            raise ValueError('An analysis instruction must fit 2,000 serialized UTF-8 bytes')
+        if request.existing_design_ast is not None or getattr(request, 'image_urls', None) or request.image_params or request.image_provider or request.image_model or request.blog_options is not None:
+            raise ValueError('Document context does not accept design, image or blog inputs')
+        if request.document_action == 'edit':
+            from src.document_edit.blocks import document_blocks
+            document_blocks(request.document_context.text)
+        return
     if request.document_text is None:
         return
     if request.type not in ('general', 'enhance_with_ai'):
@@ -344,6 +382,18 @@ def check_highlight_fields(request) -> None:
         raise ValueError('highlight_key_points accepts text only; omit secondary_prompt and image/design inputs')
 
 
+async def document_request_inputs(request):
+    if request.document_context is None:
+        return request.document_text, None
+    if not settings.document_context_enabled:
+        raise HTTPException(status_code=503, detail={'error': 'Document context is disabled', 'code': 'DOCUMENT_CONTEXT_DISABLED'})
+    if request.document_action == 'edit':
+        return request.document_context.text, None
+    prepared = await run_in_threadpool(prepare_context, request.document_context, request.query, request.document_action or 'ask',
+                                     scope=request.document_scope or 'document', analysis=request.document_analysis)
+    return None, prepared
+
+
 class ProcessRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
@@ -358,6 +408,19 @@ class ProcessRequest(BaseModel):
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
     suggest_graphs: bool = True       # Enhance only; also requires CHART_SUGGESTIONS_ENABLED
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
+    document_context: Optional[DocumentContext] = None
+    document_action: Optional[DocumentAction] = None
+    document_scope: Optional[DocumentScope] = None
+    document_analysis: Optional[AnalysisMode] = None
+    suggest_document_intent: bool = Field(False, strict=True)
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_context_attachments(cls, values):
+        # Process has no image_urls field; do not silently discard attachments on the new path.
+        if isinstance(values, dict) and values.get('document_context') is not None and values.get('image_urls'):
+            raise ValueError('Document context does not accept image attachments')
+        return values
 
     @field_validator('image_provider')
     @classmethod
@@ -417,6 +480,11 @@ class StreamRequest(BaseModel):
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
     suggest_graphs: bool = True
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
+    document_context: Optional[DocumentContext] = None
+    document_action: Optional[DocumentAction] = None
+    document_scope: Optional[DocumentScope] = None
+    document_analysis: Optional[AnalysisMode] = None
+    suggest_document_intent: bool = Field(False, strict=True)
 
     @field_validator('image_provider')
     @classmethod
@@ -617,6 +685,9 @@ class ProcessResponse(BaseModel):
     graph_suggestions: List[GraphSuggestion] = Field(default_factory=list)
     graph_suggestion_error: Optional[Dict[str, str]] = None
     document_edit: Optional[DocumentEditResult] = None
+    document_context: Optional[ContextMetadata] = None
+    document_analysis: Optional[AnalysisResult] = None
+    document_intent: Optional[IntentSuggestion] = None
     highlighting: Optional[HighlightResult] = None
 
 
@@ -898,19 +969,21 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
     start_trace(
         request_id, '/agent/process', type=request_data.type, chat_model=request_data.model,
         query_chars=len(request_data.query),
+        document_context_request=request_data.document_context is not None,
     )
     log_request_body(request_id, '/agent/process', request_data.model_dump())
 
     logger.info(f"[{request_id}] ========== NEW REQUEST ==========")
 
     try:
+        document_text, prepared_context = await document_request_inputs(request_data)
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
         query_preview = (
             request_data.query[:100] + '...' if len(request_data.query) > 100
             else request_data.query
         )
-        logger.info(f"[{request_id}] Query preview: {query_preview}")
+        logger.info(f"[{request_id}] Query preview: " + ('[document task]' if request_data.document_context is not None else query_preview))
 
         agent_type = request_data.type
         model_provider = request_data.model
@@ -963,7 +1036,10 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             existing_design_ast=request_data.existing_design_ast,
             operation_type=agent_type,
             suggest_graphs=request_data.suggest_graphs,
-            document_text=request_data.document_text,
+            document_text=document_text,
+            prepared_context=prepared_context,
+            match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
+            document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
         )
         warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
@@ -994,7 +1070,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         trace = get_trace(request_id)
         trace_attrs = trace.attrs if trace is not None else {}
         is_code = agent_type in ('generate_code', 'explain_code') or trace_attrs.get('agent_type') == 'code_writer'
-        keeps_fences = is_code or trace_attrs.get('mode') in ('longform', 'document_edit')
+        keeps_fences = is_code or trace_attrs.get('mode') in ('longform', 'document_edit', 'document_context')
         if not keeps_fences and response.startswith('```markdown\n'):
             response = response[12:]
         elif not keeps_fences and response.startswith('```md\n'):
@@ -1021,6 +1097,9 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'graph_suggestions': [meta['graph_suggestion']] if meta.get('graph_suggestion') else [],
                 'graph_suggestion_error': meta.get('graph_suggestion_unavailable'),
                 'document_edit': meta.get('document_edit_ready'),
+                'document_context': meta.get('document_context_ready'),
+                'document_analysis': meta.get('document_analysis_ready'),
+                'document_intent': meta.get('document_intent_suggested'),
                 'highlighting': meta.get('highlight_ready'),
             },
             headers={"X-Request-ID": request_id},
@@ -1037,13 +1116,14 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         finish_trace(request_id, 'rejected', error=str(exc.detail), http_status=exc.status_code)
         raise  # let FastAPI's exception handler format the response
     except Exception as e:
-        finish_trace(request_id, 'error', error=str(e), http_status=500)
+        error = CONTEXT_ERROR if request_data.document_context is not None else str(e)
+        finish_trace(request_id, 'error', error=error, http_status=500)
         total_duration = time.time() - start_time
-        logger.error(f"[{request_id}] FAILED — {e} ({total_duration:.2f}s)")
+        logger.error(f"[{request_id}] FAILED — {error} ({total_duration:.2f}s)")
         logger.info(f"[{request_id}] ================================")
         return JSONResponse(
             status_code=500,
-            content={'error': str(e)},
+            content={'error': error},
             headers={"X-Request-ID": request_id},
         )
 
@@ -1064,19 +1144,22 @@ async def stream_text(
     start_trace(
         request_id, '/agent/stream', type=request_data.type, chat_model=request_data.model,
         query_chars=len(request_data.query),
+        document_context_request=request_data.document_context is not None,
     )
     log_request_body(request_id, '/agent/stream', request_data.model_dump())
 
     logger.info(f"[{request_id}] ========== NEW STREAM REQUEST ==========")
 
     try:
+        document_text, prepared_context = await document_request_inputs(request_data)
+        context_no_model = prepared_context is not None and prepared_context.message is not None
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
         query_preview = (
             request_data.query[:100] + '...' if len(request_data.query) > 100
             else request_data.query
         )
-        logger.info(f"[{request_id}] Query preview: {query_preview}")
+        logger.info(f"[{request_id}] Query preview: " + ('[document task]' if request_data.document_context is not None else query_preview))
 
         agent_type = request_data.type
         model_provider = request_data.model
@@ -1097,15 +1180,17 @@ async def stream_text(
 
         user_id = license_meta['user_id']
         is_byok = license_meta['requires_user_api_keys']
+        if not context_no_model and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is None:
+            raise HTTPException(status_code=503, detail='Credit service unavailable')
         key_resolver = None
         text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
-        if settings.task_routing_enabled or settings.provider_fallback_enabled:
+        if not context_no_model and (settings.task_routing_enabled or settings.provider_fallback_enabled):
             from src.task_router import KeyResolver
             key_resolver = KeyResolver(license_meta['user_keys'], None if text_byok else DEFAULT_API_KEYS,
                                        redis_manager.resolve_api_key_from_user_keys)
             if not key_resolver.available_providers:
                 raise HTTPException(status_code=400, detail='No API key configured for an eligible provider')
-        original_prompt = (
+        original_prompt = '' if request_data.document_context is not None else (
             request_data.original_prompt.strip() if request_data.original_prompt else ''
         )
 
@@ -1125,12 +1210,13 @@ async def stream_text(
         full_query = build_full_query(
             agent_type, request_data.query, request_data.secondary_prompt or ""
         )
-        input_chars = len(request_data.query) + len(request_data.document_text or '')
+        input_chars = (prepared_context.metadata.billable_input_chars if prepared_context is not None
+                       else len(request_data.query) + len(document_text or ''))
 
         # Mode 8 is billed at a flat price, not by characters. Same gate, same inputs as the pipeline's priority-1
         # design check, so the price reserved here is the price of what the pipeline runs.
         design_plan = None
-        if request_data.document_text is None and agent_for_request_type(agent_type) == FREE_FORM_AGENT:
+        if document_text is None and prepared_context is None and agent_for_request_type(agent_type) == FREE_FORM_AGENT:
             from src.request_plan import plan_design_request
             design_plan = plan_design_request(
                 request_data.query, agent_type, bool(image_urls), bool(request_data.existing_design_ast))
@@ -1138,10 +1224,14 @@ async def stream_text(
 
         # Upfront credit reservation (skipped for BYOK users)
         upfront_reserved_scaled = 0
-        if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
+        if not context_no_model and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
             expected_output_chars = 0
-            if request_data.document_text is not None:
-                expected_output_chars = len(request_data.document_text)
+            reservation_input_chars = input_chars
+            if prepared_context is not None and prepared_context.analysis is not None:
+                reservation_input_chars = prepared_context.metadata.reserved_input_chars
+                expected_output_chars = prepared_context.metadata.reserved_output_chars
+            if document_text is not None:
+                expected_output_chars = len(document_text)
             if agent_type == 'generate_blog':
                 # A post costs the platform its full parallel draft before the user has read a word: reserve for it.
                 from src.blog.plan import BlogRequest, plan_blog
@@ -1149,8 +1239,8 @@ async def stream_text(
                     request_data.query, request_data.secondary_prompt,
                     request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None),
                     image_available=False).target_words
-            upfront_reserved_scaled = design_price_scaled or text_credits_scaled(input_chars, expected_output_chars)
-            if request_data.document_text is not None and upfront_reserved_scaled > MAX_RESERVATION_PER_REQUEST_SCALED:
+            upfront_reserved_scaled = design_price_scaled or text_credits_scaled(reservation_input_chars, expected_output_chars)
+            if (document_text is not None or prepared_context is not None) and upfront_reserved_scaled > MAX_RESERVATION_PER_REQUEST_SCALED:
                 finish_trace(request_id, 'rejected', error='document request exceeds credit limit', http_status=402)
                 return JSONResponse(status_code=402, content={
                     'error': 'This document exceeds the per-request credit limit. Use a smaller document.',
@@ -1184,6 +1274,7 @@ async def stream_text(
             credit_limit_hit = False
             stream_warnings: list = []
             design_billing = None   # set when a Mode 8 design is delivered: its flat price replaces the char charge
+            analysis_billing = None
 
             # Register lock-free cancellation event for this request (Point 6)
             cancel_event = register_cancellation_event(request_id)
@@ -1238,10 +1329,15 @@ async def stream_text(
                     operation_type=agent_type,
                     cancel_event=cancel_event,
                     suggest_graphs=request_data.suggest_graphs,
-                    document_text=request_data.document_text,
+                    document_text=document_text,
+                    prepared_context=prepared_context,
+                    match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
+                    document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
+                        if prepared_context is not None or document_text is not None:
+                            trace_status = 'aborted'
                         logger.info(
                             f"[{request_id}] Generator stopped by client abort "
                             f"(output_chars={output_chars})"
@@ -1258,6 +1354,8 @@ async def stream_text(
                     if isinstance(chunk, dict) and '__event__' in chunk:
                         ev = chunk['__event__']
                         if isinstance(ev, dict) and 'event' in ev and 'data' in ev:
+                            if ev['event'] == 'document_analysis_ready':
+                                analysis_billing = ev['data']['billing']
                             if ev['event'] == 'design_ready' and design_plan is not None:
                                 design_billing = {'sub_mode': design_plan.design_sub_mode,
                                                   'credits_scaled': design_price_scaled}
@@ -1275,7 +1373,7 @@ async def stream_text(
                     next_output_chars = len(chunk) if replacing else output_chars + len(chunk)
 
                     # Per-1000-char incremental reservation (non-BYOK only)
-                    if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
+                    if not context_no_model and analysis_billing is None and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
                         while (input_chars + next_output_chars) > next_reserve_threshold:
                             if (
                                 upfront_reserved_scaled + extra_reserved_scaled
@@ -1316,6 +1414,9 @@ async def stream_text(
                     f"pending images: {pending_count}"
                 )
                 done_event = {'type': 'done', 'duration': round(total_duration, 2), 'pending_images': pending_count}
+                if (prepared_context is not None or document_text is not None) and cancel_event.is_set():
+                    done_event['aborted'] = True
+                    trace_status = 'aborted'
                 if stream_warnings:
                     done_event['warnings'] = stream_warnings
                 yield f"data: {json.dumps(done_event)}\n\n"
@@ -1392,10 +1493,10 @@ async def stream_text(
 
             except Exception as e:
                 had_error = True
-                trace_status, trace_error = 'error', str(e)
+                trace_status, trace_error = 'error', CONTEXT_ERROR if request_data.document_context is not None else str(e)
                 error_code = type(e).__name__
-                logger.error(f"[{request_id}] STREAM FAILED — {e}")
-                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+                logger.error(f"[{request_id}] STREAM FAILED — {trace_error}")
+                yield f"data: {json.dumps({'type': 'error', 'error': trace_error})}\n\n"
 
             except GeneratorExit:
                 trace_status = 'aborted'
@@ -1406,7 +1507,15 @@ async def stream_text(
                 )
 
             finally:
+                if prepared_context is not None and prepared_context.analysis is not None:
+                    cancel_event.set()
                 unregister_cancellation_event(request_id)
+                context_trace = get_trace(request_id)
+                context_used_model = (prepared_context is None and document_text is None) or bool(context_trace and context_trace.attrs.get('document_model_started'))
+                if prepared_context is not None and prepared_context.analysis is not None and analysis_billing is None and not had_error:
+                    context_used_model = False
+                billed_input_chars = analysis_billing['input_chars'] if analysis_billing is not None else input_chars
+                billed_output_chars = analysis_billing['output_chars'] if analysis_billing is not None else output_chars
                 duration_ms = int((time.time() - start_time) * 1000)
                 log_response_body(request_id, '/agent/stream', {
                     'text': ''.join(out_preview), 'output_chars': output_chars,
@@ -1417,7 +1526,10 @@ async def stream_text(
                     images=summarize_images(pending_images), http_status=200,
                 )
 
-                if not had_error and not is_byok:
+                if not context_used_model and not is_byok and credit_manager is not None and upfront_reserved_scaled:
+                    credit_manager.schedule_release(user_id, upfront_reserved_scaled + extra_reserved_scaled, delay_seconds=0)
+
+                if context_used_model and not had_error and not is_byok:
                     if resolved_image_count > 0 and output_chars > 0:
                         op_type = 'mixed'
                     elif resolved_image_count > 0:
@@ -1437,8 +1549,8 @@ async def stream_text(
                         )
                         fire_credit_deduction_and_release(
                             user_id=user_id,
-                            input_chars=input_chars,
-                            output_chars=output_chars,
+                            input_chars=billed_input_chars,
+                            output_chars=billed_output_chars,
                             operation_type=op_type,
                             image_count=resolved_image_count,
                             reserved_scaled=total_reserved_scaled,
@@ -1453,14 +1565,14 @@ async def stream_text(
                         )
                     else:
                         fire_credit_deduction(
-                            user_id, input_chars, output_chars, op_type,
+                            user_id, billed_input_chars, billed_output_chars, op_type,
                             resolved_image_count,
                             provider=bill_provider, model=bill_model,
                             duration_ms=duration_ms, success=True,
                             images=image_details, design=design_billing,
                         )
 
-                elif had_error and not is_byok:
+                elif context_used_model and had_error and not is_byok:
                     if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
                         total_reserved_scaled = (
                             upfront_reserved_scaled
@@ -1495,13 +1607,14 @@ async def stream_text(
         finish_trace(request_id, 'rejected', error=str(exc.detail), http_status=exc.status_code)
         raise
     except Exception as e:
-        finish_trace(request_id, 'error', error=str(e), http_status=500)
+        error = CONTEXT_ERROR if request_data.document_context is not None else str(e)
+        finish_trace(request_id, 'error', error=error, http_status=500)
         total_duration = time.time() - start_time
-        logger.error(f"[{request_id}] STREAM FAILED — {e} ({total_duration:.2f}s)")
+        logger.error(f"[{request_id}] STREAM FAILED — {error} ({total_duration:.2f}s)")
         logger.info(f"[{request_id}] ================================")
         return JSONResponse(
             status_code=500,
-            content={'error': str(e)},
+            content={'error': error},
             headers={"X-Request-ID": request_id},
         )
 

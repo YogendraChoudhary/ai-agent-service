@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     backend_webhook_url: str = Field("", alias="BACKEND_WEBHOOK_URL")
     webhook_secret: str = Field("", alias="WEBHOOK_SECRET")
+    billing_webhook_idempotent: bool = Field(False, alias="BILLING_WEBHOOK_IDEMPOTENT")
 
     # ------------------------------------------------------------------
     # CDN / S3
@@ -192,6 +193,7 @@ class Settings(BaseSettings):
     web_read_call_limit: int = Field(8, alias="WEB_READ_CALL_LIMIT")
     model_tier_routing_enabled: bool = Field(True, alias="MODEL_TIER_ROUTING_ENABLED")  # False = always advanced
     tier_long_query_chars: int = Field(1500, alias="TIER_LONG_QUERY_CHARS")
+    document_context_enabled: bool = Field(True, alias="DOCUMENT_CONTEXT_ENABLED")
     image_wait_seconds: int = Field(120, alias="IMAGE_WAIT_SECONDS")                # /agent/process waits this long
     # JSON object of per-image credit overrides in scaled units, e.g. {"openai/gpt-image-1": 80}
     image_credits_by_model: str = Field("", alias="IMAGE_CREDITS_BY_MODEL")

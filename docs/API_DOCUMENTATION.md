@@ -2,6 +2,23 @@
 
 A powerful AI-powered text processing API that supports multiple AI providers and various text operations for HTML editor integration.
 
+## Document awareness
+
+Billing reliability: [Python billing delivery and cancellation](BILLING_DELIVERY.md) describes durable pending charges,
+credit holds, the stable `Idempotency-Key` header and the opt-in retry requirement. Document edits canceled before
+any provider call now report `done.aborted=true` and release their reservation without a successful deduction.
+
+Scoped Ask (`document_scope`), full-source `document_analysis`, style-aware explicit Edit and opt-in
+`suggest_document_intent` are supported. See the [context handoff](DOCUMENT_CONTEXT_API_HANDOFF.md)
+for request validation, evidence/progress events, analysis budgets and intermediate-stage billing.
+
+The additive `document_context` field supports `document_action="ask"`, `"draft"` or `"edit"` on
+`type="general"` for both process and stream. It is enabled by default (`DOCUMENT_CONTEXT_ENABLED=true`);
+an explicit `false` disables new-path requests with HTTP 503 and code `DOCUMENT_CONTEXT_DISABLED`. Ask/Draft return context coverage and
+billable input metadata; Edit delegates to the existing patch flow. Existing `document_text` requests are unchanged.
+See [Document context API and editor integration](DOCUMENT_CONTEXT_API_HANDOFF.md) for the complete schema,
+limits, named stream event, upstream billing requirements and snapshot/Insert rules.
+
 ## Base URL
 
 ```
@@ -74,7 +91,8 @@ Content-Type: application/json
 ```
 
 `html_response` repeats `markdown_response` (kept for existing clients). `warnings` is always present and empty unless the
-server fixed or could not do something (today only `generate_blog` reports any; see below).
+server fixed or could not do something. Document-aware drafting also reports partial context and output-limit
+warnings; see the document-context handoff.
 
 **Error (400/500)**
 ```json

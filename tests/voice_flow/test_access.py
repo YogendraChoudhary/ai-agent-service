@@ -1,7 +1,6 @@
 """Licence and credits for POST /v1/voice/dictate (src/voice_flow/access.py), with a fake Redis, credit manager and webhook."""
 
 import asyncio
-import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -356,14 +355,16 @@ class TestWiring:
 
     def test_a_dictation_through_the_real_app_is_billed_through_the_real_webhook_path(self, monkeypatch):
         import api
-        redis, credits, transcriber = FakeRedis(), FakeCredits(), FakeTranscriber()
-        sent, released = [], threading.Event()
-
-        def release(user_id, scaled):
-            credits.schedule_release(user_id, scaled)
-            released.set()
-
-        monkeypatch.setattr(credits, "release", release, raising=False)
+        import fakeredis
+        from src.billing_delivery import BillingDelivery, pending_credits_key
+        from src.credit_manager import CreditManager
+        redis, transcriber = FakeRedis(), FakeTranscriber()
+        store = fakeredis.FakeRedis(decode_responses=True)
+        store.hset('subscription:u1', mapping={'remaining_credits': 100, 'purchased_credits': 0})
+        credits = CreditManager(store)
+        box = BillingDelivery(store, 'https://billing.invalid/voice-test', 'test-secret')
+        monkeypatch.setattr('src.webhook._billing_delivery', box)
+        sent = []
         monkeypatch.setattr(api, "redis_manager", redis)
         monkeypatch.setattr(api, "credit_manager", credits)
         monkeypatch.setattr(api, "CREDIT_PRECHECK_ENABLED", True)
@@ -377,14 +378,18 @@ class TestWiring:
         assert dictate(client, wav(1.0)).status_code == 401
         r = dictate(client, wav(1.0), headers=AUTH)
         assert r.status_code == 200 and r.json()["formatted_text"] == TASKS
-        assert released.wait(2)
-        assert credits.reserve_calls == [("u1", 10)] and credits.released == [10]
+        assert store.get('credits_reserved:u1') is None
+        assert store.get(pending_credits_key('u1')) == '10'
+        assert not sent
+        assert box.process_once() and box.process_once()
+        assert store.get(pending_credits_key('u1')) is None
         assert sent[0]["json"] == {
             "user_id": "u1", "input_chars": 0, "output_chars": len(TASKS), "operation_type": "text", "image_count": 0,
             "provider": "fake", "model": None, "duration_ms": sent[0]["json"]["duration_ms"],
             "success": True, "error_code": None,
         }
         assert sent[0]["headers"]["X-Webhook-Secret"] == "test-secret"
+        assert sent[0]['headers']['Idempotency-Key']
         assert dictate(client, b"nope", headers=AUTH).json() == {"error": "could not decode the audio"}
         monkeypatch.setattr(router_module, "_in_flight", router_module.MAX_DICTATIONS_IN_FLIGHT)
         busy = dictate(client, headers=AUTH)

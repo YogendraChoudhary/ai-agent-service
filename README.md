@@ -28,7 +28,7 @@ benchmarks/          Saved benchmark reports
 docs/                API documentation, plans, and benchmark notes
 ```
 
-Install the test runner with `python -m pip install pytest`, then run `python -m pytest` from the
+Install test dependencies with `python -m pip install -r requirements-dev.txt`, then run `python -m pytest` from the
 project root. Test discovery is limited to `tests/`; the shared guards block real Redis access.
 Live provider checks remain opt-in scripts. Run one area with `python -m pytest tests/code`,
 or run the code intent corpus with `python scripts/evaluate_code.py`.
@@ -60,6 +60,8 @@ DEFAULT_DEEPSEEK_API_KEY=your_deepseek_api_key_here
 # ==============================================================================
 BACKEND_WEBHOOK_URL=https://api.yourdomain.com/api/agent/webhook
 WEBHOOK_SECRET=your_webhook_hmac_secret_here
+# Enable only after the receiver atomically deduplicates Idempotency-Key.
+BILLING_WEBHOOK_IDEMPOTENT=false
 API_KEY_ENCRYPTION_SECRET=your_32_byte_encryption_secret_here
 
 # ==============================================================================
@@ -77,6 +79,10 @@ CREDIT_SETTLE_DELAY_SECONDS=3.0
 MAX_RESERVATION_PER_REQUEST=100
 MAX_REFERENCE_IMAGES=3
 ```
+
+Credit billing uses a persistent Redis queue and retains credit holds after an unacknowledged delivery.
+Automatic payment retries stay disabled until receiver-side duplicate protection is confirmed. See
+[billing delivery and cancellation](docs/BILLING_DELIVERY.md) for the contract, deployment requirements and tests.
 
 ---
 
@@ -236,12 +242,27 @@ and require the writer to choose Insert. The graph stores exact decimal values s
 Type/color changes preserve the full dataset. See [the frontend handoff](docs/GRAPH_API_HANDOFF.md) for the SSE/JSON
 contracts and editor changes. Run `python scripts/demo_editable_graph.py` for a provider-free demonstration.
 
-To edit parts of a document without a selection, send `document_text` with the full current Markdown/plain text
+Document-aware questions and drafting are enabled by default (`DOCUMENT_CONTEXT_ENABLED=true`). Send
+`document_context` with `document_action="ask"` or `"draft"` on `type="general"`. Ask answers in chat; Draft
+returns only a new suggested passage. Coverage and billing metadata distinguish full context, partial drafting
+context and requests that need a smaller source without running a model. See the
+[context handoff](docs/DOCUMENT_CONTEXT_API_HANDOFF.md) and run `python scripts/demo_document_context.py`
+for a provider-free example. Explicit `document_scope="focused"|"selection"` enables local retrieval;
+`document_analysis="summary"|"contradictions"` runs bounded full-source analysis. Explicit context Edit uses
+untargeted prose as a style reference, and `suggest_document_intent=true` returns advisory action suggestions.
+The handoff describes limits, staged analysis billing and editor integration.
+Live synthetic accuracy, Edit preservation and streamed latency results are in
+[the provider evaluation report](docs/DOCUMENT_CONTEXT_LIVE_RESULTS.md); `scripts/evaluate_document_context.py`
+repeats them with the configured provider keys.
+
+To edit existing parts of a document without a selection, send `document_text` with the full current Markdown/plain text
 and use `query` for the editing instruction (`general` or `enhance_with_ai`). The backend locates the relevant
 paragraphs, returns verified patches and preserves every untargeted source region exactly. Proposals require
 frontend review and stale-snapshot checks; `/agent/documents/apply` replays accepted patches without model calls.
 See [the document-editing handoff](docs/DOCUMENT_EDIT_API_HANDOFF.md) and run `python scripts/demo_document_edit.py`
 for a provider-free example, or add `--live` to test the configured OpenAI model on synthetic documents.
+New clients can also use `document_context` with `document_action="edit"` when the new feature is enabled;
+this delegates to the same patch engine. Keep the existing `complete` selection-replacement contract separate from Draft insertion.
 `determine_agent_type` (keyword matching) remains only for callers that name no agent.
 
 `generate_blog` is not one agent run: `src/blog` plans the post in code (length, sections, tables, quotes, images), has the

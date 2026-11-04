@@ -1,11 +1,9 @@
 """
-Webhook module for notifying the backend about credit deductions.
-Uses fire-and-forget pattern (daemon thread) so streaming responses aren't delayed.
+Durable credit billing delivery; prompt history remains a best-effort background notification.
 """
 
 import os
 import threading
-import time
 import logging
 
 import requests
@@ -37,138 +35,66 @@ def _payload(user_id, input_chars, output_chars, operation_type, image_count, pr
     return body
 
 
+_billing_delivery = None
+
+
+def start_billing_delivery(redis_client):
+    """Each app worker drains the shared durable queue; leases prevent concurrent delivery."""
+    global _billing_delivery
+    from config import settings
+    from .billing_delivery import BillingDelivery
+    _billing_delivery = BillingDelivery(redis_client, BACKEND_WEBHOOK_URL, WEBHOOK_SECRET,
+        allow_retries=settings.billing_webhook_idempotent)
+    _billing_delivery.start()
+
+
+def stop_billing_delivery():
+    global _billing_delivery
+    if _billing_delivery is not None:
+        _billing_delivery.stop()
+        _billing_delivery = None
+
+
+def _queue_charge(body, *, reserved_scaled=0, settle_delay=0, event_id=None):
+    from .credit_manager import AUTOCOMPLETE_CREDITS_SCALED, IMAGE_CREDITS_SCALED, text_credits_scaled
+    if _billing_delivery is None:
+        raise RuntimeError('Durable billing delivery is unavailable')
+    hold = 0
+    if body['success']:
+        if body.get('design'):
+            hold = body['design']['credits_scaled']
+        else:
+            if body['operation_type'] == 'autocomplete':
+                hold = AUTOCOMPLETE_CREDITS_SCALED
+            elif body['operation_type'] != 'image':
+                hold = text_credits_scaled(body['input_chars'], body['output_chars'])
+        hold += (sum(i['credits_scaled'] for i in body['images']) if body.get('images')
+                 else body['image_count'] * IMAGE_CREDITS_SCALED)
+        hold = max(hold, reserved_scaled)
+    return _billing_delivery.enqueue(body, event_id=event_id, reserved_scaled=reserved_scaled,
+        hold_scaled=hold, settle_delay=settle_delay)
+
+
 def fire_credit_deduction(
-    user_id: str,
-    input_chars: int,
-    output_chars: int,
-    operation_type: str = "text",
-    image_count: int = 0,
-    *,
-    provider: str | None = None,
-    model: str | None = None,
-    duration_ms: int | None = None,
-    success: bool = True,
-    error_code: str | None = None,
-    images: list | None = None,
-    design: dict | None = None,
+    user_id: str, input_chars: int, output_chars: int, operation_type: str = "text", image_count: int = 0,
+    *, provider=None, model=None, duration_ms=None, success=True, error_code=None, images=None, design=None,
+    billing_event_id=None,
 ):
-    """
-    Send a non-blocking credit deduction webhook to the backend.
-
-    Args:
-        user_id: The user ID to deduct credits for
-        input_chars: Number of input characters
-        output_chars: Number of output characters
-        operation_type: Type of AI operation ("text", "image", "mixed", "autocomplete")
-        image_count: Number of successfully generated images (for image/mixed operations)
-        provider: AI provider used ('openai'|'claude'|'grok'|'gemini'|'deepseek') — for admin analytics
-        model: Specific model name — for admin analytics (optional)
-        duration_ms: Total request duration in ms — for admin analytics
-        success: Whether the call succeeded; failures are logged but don't deduct credits
-        error_code: Short error identifier when success=False
-        images: per generated image {"provider", "model", "credits_scaled"}; sent only when there are images
-        design: a delivered Mode 8 design {"sub_mode", "credits_scaled"}; its flat price replaces the char-based charge
-    """
-    if not BACKEND_WEBHOOK_URL or not WEBHOOK_SECRET:
-        logger.warning("Webhook env vars missing (BACKEND_WEBHOOK_URL or WEBHOOK_SECRET) — skipping credit deduction")
-        return
-
-    def _send():
-        try:
-            resp = requests.post(
-                BACKEND_WEBHOOK_URL,
-                json=_payload(user_id, input_chars, output_chars, operation_type, image_count, provider,
-                              model, duration_ms, success, error_code, images, design),
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Webhook-Secret": WEBHOOK_SECRET,
-                },
-                timeout=10,
-            )
-            logger.info(f"Credit deduction webhook sent for user={user_id}: status={resp.status_code}")
-        except requests.exceptions.ConnectionError:
-            logger.warning(
-                f"Backend webhook unreachable at {BACKEND_WEBHOOK_URL} "
-                f"(Connection refused — backend web app is not running on port 3000). "
-                f"Skipping credit deduction for user={user_id}."
-            )
-        except Exception as e:
-            logger.error(f"Credit deduction webhook failed for user={user_id}: {e}")
-
-    thread = threading.Thread(target=_send, daemon=True)
-    thread.start()
+    """Persist usage before returning; transport retries keep the same Idempotency-Key."""
+    return _queue_charge(_payload(user_id, input_chars, output_chars, operation_type, image_count, provider,
+        model, duration_ms, success, error_code, images, design), event_id=billing_event_id)
 
 
 def fire_credit_deduction_and_release(
-    user_id: str,
-    input_chars: int,
-    output_chars: int,
-    operation_type: str,
-    image_count: int,
-    reserved_scaled: int,
-    credit_manager,
-    settle_delay_seconds: float,
-    *,
-    provider: str | None = None,
-    model: str | None = None,
-    duration_ms: int | None = None,
-    success: bool = True,
-    error_code: str | None = None,
-    images: list | None = None,
-    design: dict | None = None,
+    user_id: str, input_chars: int, output_chars: int, operation_type: str, image_count: int,
+    reserved_scaled: int, credit_manager, settle_delay_seconds: float,
+    *, provider=None, model=None, duration_ms=None, success=True, error_code=None, images=None, design=None,
+    billing_event_id=None,
 ):
-    """
-    Streaming variant of fire_credit_deduction. POSTs the webhook, sleeps
-    `settle_delay_seconds` so the backend's DB update flows through the
-    Supabase edge function back into subscription:{userId}, then releases
-    the in-flight reservation. Runs in a single daemon thread so the SSE
-    response sees zero added latency.
-
-    If webhook env vars aren't configured we still release the reservation
-    so credits don't leak.
-
-    Telemetry kwargs (provider/model/duration_ms/success/error_code) are
-    forwarded to the backend for the admin AI Analytics dashboard.
-    """
-    if not BACKEND_WEBHOOK_URL or not WEBHOOK_SECRET:
-        logger.warning(
-            "Webhook env vars missing — releasing reservation without posting webhook"
-        )
-        credit_manager.schedule_release(user_id, reserved_scaled, delay_seconds=0)
-        return
-
-    def _send_then_release():
-        try:
-            resp = requests.post(
-                BACKEND_WEBHOOK_URL,
-                json=_payload(user_id, input_chars, output_chars, operation_type, image_count, provider,
-                              model, duration_ms, success, error_code, images, design),
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Webhook-Secret": WEBHOOK_SECRET,
-                },
-                timeout=10,
-            )
-            logger.info(
-                f"Credit deduction webhook sent for user={user_id}: status={resp.status_code}"
-            )
-        except requests.exceptions.ConnectionError:
-            logger.warning(
-                f"Backend webhook unreachable at {BACKEND_WEBHOOK_URL} "
-                f"(Connection refused — backend web app is not running on port 3000). "
-                f"Credit reservation will still be released for user={user_id}."
-            )
-        except Exception as e:
-            logger.error(f"Credit deduction webhook failed for user={user_id}: {e}")
-        finally:
-            if settle_delay_seconds > 0:
-                time.sleep(settle_delay_seconds)
-            try:
-                credit_manager.release(user_id, reserved_scaled)
-            except Exception as e:
-                logger.error(f"Reservation release failed for user={user_id}: {e}")
-
-    threading.Thread(target=_send_then_release, daemon=True).start()
+    """Atomically transfer the active reservation to a durable billing hold until acknowledged."""
+    return _queue_charge(_payload(user_id, input_chars, output_chars, operation_type, image_count, provider,
+        model, duration_ms, success, error_code, images, design), reserved_scaled=reserved_scaled,
+        settle_delay=settle_delay_seconds, event_id=billing_event_id)
 
 
 def fire_prompt_history_save(user_id: str, prompt: str):

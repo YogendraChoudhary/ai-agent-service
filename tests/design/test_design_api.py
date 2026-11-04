@@ -74,6 +74,7 @@ class TestDesignApi(unittest.TestCase):
             patch.object(api, "async_validate_and_get_api_key", AsyncMock(return_value=("fake_key", MOCK_USER_META))),
             patch.object(api, "credit_manager", None),
             patch.object(api, "CREDIT_PRECHECK_ENABLED", False),
+            patch.object(api, "fire_credit_deduction"),
             patch.object(api, "fire_prompt_history_save"),
         ]
         for p in self.patches:
@@ -309,6 +310,7 @@ def test_stream_hands_its_abort_event_to_the_pipeline():
             patch.object(api, "async_validate_and_get_api_key", AsyncMock(return_value=("k", MOCK_USER_META))), \
             patch.object(api, "credit_manager", None), patch.object(api, "CREDIT_PRECHECK_ENABLED", False), \
             patch.object(api, "fire_prompt_history_save"), \
+            patch.object(api, "fire_credit_deduction"), \
             patch.object(settings, "task_routing_enabled", False), \
             patch.object(settings, "provider_fallback_enabled", False):
         res = TestClient(api.app).post("/agent/stream", json={

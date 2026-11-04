@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest
+pytest-asyncio
+fakeredis[lua]==2.40.0

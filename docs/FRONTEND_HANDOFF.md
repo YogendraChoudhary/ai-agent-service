@@ -2,6 +2,17 @@
 
 For: the Eddyter frontend engineer(s).
 Backend: this agent service (`api.py`, `src/voice_flow`, `src/design_canvas`).
+
+Backend changes 5–7 also support scoped retrieval, full-source summary/contradiction analysis, style-aware
+explicit Edit and advisory intent suggestions. Analysis adds `document_analysis_progress` and
+`document_analysis_ready`; its completed context replaces initial pending metadata. See the linked handoff
+for references and staged billing.
+
+Document awareness addition, 3 November 2026: [Document context API and editor integration](DOCUMENT_CONTEXT_API_HANDOFF.md)
+defines Ask/Draft/Edit, the named `document_context_ready` event, source positions and billing metadata. The new
+path is enabled by default (`DOCUMENT_CONTEXT_ENABLED=true`). Do not send every no-selection question as `document_text`:
+that field remains an instruction to propose existing-prose patches. Follow the new handoff for document questions
+and insertion suggestions; the existing edit review/apply contract remains intact.
 Verified: 2026-10-29 against HEAD `df292a7`, by reading the code paths named below.
 Licence and billing are implemented in `src/voice_flow/access.py` and covered by `tests/voice_flow/test_access.py`, including production API wiring.
 **Not exercised for this document:** live provider calls, a real browser microphone, the production deployment.
@@ -24,6 +35,7 @@ Partly. There is no single guide, and two features have none at all.
 | **Voice dictation** | `VOICE_FLOW.md` (operator/tuning doc) and the docstring of `src/voice_flow/router.py` | **No**: nothing says what a browser must build | **§3** |
 | **Design canvas** | **None.** `API_DOCUMENTATION.md` has two table rows. `gemini-code-1792761204580.md` is a pre-implementation spec that points at a `docs/design_canvas_plan.md` which does not exist | **No** | **§4** |
 | SSE stream protocol | `agent.md` §11.2 | **Wrong**: do not use it (see §2.4) | **§2** |
+| Document context | [`DOCUMENT_CONTEXT_API_HANDOFF.md`](DOCUMENT_CONTEXT_API_HANDOFF.md) | Contract ready; editor integration required | New handoff linked above |
 
 `EMAIL_API_HANDOFF.md` is the model for what a handoff should be. This document follows it.
 
@@ -36,7 +48,7 @@ would cost days. Verified against the code:
 |---|---|
 | Voice: WebSocket at `/agent/voice/stream` | **`POST /v1/voice/dictate`.** Voice is a separate router, not under `/agent` (`router.py`), and it has no WebSocket: one multipart upload per dictation |
 | Voice: "Opus/PCM audio streaming" | **No streaming.** Upload the finished recording once. `MediaRecorder` output (WebM/Opus, or MP4/AAC on Safari) is accepted as is, so there is no AudioWorklet or PCM conversion to build (§3.5) |
-| Design: "listen for `event: design_ready` on `/agent/stream`" | Correct, but only the design path uses *named* SSE events (`init`, `design_ready`, `complete`). Everything else is unnamed `data: {"type": …}`. The parser must handle both (§2.3) |
+| Design: "listen for `event: design_ready` on `/agent/stream`" | Correct. Named events also carry document proposals (`document_edit_ready`) and context metadata (`document_context_ready`). Content and done remain `data: {"type": …}`. The parser must handle both (§2.3) |
 | Long-form: "NO frontend work" | Small but real: `refine_progress` events, `done.warnings`, and **the document must be sent as Markdown or the pipeline silently does not run** (§6) |
 | Task routing / code gen: "NO frontend work" | The editor must send `model_source`, must send the specific `type` rather than `general`, and must handle `content_replace` **before** the backend enables streaming repair (§5) |
 | Email: "UI to trigger email generation" | Yes, but the browser must **not** call `/agent/email/*` directly; those routes take a raw provider key (§1, §8) |
@@ -69,6 +81,7 @@ production environment may override them. Confirm with whoever deploys.
 | Voice | `VOICE_FLOW_ENABLED` | **on** | `/v1/voice/*` returns 404 |
 | Email | `EMAIL_AI_ENABLED` | on | 503 on all three routes |
 | Blog | `BLOG_AI_ENABLED` | **off** | `generate_blog` → HTTP 503 `{"error": "AI blog generation is disabled"}` |
+| Document context | `DOCUMENT_CONTEXT_ENABLED` | **on** | `document_context` → HTTP 503 `DOCUMENT_CONTEXT_DISABLED`; legacy edits unchanged |
 | Long-form | `LONGFORM_REFINE_ENABLED` | **off** | The four text types run as one call, as before |
 | Streaming code repair | `CODE_REPAIR_STREAM_EVENT` | **off** | `content_replace` is never sent |
 | Task routing | `TASK_ROUTING_ENABLED` | on | Provider chosen as submitted |

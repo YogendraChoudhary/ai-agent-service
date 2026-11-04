@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Tuple
 
+from .billing_delivery import pending_credits_key
+
 logger = logging.getLogger(__name__)
 
 # Scale factor used internally so sub-1 credit costs (autocomplete = 0.2)
@@ -90,15 +92,16 @@ local pur  = tonumber(sub[2]) or 0
 local total_scaled = (rem + pur) * 10
 
 local reserved = tonumber(redis.call('GET', KEYS[2])) or 0
+local pending = tonumber(redis.call('GET', KEYS[3])) or 0
 local need = tonumber(ARGV[1])
 
-if total_scaled - reserved < need then
-  return {0, total_scaled - reserved}
+if total_scaled - reserved - pending < need then
+  return {0, total_scaled - reserved - pending}
 end
 
 local new_reserved = redis.call('INCRBY', KEYS[2], need)
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]))
-return {1, total_scaled - new_reserved}
+return {1, total_scaled - new_reserved - pending}
 """
 
 # Lua: atomic release. Capped at 0; deletes the key on full release so
@@ -143,6 +146,7 @@ class CreditManager:
                 keys=[
                     f"subscription:{user_id}",
                     f"credits_reserved:{user_id}",
+                    pending_credits_key(user_id),
                 ],
                 args=[scaled_amount, self._reservation_ttl],
             )
@@ -214,7 +218,8 @@ class CreditManager:
             rem = int(sub[0]) if sub[0] else 0
             pur = int(sub[1]) if sub[1] else 0
             reserved = self._read_reserved(user_id)
-            available = (rem + pur) * CREDIT_SCALE - reserved
+            pending = int(self._redis.get(pending_credits_key(user_id)) or 0)
+            available = (rem + pur) * CREDIT_SCALE - reserved - pending
             return max(0, available)
         except Exception as exc:
             logger.error("CreditManager.peek_available failed for user=%s: %s", user_id, exc)
