@@ -251,7 +251,9 @@ class Settings(BaseSettings):
     # Voice dictation (src/voice_flow). Local Whisper (faster-whisper) turns speech into text; a low-end Gemini model
     # compiles it (lists, self-corrections, fillers, cursor-aware casing); code does the final spacing.
     # ------------------------------------------------------------------
-    voice_flow_enabled: bool = Field(True, alias="VOICE_FLOW_ENABLED")             # True = /v1/voice/* is mounted
+    # Off by default: with an empty VOICE_FLOW_TOKEN the routes are unauthenticated and run on the
+    # platform Gemini key and this host's CPU (Whisper). Enable only together with a token.
+    voice_flow_enabled: bool = Field(False, alias="VOICE_FLOW_ENABLED")            # True = /v1/voice/* is mounted
     voice_flow_token: str = Field("", alias="VOICE_FLOW_TOKEN")                      # non-empty = clients must send it
     voice_whisper_model: str = Field("small", alias="VOICE_WHISPER_MODEL")           # tiny|base|small|... or a local path
     # float32 beat int8 on an Apple M4 (small: 675 ms vs 860-940 ms); on x86 servers int8 is the faster choice.

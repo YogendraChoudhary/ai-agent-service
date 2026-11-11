@@ -78,7 +78,7 @@ production environment may override them. Confirm with whoever deploys.
 | Feature | Env var | Code default | When off |
 |---|---|---|---|
 | Design canvas | `DESIGN_CANVAS_ENABLED` | **on** | No `design_ready` ever arrives; the request is answered as ordinary chat text (§4.2) |
-| Voice | `VOICE_FLOW_ENABLED` | **on** | `/v1/voice/*` returns 404 |
+| Voice | `VOICE_FLOW_ENABLED` | **off** (enable only with `VOICE_FLOW_TOKEN`) | `/v1/voice/*` returns 404 |
 | Email | `EMAIL_AI_ENABLED` | on | 503 on all three routes |
 | Blog | `BLOG_AI_ENABLED` | **on** | `generate_blog` → HTTP 503 `{"error": "AI blog generation is disabled"}` |
 | Charts | `CHART_SUGGESTIONS_ENABLED` | **on** | No `graph_suggestion` or `graph_suggestion_unavailable` after Enhance, even when the instruction asks for a chart |
@@ -684,7 +684,7 @@ block-based emails.
 |---|---|---|---|
 | Q1 — resolved | Voice authentication and pricing | Backend | Built: `Authorization: Bearer <licence key>`, existing text billing by formatted output, no credits for BYOK plans. BYOK needs a supported personal light-model key and never uses platform provider keys. Local Whisper still runs on the API server |
 | Q2 | Does an Eddyter-backend proxy for `/agent/email/*` exist? | Backend | The frontend has nothing to call otherwise |
-| Q3 | Production values of `VOICE_FLOW_ENABLED`, `DESIGN_CANVAS_ENABLED`, `BLOG_AI_ENABLED`, `LONGFORM_REFINE_ENABLED`, `CDN_URL`; voice defaults on in code | Backend / ops | Decides which UI is live |
+| Q3 | Production values of `VOICE_FLOW_ENABLED`, `DESIGN_CANVAS_ENABLED`, `BLOG_AI_ENABLED`, `LONGFORM_REFINE_ENABLED`, `CDN_URL`; voice defaults off in code | Backend / ops | Decides which UI is live |
 | Q4 | ~~`container.layout == "grid"` has no column count~~ **Resolved:** `columns` (1–12) added for grid containers | Backend + Frontend | §4.4 |
 | Q5 | What does the editor send for the four long-form types: Markdown or HTML? | Frontend | HTML silently bypasses the pipeline (§6) |
 | Q6 | Where does a design block live in Lexical? | Frontend + Product | Buttons now carry an optional, validated `href` (§4.4); link editing is in the editor |

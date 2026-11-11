@@ -1,7 +1,7 @@
 # Voice dictation (src/voice_flow)
 
 Speak, release a key, get formatted text at the caret: lists, self-corrections, fillers, capitalization and spacing handled.
-Local Whisper for speech, a low-end Gemini model for formatting, code for the last mile. Mounted when `VOICE_FLOW_ENABLED` is true (currently the code default).
+Local Whisper for speech, a low-end Gemini model for formatting, code for the last mile. Mounted when `VOICE_FLOW_ENABLED` is true. It is off by default: with an empty `VOICE_FLOW_TOKEN` the routes are unauthenticated and run on the platform Gemini key and this host's CPU, so enable it only together with a token. For local testing set `VOICE_FLOW_ENABLED=true` in `.env` (`scripts/run_local_server.py` and `scripts/voice_demo.py` already turn it on).
 
 ```
 mic -> MediaRecorder -> ONE upload (webm/opus, mp4/aac, wav ...) -> decoded to 16 kHz mono -> faster-whisper (local, initial_prompt carries the list cues)
@@ -33,7 +33,7 @@ runs on the rule-based formatter and the page says so. The startup output and `G
 
 | Variable | Default | Notes |
 |---|---|---|
-| `VOICE_FLOW_ENABLED` | `true` | mounts `/v1/voice/*` and warms the models at startup |
+| `VOICE_FLOW_ENABLED` | `false` | mounts `/v1/voice/*` and warms the models at startup; enable only with `VOICE_FLOW_TOKEN` set |
 | `VOICE_WHISPER_MODEL` | `small` | `base` is ~2x faster and less accurate on real speech; `distil-large-v3` is 4 s+ on CPU |
 | `VOICE_WHISPER_COMPUTE_TYPE` / `_THREADS` | `float32` / `8` | measured best on an Apple M4; use `int8` on x86 servers |
 | `VOICE_DEFAULT_STYLE` | `clean` | `clean` keeps your wording (fillers, false starts and repeats removed); `polished` also tightens each list point to "Label: one sentence". Per request: `style`. Polished costs an extra model call when it has to repair a dropped claim |

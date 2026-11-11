@@ -1,6 +1,12 @@
 """Shared pytest guards."""
 
+import os
+
 import pytest
+
+# Voice is off by default in production config; the suite exercises the mounted routes.
+# Set before any test module imports config, so the app is built with the router.
+os.environ.setdefault("VOICE_FLOW_ENABLED", "true")
 
 
 @pytest.fixture(autouse=True)
