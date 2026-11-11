@@ -219,7 +219,28 @@ def test_stream_billing_counts_document_context_not_just_short_instruction(runti
     assert response.status_code == 200
     (args, _), = charges
     assert args[1] == len(INSTRUCTION) + len(DOC)
-    assert args[2] == len(DOC.replace("very very useful", "particularly useful").replace("clear and clear", "clear and practical"))
+    # Output is the rewritten blocks only, not the whole document snapshot the stream carries.
+    blocks = prose()
+    assert args[2] == (len(blocks[0].text.replace("very very useful", "particularly useful"))
+                       + len(blocks[1].text.replace("clear and clear", "clear and practical")))
+
+
+@pytest.mark.parametrize("plan, instruction", [
+    ({"status": "no_change", "message": "Nothing to change.", "targets": []}, INSTRUCTION),
+    ({"status": "needs_clarification", "message": "Which paragraph?", "targets": []}, INSTRUCTION),
+    (None, "Delete the Conclusion section"),
+])
+def test_edits_without_a_proposal_charge_nothing(runtime, monkeypatch, plan, instruction):
+    client, state = runtime
+    if plan is not None:
+        state["model"] = ScriptedEditor(instruction, plan=plan)
+    charges = []
+    monkeypatch.setattr(api, "async_validate_and_get_api_key", AsyncMock(return_value=("provider-key", {
+        "user_id": "u1", "requires_user_api_keys": False, "user_keys": {}})))
+    monkeypatch.setattr(api, "fire_credit_deduction", lambda *a, **kw: charges.append((a, kw)))
+    events = parse_sse_events(client.post("/agent/stream", json=body(query=instruction)).text)
+    assert next(e["data"] for e in events if e["event"] == "document_edit_ready")["status"] != "proposed"
+    assert charges == []
 
 
 @pytest.mark.parametrize("limit", ["balance", "request"])

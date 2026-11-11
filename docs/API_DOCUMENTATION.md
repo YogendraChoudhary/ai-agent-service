@@ -838,7 +838,7 @@ Rollout flags (set any to `false` to switch that piece off without a deploy):
 | `CODE_INTENT_SHADOW_MODE` | `false` | Log intent without changing the selected agent |
 | `CODE_VALIDATION_ENABLED` | `true` | Check generated code after completion |
 | `CODE_REPAIR_ENABLED` | `true` | Allow one repair |
-| `CODE_REPAIR_STREAM_EVENT` | `false` | Allow streaming repair and `content_replace` (enable once the frontend handles it) |
+| `CODE_REPAIR_STREAM_EVENT` | `true` | Allow streaming repair and `content_replace` (the frontend must handle it) |
 
 `CODE_CLASSIFIER_TIMEOUT_SECONDS` defaults to `1.5`. Platform classification uses the currently configured
 Claude autocomplete model; BYOK uses the user's provider's autocomplete model and key. Ordinary content
@@ -965,14 +965,14 @@ accounts reserve nothing. The post is a single request: `operation_type` is `mix
 
 | Environment variable | Default | Purpose |
 |---|---|---|
-| `BLOG_AI_ENABLED` | `false` | `generate_blog` answers 503 when off |
+| `BLOG_AI_ENABLED` | `true` | `generate_blog` answers 503 when off |
 | `BLOG_IMAGE_SOURCE` | `generate` | `generate` draws pictures with the image adapter; `none` (or `stock`, not built yet) means no pictures |
 | `BLOG_SECTION_PARALLEL` | `3` | Parts drafted at the same time per request (1-8) |
 | `BLOG_MAX_PROSE_RUN` | `220` | Words allowed between visual breaks |
 | `BLOG_REPAIR_ENABLED` | `true` | One repair call per failing outline or part |
 | `BLOG_STREAM_TITLE` | `true` | Open the post with its title and subtitle as soon as the model has written them, while the rest of the outline is still streaming. The post is identical either way; `false` sends the title only after the whole outline has validated (and the `outline` event first) |
 | `BLOG_OUTLINE_MODEL` | *(empty)* | Model for the **first** outline attempt only: `provider` or `provider:tier` (for example `gemini:basic`; tier `basic` or `advanced`, default `basic`). Empty means the drafting model. It is used only if the request may use that provider (a BYOK account needs its own key for it; `/agent/process` has just the one key it was given); if it is unavailable or fails, the outline falls back to the drafting providers. The outline repair and every part always run on the drafting model, and billing/attribution follow the model that writes the post. Invalid values are ignored with a warning |
-| `BLOG_INTENT_REGEX_ENABLED` | `false` | Route "write a blog post about ..." typed into `general` chat to this pipeline |
+| `BLOG_INTENT_REGEX_ENABLED` | `true` | Route "write a blog post about ..." typed into `general` chat to this pipeline |
 | `BLOG_INTENT_SHADOW_MODE` | `false` | Log that decision without acting on it (run this for a week first) |
 
 The writing task defaults to OpenAI (advanced tier) with the usual fallback tree, unless the user chose a model. Each
@@ -993,8 +993,8 @@ how the editor draws a picture followed by an italic caption line (open item O2 
 ## Long-document refinement (`enhance_with_ai`, `fix_grammar`, `change_tone`, `simplify`)
 
 These four types used to send the whole text to the model in one call and hope it kept the tables, quotes, pictures and
-paragraphs where they were. A long or structured document can now go through a pipeline that **proves** it did. It ships
-**disabled** (`LONGFORM_REFINE_ENABLED=false`); with it off nothing changes, byte for byte. Request and response shapes are
+paragraphs where they were. A long or structured document can now go through a pipeline that **proves** it did. It is
+**on** by default (`LONGFORM_REFINE_ENABLED=true`); with it off nothing changes, byte for byte. Request and response shapes are
 unchanged: `query` is the document, `secondary_prompt` the tone (`change_tone`) or the instruction (`enhance_with_ai`).
 
 ### Which requests use it
@@ -1082,7 +1082,7 @@ so the billed length, is the document's. Nothing is reserved or billed for pictu
 
 | Environment variable | Default | Purpose |
 |---|---|---|
-| `LONGFORM_REFINE_ENABLED` | `false` | Turn the pipeline on for the four types |
+| `LONGFORM_REFINE_ENABLED` | `true` | Turn the pipeline on for the four types |
 | `LONGFORM_REFINE_MIN_WORDS` | `600` | Plain text shorter than this keeps the single call (a document with structure always qualifies) |
 | `LONGFORM_CHUNK_WORDS` | `1000` | Target passage size (100-3,000; passages run from 0.6x to 1.4x of it) |
 | `LONGFORM_FIRST_CHUNK_WORDS` | `300` | Target size of the first passage only (0-3,000), so text is on screen after one short call. `0`, or a value not below `LONGFORM_CHUNK_WORDS`, makes every passage the same size |

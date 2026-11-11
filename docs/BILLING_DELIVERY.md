@@ -21,6 +21,44 @@ Each application worker drains the same queue. Redis leases prevent concurrent d
 
 No external backend was modified for this change. Until duplicate protection is verified there, failed messages require operator reconciliation. Retaining holds is deliberate: it can temporarily reduce a user's available balance during a billing outage, but it prevents repeated unbilled provider usage. Do not delete pending messages or counters merely to clear a held balance; first establish whether the receiver recorded the charge.
 
+## Receiver contract for the application backend (agreed November 2026)
+
+The backend team confirmed their receiver currently ignores `design`, `images[]` and `Idempotency-Key`, so a design
+is charged as ordinary text by characters. They will change the receiver as follows; nothing changes in this
+service's payload, which already carries everything needed.
+
+**Design charges.** Designs keep `operation_type: "text"` (so the current receiver still accepts them). When the body
+has a `design` object, charge it flat and ignore `input_chars` / `output_chars`:
+
+```json
+{"operation_type": "text", "input_chars": 142, "output_chars": 0, "design": {"sub_mode": "create_from_prompt", "credits_scaled": 30}}
+```
+
+| `design.sub_mode` | Charge | `credits_scaled` |
+|---|---|---|
+| `create_from_prompt`, `create_from_vision` | 3 credits | 30 |
+| `edit_existing_ast` | 0.5 credits | 5 |
+
+`credits_scaled` is the agent's price for that `sub_mode` (1 credit = 10 scaled); either field gives the same result.
+Check for `design` before applying the character price. `/agent/process` does not send this webhook: for a design made
+there, the backend bills from the request `type` (`generate_design` = 3, `edit_design` = 0.5).
+
+**Images.** `images: [{"provider", "model", "credits_scaled"}]` lists each picture with its model's price. Until the
+receiver reads it, `image_count` × 5 credits applies, as today.
+
+**Duplicates.** Each message carries a stable `Idempotency-Key` header (also the event id), unchanged across retries.
+The receiver must:
+
+1. Record the key in the same database transaction as the credit deduction, so a key is never stored without its
+   charge or charged without its key.
+2. Answer a repeated key with **HTTP 2xx** and no second charge. Only 2xx counts as delivered here; a 409 or other
+   error makes the agent keep retrying that message.
+3. Keep keys for at least 7 days. Retries back off up to every 300 seconds with no attempt limit.
+
+**Switching on retries.** Only after (1)–(3) are deployed, set `BILLING_WEBHOOK_IDEMPOTENT=true` on every agent
+worker. Until then it stays `false`: each message is posted once, and a failed or timed-out delivery keeps its credit
+hold for manual reconciliation instead of risking a double charge.
+
 ## Deployment and operations
 
 - Run the normal FastAPI lifespan. It starts and stops the delivery worker around the Redis connection lifecycle. Upgrade every application worker so all reservation checks include pending billing.

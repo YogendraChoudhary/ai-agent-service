@@ -38,6 +38,7 @@ class ApiCase(unittest.TestCase):
         patches = [
             patch.object(tpa, "create_agent", self.agents),
             patch.object(settings, "longform_refine_enabled", True),
+            patch.object(settings, "chart_suggestions_enabled", False),  # these tests count the refinement calls only
             patch.object(settings, "task_routing_enabled", False),
             patch.object(settings, "provider_fallback_enabled", False),
             patch.object(api, "async_validate_and_get_api_key", AsyncMock(return_value=("k", META))),

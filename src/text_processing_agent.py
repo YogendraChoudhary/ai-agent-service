@@ -1260,6 +1260,19 @@ _SG_HEAD = [
     "",
 ]
 
+# Write mode: the free-form answer is inserted into the user's document as it is (editor contract).
+_SG_DOCUMENT_OUTPUT = [
+    "YOUR OUTPUT GOES STRAIGHT INTO THE USER'S DOCUMENT:",
+    "- Return only the content that belongs in the document, ready to keep as written.",
+    "- Never add a preface or sign-off ('Here is…', 'Sure!', 'I hope this helps', 'Let me know if…'), notes about "
+    "what you did or assumed, alternatives, or questions to the user.",
+    "- Never ask the user to paste, share, send or provide anything, and never offer to insert or change something "
+    "later. If a detail is missing, write complete content that does not depend on it; use a short bracketed "
+    "placeholder such as [Company name] only for a name, date or figure the content cannot do without.",
+    "- For a chart or graph, give its data as a ```mermaid xychart-beta``` block (the editor renders it as a chart).",
+    "",
+]
+
 _SG_STRUCTURE = [
     "TABLE CREATION:",
     "- When user asks to 'create a table', 'organize as table', 'make a comparison table'",
@@ -1417,7 +1430,7 @@ def build_smart_global_instructions(plan=None) -> list:
             "- Format content in clean Markdown",
             "",
         ]
-        return current_date_line + _SG_HEAD + capabilities + _SG_IMAGES_LEGACY + _SG_STRUCTURE + _SG_WEB + _SG_IMAGE_TOOL_USAGE + _SG_TAIL
+        return current_date_line + _SG_HEAD + _SG_DOCUMENT_OUTPUT + capabilities + _SG_IMAGES_LEGACY + _SG_STRUCTURE + _SG_WEB + _SG_IMAGE_TOOL_USAGE + _SG_TAIL
 
     capabilities = [
         "CAPABILITIES:",
@@ -1434,7 +1447,7 @@ def build_smart_global_instructions(plan=None) -> list:
     images = _sg_images_planned(plan.image_count, plan.image_requested) if plan.image_count > 0 else _SG_NO_IMAGES
     web = _SG_WEB if plan.use_web else _SG_NO_WEB
     tail = _SG_TAIL
-    return current_date_line + _SG_HEAD + capabilities + images + _SG_STRUCTURE + web + tail
+    return current_date_line + _SG_HEAD + _SG_DOCUMENT_OUTPUT + capabilities + images + _SG_STRUCTURE + web + tail
 
 
 
@@ -1742,6 +1755,8 @@ AGENT_CONFIGS = {
             REFINE_STRUCTURE_RULE,
             REFINE_LENGTH_RULES["enhance"],
             "CRITICAL: Output ONLY the enhanced text. Do NOT include any headers, labels, or prefixes like 'Enhanced Text:', 'Improved Version:', 'Here is the enhanced text:', etc. Just output the final enhanced text directly.",
+            "When the message has an <instruction> and a <text>, the instruction says how to change the text; it is not "
+            "part of it. Apply it to the text, and never copy the instruction, the tags or a 'Text:' label into your answer.",
             markdown_conversion_instruction,
         ],
         "use_tools": False,
@@ -2253,6 +2268,8 @@ def process_user_query_stream(
     prepared_context: Optional[PreparedContext] = None,
     match_document_style: bool = False,
     document_intent: Optional[dict] = None,
+    chart_request: Optional[dict] = None,
+    needs_document: Optional[dict] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2281,7 +2298,7 @@ def process_user_query_stream(
         instruction: The request's secondary prompt as the user wrote it (style notes for a blog post).
         blog_options: Validated BlogOptions for the generate_blog type (length, images, tone, audience).
         user_text: The document as the user sent it, for the four refinement types (enhance, grammar, tone, simplify): `query`
-            carries the single-call prompt ("Enhance: ..., Text: ..."), this is the text itself. A document that qualifies
+            carries the single-call prompt ("<instruction>...</instruction> <text>...</text>"), this is the text itself. A document that qualifies
             (src/longform, LONGFORM_REFINE_ENABLED) is refined in verified chunks instead.
         existing_design_ast: The DesignDocumentAST the user is editing (Mode 8), as a dict or JSON string.
         document_text: Full current document snapshot for selection-free edits; query/user_text is the instruction.
@@ -2300,6 +2317,11 @@ def process_user_query_stream(
 
     if document_intent is not None:
         yield {'__event__': {'event': 'document_intent_suggested', 'data': document_intent}}
+    if needs_document is not None:
+        # Write mode asked about a document it did not send: name the mode instead of guessing (no model call).
+        trace_set(request_id, mode='needs_context', suggested_action=needs_document['suggested_action'])
+        yield {'__event__': {'event': 'needs_context', 'data': needs_document}}
+        return
     document_mode = prepared_context is not None
     if document_mode:
         if not settings.document_context_enabled:
@@ -2313,7 +2335,9 @@ def process_user_query_stream(
         if prepared_context.warnings:
             yield {'__warnings__': prepared_context.warnings}
         if prepared_context.message is not None:
-            yield prepared_context.message
+            # A clarification is never streamed as content, so the editor cannot insert it into the document.
+            if prepared_context.metadata.status != 'needs_clarification':
+                yield prepared_context.message
             return
         force_agent_type = FREE_FORM_AGENT
         image_routing = False
@@ -2603,9 +2627,17 @@ def process_user_query_stream(
 
     def graph_suggestions():
         if agent_type == 'enhance' and user_text and suggest_graphs and settings.chart_suggestions_enabled and not image_urls:
+            key_for = key_resolver if routed else (lambda _provider: api_key)
+            if chart_request is not None:
+                # The instruction asked for a chart: always exactly one graph_suggestion or "can't chart this".
+                from .charts.runtime import stream_requested_chart
+                yield from stream_requested_chart(
+                    user_text, where='your text', chart_type=chart_request['chart_type'], candidates=candidates,
+                    key_for=key_for, is_byok=is_byok, user_id=user_id, request_id=request_id, cancel_event=cancel_event)
+                return
             from .charts.runtime import stream_graph_suggestion
             yield from stream_graph_suggestion(
-                user_text, candidates=candidates, key_for=key_resolver if routed else (lambda _provider: api_key),
+                user_text, candidates=candidates, key_for=key_for,
                 is_byok=is_byok, user_id=user_id, request_id=request_id, cancel_event=cancel_event)
 
     if (agent_type in REFINEMENT_AGENTS and user_text is not None and settings.longform_refine_enabled and not image_urls):
@@ -2758,12 +2790,18 @@ def process_user_query_stream(
         if report_model:
             yield {'__model_used__': runner.used}
 
+        # Button links stay exactly what the user gave; anything else is removed and reported (design_canvas/links.py).
+        from .design_canvas.links import check_links
+        link_warnings = check_links(design_ast, query, existing_ast_str)
+        if link_warnings:
+            trace_set(request_id, design_link_warnings=[w["kind"] for w in link_warnings])
+
         # Emit the design_ready SSE event payload
         design_payload = design_ast.model_dump()
         yield {"__event__": {"event": "design_ready", "data": design_payload}}
         # Final complete event for the caller
         yield {"__event__": {"event": "complete", "data": {
-            "total_tokens": total_tokens, "elapsed_seconds": elapsed, "mode": "design_canvas", "warnings": [],
+            "total_tokens": total_tokens, "elapsed_seconds": elapsed, "mode": "design_canvas", "warnings": link_warnings,
             "attempts": len(attempts), "auto_healed": harness_report.get("auto_healed", False),
         }}}
         return
@@ -2789,7 +2827,9 @@ def process_user_query_stream(
                 prose_only = (agent_type == 'enhance' and suggest_graphs and settings.chart_suggestions_enabled)
                 graph_instructions = ([*config['instructions'],
                     "Graphs are offered separately as optional suggestions. Return only the improved document; "
-                    "do not add a graph, SVG, Mermaid or chart code to the prose."] if prose_only else None)
+                    "do not add a graph, SVG, Mermaid or chart code to the prose."
+                    + (" The requested chart is produced separately: do not add a table, list of figures or "
+                       "placeholder for it either." if chart_request is not None else "")] if prose_only else None)
                 agent = create_agent(agent_type, provider, key, request_id, pending_images=pending_images,
                                      user_id=user_id, credit_manager=credit_manager, is_byok=is_byok,
                                      image_ctx=image_ctx, plan=candidate_plan,
@@ -2805,8 +2845,17 @@ def process_user_query_stream(
                         return
                     trace_set(request_id, document_model_started=True)
                 output_limit = output_token_budget(model_id, _round_max_tokens(max_tokens)) if document_mode else None
-                for chunk in _agent_text(agent, prepared_context.prompt if document_mode else query, images, provider, use_tools, request_id,
-                                         output_limit=output_limit):
+                stream = _agent_text(agent, prepared_context.prompt if document_mode else query, images, provider, use_tools,
+                                     request_id, output_limit=output_limit)
+                # Text that goes straight into the document: no requests for input, prefaces or closing notes in Write
+                # mode, and no echoed instruction in Enhance (src/output_guard.py).
+                if agent_type == FREE_FORM_AGENT and not document_mode and operation_type == 'general':
+                    from .output_guard import guard_write
+                    stream = guard_write(stream, user_text if user_text is not None else query)
+                elif agent_type == 'enhance' and instruction:
+                    from .output_guard import guard_enhance
+                    stream = guard_enhance(stream, instruction)
+                for chunk in stream:
                     if document_mode and cancel_event is not None and cancel_event.is_set():
                         return
                     if document_mode and isinstance(chunk, dict):
@@ -2938,6 +2987,8 @@ def process_user_query_with_images(
     prepared_context: Optional[PreparedContext] = None,
     match_document_style: bool = False,
     document_intent: Optional[dict] = None,
+    chart_request: Optional[dict] = None,
+    needs_document: Optional[dict] = None,
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
@@ -2984,6 +3035,8 @@ def process_user_query_with_images(
         prepared_context=prepared_context,
         match_document_style=match_document_style,
         document_intent=document_intent,
+        chart_request=chart_request,
+        needs_document=needs_document,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]

@@ -166,3 +166,4 @@ DoNotUpload
 
 # Output of scripts/run_local_server.py
 local_run/
+.DS_Store

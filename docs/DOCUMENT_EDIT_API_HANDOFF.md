@@ -99,7 +99,10 @@ The example offsets and fingerprints are illustrative; use the real values retur
 |---|---|---|
 | `proposed` | One or more verified replacements are ready | Highlight changes and offer acceptance |
 | `needs_clarification` | The intended target/action could not be identified safely | Display `message`; request a more specific prompt |
-| `no_change` | The selected text already satisfies the instruction | Keep the document unchanged |
+| `needs_clarification` (new facts) | The request wants details, examples, facts, statistics or sources the text does not contain ("add more detail to the Benefits paragraph", "include two examples", "elaborate on pricing"). Edit may not invent facts, so no model call is made | `message` is `Edit only rewrites what is already there and can't add new details, examples or facts. Use Draft to add them.` Offer Draft. Style requests ("add more warmth", "make it longer") are still rewrites |
+| `needs_clarification` (restructure) | The request deletes, moves, merges or splits whole sections, paragraphs, tables or lists ("delete the Conclusion section", "move the table below the intro"). No model call | `message` is `Edit only rewrites existing text; it can't delete, move, merge or split sections, paragraphs or tables. Make that change directly in the document.` |
+| `needs_clarification` (insert) | The request asks to add or insert new content ("add X below the heading", "insert a table after …", "add a new section"). Edit only rewrites existing blocks, so no model call is made. In-line changes such as "add a comma after 'However'" or "add bold to the key phrase" are rewrites and still go to the planner | `message` is exactly `Edit only rewrites existing text; use Draft to add new content.` Offer to switch to Draft |
+| `no_change` | Nothing was rewritten: the text already fits, or the request needs material Edit may not invent (for example "expand the conclusion" when there is nothing more to say without new facts) | Keep the document unchanged; show `message` ("No changes were proposed: … Use Draft to add new content.") |
 | `failed` | A provider/validation failure prevented a safe proposal | Keep the document unchanged; show retry |
 
 Non-proposed results have no patches and identical original/result hashes. HTTP `success: true` means the request
@@ -126,7 +129,10 @@ Clarification/no-change/failed proposals use the same sequence, with the exact o
 the caret or append it to the document**. Wait for `done`, verify hashes and show a proposal. Do not apply patches
 after an error, abort, disconnect, `credit_limit_reached` or incomplete snapshot, even if metadata already arrived.
 
-Platform credit checks include both instruction and complete document context. Upfront reservation also estimates
+Platform credit checks include both instruction and complete document context. An Edit is charged only when it
+returns `proposed`: input is the instruction plus the document, output is the text of the rewritten blocks (the
+patches' `after`), not the whole snapshot the stream carries. `no_change`, `needs_clarification` and `failed` charge
+nothing. Upfront reservation also estimates
 one document of output; insufficient balance or an excessive per-request credit reservation returns HTTP 402
 before model work. `REQUEST_CREDIT_LIMIT` asks for a smaller document. BYOK restrictions remain unchanged.
 

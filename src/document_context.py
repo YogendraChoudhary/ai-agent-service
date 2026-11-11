@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .document_edit.blocks import fingerprint, utf16_length
 from .longform.markdown_ast import looks_like_html, parse
+from .document_placement import DraftPlacement, resolve_placement
 
 DocumentAction = Literal["ask", "draft", "edit"]
 DocumentScope = Literal["document", "selection", "focused"]
@@ -74,7 +75,7 @@ class DocumentReference(ContextRange):
 class ContextMetadata(BaseModel):
     action: Literal["ask", "draft"]
     response_kind: Literal["chat_answer", "draft"]
-    status: Literal["ready", "needs_context"]
+    status: Literal["ready", "needs_context", "needs_clarification"]
     source_sha256: str
     coverage: Literal["full", "partial", "none", "pending"]
     strategy: Literal["full", "focused", "none", "retrieval", "selection", "analysis"]
@@ -91,6 +92,10 @@ class ContextMetadata(BaseModel):
     reserved_output_chars: int = 0
     max_stage_calls: int = 0
     references: list[DocumentReference] = Field(default_factory=list)
+    # Draft only: where the editor inserts the draft when the task named a place; absent means "at the cursor".
+    placement: Optional["DraftPlacement"] = None
+    # The reason when status is not "ready" (also streamed as text for needs_context, as before).
+    message: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +120,7 @@ def reference(text, start, end, identifier, section=()):
 def unavailable_context(context, action, scope, message, analysis_mode=None):
     return PreparedContext('', ContextMetadata(action=action, response_kind='draft' if action == 'draft' else 'chat_answer',
         status='needs_context', source_sha256=fingerprint(context.text), source_chars=len(context.text),
-        scope=scope, coverage='none', strategy='none', analysis_mode=analysis_mode), message)
+        scope=scope, coverage='none', strategy='none', analysis_mode=analysis_mode, message=message), message)
 
 
 def estimated_tokens(text: str) -> int:
@@ -146,6 +151,18 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
         focus_start = focus_end = source_index(text, context.cursor_utf16) if context.cursor_utf16 is not None else len(text)
     metadata = ContextMetadata(action=action, response_kind="draft" if action == "draft" else "chat_answer",
         status="ready", source_sha256=fingerprint(text), coverage="full", strategy="full", source_chars=len(text))
+    if action == "draft":
+        cursor = focus_start if (context.cursor_utf16 is not None or (selection and selection.start_utf16 != selection.end_utf16)) else None
+        placement, question = resolve_placement(text, query, cursor)
+        if question is not None:
+            # A named place that cannot be found: no model call, nothing to insert.
+            return PreparedContext("", metadata.model_copy(update={"status": "needs_clarification", "coverage": "none",
+                                                                     "strategy": "none", "message": question}), question)
+        if placement is not None:
+            # The draft is written for the anchor, not the cursor: the context is centred there.
+            anchor = source_index(text, placement.end_utf16 if placement.position == "after" else placement.start_utf16)
+            focus_start = focus_end = anchor
+            metadata = metadata.model_copy(update={"placement": placement})
 
     def envelope(start, end, *, outline=(), coverage="full"):
         cuts = sorted({start, end, max(start, min(end, focus_start)), max(start, min(end, focus_end))})
@@ -162,7 +179,8 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
         return len(data.encode("utf-8")) <= CONTEXT_MAX_BYTES and estimated_tokens(data) <= CONTEXT_TOKEN_BUDGET
 
     def unavailable(message):
-        return PreparedContext("", metadata.model_copy(update={"status": "needs_context", "coverage": "none", "strategy": "none"}), message)
+        return PreparedContext("", metadata.model_copy(update={"status": "needs_context", "coverage": "none", "strategy": "none",
+                                                                 "placement": None, "message": message}), message)
 
     if action == "ask" and not text.strip():
         return unavailable("There is no document content to answer questions about. Add some text first.")
@@ -220,3 +238,6 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
         "included_ranges": [ContextRange(start_utf16=utf16_length(text[:left]), end_utf16=utf16_length(text[:right])) for left, right in merged],
         "estimated_input_tokens": estimated_tokens(prompt), "billable_input_chars": len(data) + len(query)})
     return PreparedContext(prompt, metadata)
+
+
+ContextMetadata.model_rebuild()

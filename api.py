@@ -36,7 +36,7 @@ from src.charts.router import router as chart_router
 from src.charts.schema import GraphSuggestion
 from src.document_edit.router import router as document_router
 from src.document_edit.schema import DocumentEditResult
-from src.document_context import AnalysisMode, DocumentAction, DocumentScope, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context
+from src.document_context import AnalysisMode, DocumentAction, DocumentScope, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context, source_index
 from src.document_analysis import AnalysisResult
 from src.document_intent import IntentSuggestion, suggest_document_intent
 from src.key_points import HighlightResult, KeyPointValidationError, MAX_TEXT_CHARS
@@ -380,6 +380,30 @@ def check_highlight_fields(request) -> None:
     request.query.encode('utf-8')
     if request.secondary_prompt or request.existing_design_ast is not None or getattr(request, 'image_urls', None) or request.image_params or request.image_provider or request.image_model:
         raise ValueError('highlight_key_points accepts text only; omit secondary_prompt and image/design inputs')
+
+
+def write_needs_document_for(request) -> Optional[dict]:
+    """Write mode (type general, nothing but the prompt) that refers to a document it did not send; see document_intent."""
+    if (request.type != 'general' or request.document_context is not None or request.document_text is not None
+            or request.existing_design_ast is not None or getattr(request, 'image_urls', None)):
+        return None
+    from src.document_intent import write_needs_document
+    return write_needs_document(request.query)
+
+
+def chart_request_for(request) -> Optional[dict]:
+    """
+    Enhance with an instruction that explicitly asks for a chart ("improve this and add a bar chart"): the enhanced
+    prose is followed by exactly one graph_suggestion or graph_suggestion_unavailable, never a table. None keeps the
+    optional suggestion. Write mode (general) keeps its Mermaid output and other types never chart (editor contract).
+    """
+    if (request.type != 'enhance_with_ai' or not request.suggest_graphs or not settings.chart_suggestions_enabled
+            or not request.secondary_prompt or getattr(request, 'image_urls', None)):
+        return None
+    from src.charts.request import asks_for_chart, requested_chart_type
+    if not asks_for_chart(request.secondary_prompt, allow_writing=True):
+        return None
+    return {'chart_type': requested_chart_type(request.secondary_prompt)}
 
 
 async def document_request_inputs(request):
@@ -796,7 +820,9 @@ def resolve_request_image_params(request_data, agent_type: str, model_provider: 
 def build_full_query(agent_type: str, user_query: str, secondary_prompt: str) -> str:
     """Build the full prompt string sent to the AI model."""
     if agent_type == 'enhance_with_ai' and secondary_prompt:
-        return f"Enhance: {secondary_prompt}, Text: {user_query}"
+        # Tags keep the instruction apart from the text: run together ("Enhance: X, Text: Y") the model sometimes copied
+        # the instruction into the document.
+        return f"<instruction>{secondary_prompt}</instruction>\n<text>\n{user_query}\n</text>"
     if agent_type == 'change_tone' and secondary_prompt:
         return f"Change tone to {secondary_prompt}: {user_query}"
     if agent_type == 'translate' and secondary_prompt:
@@ -976,6 +1002,8 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
     logger.info(f"[{request_id}] ========== NEW REQUEST ==========")
 
     try:
+        chart_request = chart_request_for(request_data)
+        needs_document = write_needs_document_for(request_data)
         document_text, prepared_context = await document_request_inputs(request_data)
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
@@ -1040,6 +1068,8 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
             prepared_context=prepared_context,
             match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
             document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
+            chart_request=chart_request,
+            needs_document=needs_document,
         )
         warnings = meta.get('warnings', [])
         logger.info(f"[{request_id}] AI response received in {time.time() - ai_start:.2f}s")
@@ -1101,6 +1131,7 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
                 'document_analysis': meta.get('document_analysis_ready'),
                 'document_intent': meta.get('document_intent_suggested'),
                 'highlighting': meta.get('highlight_ready'),
+                'needs_context': meta.get('needs_context'),
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1151,8 +1182,10 @@ async def stream_text(
     logger.info(f"[{request_id}] ========== NEW STREAM REQUEST ==========")
 
     try:
+        chart_request = chart_request_for(request_data)
+        needs_document = write_needs_document_for(request_data)
         document_text, prepared_context = await document_request_inputs(request_data)
-        context_no_model = prepared_context is not None and prepared_context.message is not None
+        context_no_model = (prepared_context is not None and prepared_context.message is not None) or needs_document is not None
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
         query_preview = (
@@ -1275,6 +1308,7 @@ async def stream_text(
             stream_warnings: list = []
             design_billing = None   # set when a Mode 8 design is delivered: its flat price replaces the char charge
             analysis_billing = None
+            edit_result = None
 
             # Register lock-free cancellation event for this request (Point 6)
             cancel_event = register_cancellation_event(request_id)
@@ -1333,6 +1367,8 @@ async def stream_text(
                     prepared_context=prepared_context,
                     match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
                     document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
+                    chart_request=chart_request,
+                    needs_document=needs_document,
                 )):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
@@ -1356,6 +1392,8 @@ async def stream_text(
                         if isinstance(ev, dict) and 'event' in ev and 'data' in ev:
                             if ev['event'] == 'document_analysis_ready':
                                 analysis_billing = ev['data']['billing']
+                            if ev['event'] == 'document_edit_ready':
+                                edit_result = ev['data']
                             if ev['event'] == 'design_ready' and design_plan is not None:
                                 design_billing = {'sub_mode': design_plan.design_sub_mode,
                                                   'credits_scaled': design_price_scaled}
@@ -1373,7 +1411,8 @@ async def stream_text(
                     next_output_chars = len(chunk) if replacing else output_chars + len(chunk)
 
                     # Per-1000-char incremental reservation (non-BYOK only)
-                    if not context_no_model and analysis_billing is None and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
+                    # An Edit streams the whole document snapshot back; it is billed on its patches, not on these characters.
+                    if not context_no_model and analysis_billing is None and document_text is None and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
                         while (input_chars + next_output_chars) > next_reserve_threshold:
                             if (
                                 upfront_reserved_scaled + extra_reserved_scaled
@@ -1511,11 +1550,17 @@ async def stream_text(
                     cancel_event.set()
                 unregister_cancellation_event(request_id)
                 context_trace = get_trace(request_id)
-                context_used_model = (prepared_context is None and document_text is None) or bool(context_trace and context_trace.attrs.get('document_model_started'))
+                context_used_model = (prepared_context is None and document_text is None and needs_document is None) or bool(context_trace and context_trace.attrs.get('document_model_started'))
                 if prepared_context is not None and prepared_context.analysis is not None and analysis_billing is None and not had_error:
+                    context_used_model = False
+                if edit_result is not None and edit_result.get('status') != 'proposed':
+                    # No proposal (no_change, needs_clarification, failed): nothing reaches the document, nothing is charged.
                     context_used_model = False
                 billed_input_chars = analysis_billing['input_chars'] if analysis_billing is not None else input_chars
                 billed_output_chars = analysis_billing['output_chars'] if analysis_billing is not None else output_chars
+                if edit_result is not None:
+                    # The stream carries the whole document snapshot; only the rewritten blocks are generated output.
+                    billed_output_chars = sum(len(p.get('after', '')) for p in edit_result.get('patches', []))
                 duration_ms = int((time.time() - start_time) * 1000)
                 log_response_body(request_id, '/agent/stream', {
                     'text': ''.join(out_preview), 'output_chars': output_chars,

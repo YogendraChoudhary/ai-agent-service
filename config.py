@@ -49,8 +49,8 @@ class Settings(BaseSettings):
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
     code_validation_enabled: bool = Field(True, alias="CODE_VALIDATION_ENABLED")
     code_repair_enabled: bool = Field(True, alias="CODE_REPAIR_ENABLED")
-    # Off until the frontend handles the content_replace SSE event.
-    code_repair_stream_event: bool = Field(False, alias="CODE_REPAIR_STREAM_EVENT")
+    # On: the frontend must handle the content_replace SSE event (a repaired answer replaces the streamed one).
+    code_repair_stream_event: bool = Field(True, alias="CODE_REPAIR_STREAM_EVENT")
     text_prices_per_mtok: str = Field('{}', alias="TEXT_PRICES_PER_MTOK")
 
     @field_validator('voice_llm_mode')
@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     backend_webhook_url: str = Field("", alias="BACKEND_WEBHOOK_URL")
     webhook_secret: str = Field("", alias="WEBHOOK_SECRET")
+    # Stays off until the receiver dedupes Idempotency-Key with the charge and answers repeats with 2xx (docs/BILLING_DELIVERY.md).
     billing_webhook_idempotent: bool = Field(False, alias="BILLING_WEBHOOK_IDEMPOTENT")
 
     # ------------------------------------------------------------------
@@ -207,9 +208,9 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------
     # Visually rich blog generation (src/blog). The model writes an outline and section bodies; code decides
-    # the visuals, writes the headings and image markup, and lints the result. Ships OFF.
+    # the visuals, writes the headings and image markup, and lints the result. On by default.
     # ------------------------------------------------------------------
-    blog_ai_enabled: bool = Field(False, alias="BLOG_AI_ENABLED")                 # False = generate_blog returns 503
+    blog_ai_enabled: bool = Field(True, alias="BLOG_AI_ENABLED")                 # False = generate_blog returns 503
     blog_image_source: str = Field("generate", alias="BLOG_IMAGE_SOURCE")          # generate | stock | none
     blog_section_parallel: int = Field(3, ge=1, le=8, alias="BLOG_SECTION_PARALLEL")  # units in flight per request
     blog_max_prose_run: int = Field(220, ge=60, alias="BLOG_MAX_PROSE_RUN")        # words allowed between visual breaks
@@ -222,19 +223,21 @@ class Settings(BaseSettings):
     # streaming in (the outline is ~1,000 tokens, so first text no longer waits for all of it). The content is the same either
     # way; False opens the post only once the whole outline has validated.
     blog_stream_title: bool = Field(True, alias="BLOG_STREAM_TITLE")
-    blog_intent_regex_enabled: bool = Field(False, alias="BLOG_INTENT_REGEX_ENABLED")  # promote "write a blog post about..." from general
+    blog_intent_regex_enabled: bool = Field(True, alias="BLOG_INTENT_REGEX_ENABLED")  # promote "write a blog post about..." from general
     blog_intent_shadow_mode: bool = Field(False, alias="BLOG_INTENT_SHADOW_MODE")  # log the promotion decision only
 
     # ------------------------------------------------------------------
     # Structure-preserving refinement of long documents (src/longform) for enhance_with_ai, fix_grammar, change_tone and
     # simplify. A qualifying document is frozen (tables, quotes, images, code and links become tokens), cut into chunks,
-    # refined in parallel, checked in code and restored where the model moved something. Ships OFF.
+    # refined in parallel, checked in code and restored where the model moved something. On by default.
     # ------------------------------------------------------------------
-    # Additive graph suggestions for Enhance. Enable when the editor handles graph_suggestion events and persists
-    # eddyter_chart JSON (docs/GRAPH_API_HANDOFF.md); no charts are automatically inserted into the prose.
-    chart_suggestions_enabled: bool = Field(False, alias="CHART_SUGGESTIONS_ENABLED")
+    # Additive graph suggestions for Enhance; an Enhance instruction that asks for a chart ("add a bar chart") always
+    # gets the editable chart or a "can't chart this" event, never a table. Write mode keeps its Mermaid output. Enable when the editor
+    # handles graph_suggestion events and persists eddyter_chart JSON (docs/GRAPH_API_HANDOFF.md). On by default: the
+    # editor team asked for it in production. No charts are automatically inserted into the prose.
+    chart_suggestions_enabled: bool = Field(True, alias="CHART_SUGGESTIONS_ENABLED")
     chart_extraction_timeout_seconds: float = Field(25.0, gt=0, le=60, alias="CHART_EXTRACTION_TIMEOUT_SECONDS")
-    longform_refine_enabled: bool = Field(False, alias="LONGFORM_REFINE_ENABLED")
+    longform_refine_enabled: bool = Field(True, alias="LONGFORM_REFINE_ENABLED")
     longform_refine_min_words: int = Field(600, ge=1, alias="LONGFORM_REFINE_MIN_WORDS")   # shorter and unstructured: the single call
     longform_chunk_words: int = Field(1000, ge=100, le=3000, alias="LONGFORM_CHUNK_WORDS")  # target chunk size (window 0.6x-1.4x)
     longform_first_chunk_words: int = Field(300, ge=0, le=3000, alias="LONGFORM_FIRST_CHUNK_WORDS")  # smaller first chunk = text sooner; 0 = off

@@ -70,7 +70,7 @@ DESIGN_EXAMPLE_JSON = json.dumps({
             {"node_type": "text", "id": "body", "tag": "p", "font_size_px": 15, "spans": [
                 {"text": "Short, long or anything in between.", "color": "#D1D1D6"}]},
             {"node_type": "button", "id": "cta", "label": "Get started", "text_color": "#0B0B0F",
-             "style": {"background_color": "#34F5A6", "border_radius": 999,
+             "href": "https://example.com/start", "style": {"background_color": "#34F5A6", "border_radius": 999,
                        "padding": {"top": 12, "right": 24, "bottom": 12, "left": 24}}},
         ],
     },
@@ -95,6 +95,13 @@ Schema rules (read carefully):
 - Text spans on dark backgrounds MUST have sufficient WCAG 2.1 contrast.
 - SVG attributes must only contain geometry values (d, cx, cy, r, x, y, width,
   height, rx, ry, transform); never event handlers, hrefs, or script references.
+- A `button` may have an `href`: an absolute https:// (or http://) URL, a mailto: or
+  tel: link, or an in-page #anchor. Set it only when the user names a destination or
+  the button obviously links somewhere they gave; never invent a URL, and never use
+  javascript:, data: or relative paths. Omit `href` otherwise. Never turn a link you may
+  not use into a different one (for example "/checkout" into "#checkout"): leave `href` out.
+- A container with `layout` "grid" may set `columns` (1–12 equal columns), e.g. 3 for
+  a three-card row. Use `columns` only with "grid", never with flex layouts.
 
 Return ONLY the raw JSON object with zero markdown wrappers or explanations.
 
@@ -155,6 +162,8 @@ def build_initial_design_prompt(
         task = (
             "TASK: Edit the existing DesignDocumentAST above according to the user request.\n"
             "Preserve all sibling node `id` values that are not being changed.\n"
+            "Keep every field of unchanged nodes exactly as given, including button `href` and grid `columns`, "
+            "unless the user asks to change them.\n"
         )
     elif sub_mode == "create_from_vision":
         task = (

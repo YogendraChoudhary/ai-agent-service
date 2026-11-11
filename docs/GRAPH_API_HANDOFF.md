@@ -1,4 +1,4 @@
-# Editable graph suggestions after Enhance
+# Editable graph suggestions after Enhance, and charts on request in Enhance
 
 The Python implementation improves the document as before, then optionally returns one graph suggestion derived from
 the **original input**. It never inserts graph markup into the prose. The frontend must implement preview, Insert,
@@ -6,8 +6,9 @@ Dismiss and a persistent editable graph block. No frontend repository was availa
 
 ## Enablement and compatibility
 
-- Set `CHART_SUGGESTIONS_ENABLED=true` when the frontend can consume the contract below. It defaults to `false` to
-  avoid extra model calls and invisible suggestions in existing clients. The local server runner enables it.
+- `CHART_SUGGESTIONS_ENABLED` defaults to `true` (the editor team asked for it in production). It enables Enhance
+  suggestions and explicit chart requests in Enhance. Set it to `false` to avoid the extra extraction call for clients that do not
+  consume the contract below.
 - Optional `CHART_EXTRACTION_TIMEOUT_SECONDS=25` bounds each extraction provider call. Existing provider fallback
   rules and eligible request keys are reused; fallback can make the total suggestion time longer.
 - `suggest_graphs` is an optional boolean on `/agent/process` and `/agent/stream`, default `true`. `false` opts out.
@@ -19,6 +20,34 @@ Dismiss and a persistent editable graph block. No frontend repository was availa
   `graph_llm_calls` (stage `graph_extract`) and `graph_fallbacks`. Existing text credit settlement is unchanged;
   there are no image/design credit charges.
 - Graph edits and previews are deterministic Python operations with no AI provider calls or generated-image costs.
+
+## Explicit chart requests in Enhance
+
+Agreed with the editor team: Write mode (`type: "general"`) keeps its Mermaid `xychart-beta` output, which the editor
+turns into a chart; no other type charts. In **Enhance**, when `secondary_prompt` explicitly asks for a chart
+("make it clearer and add a pie chart", "chart these numbers", "turn the table into a line graph"), the stream
+**always** ends with exactly one of these after the prose, and the writer is told not to add a table for it:
+
+```text
+event: graph_suggestion
+data: {"status":"suggested","reason":"Built only from values stated in your content. Review before inserting.","chart":{...},"preview_svg":"<svg ...>"}
+
+event: graph_suggestion_unavailable
+data: {"code":"not_chartable","requested":true,"message":"This can't be charted: no set of two or more comparable values, each stated with its label, was found in your text. Add or select the figures to chart and try again."}
+
+event: graph_suggestion_unavailable
+data: {"code":"chart_failed","requested":true,"message":"A chart could not be produced from this content. Nothing was changed; please retry."}
+```
+
+- Detection is a zero-cost wording check on `secondary_prompt` only (`src/charts/request.py`), never on the document
+  text. The chart verb may come later in the instruction ("tighten the wording and chart the revenue"). Questions ("what chart fits?") and diagrams (flowchart, org chart, Gantt) are not chart requests.
+- `pie` or `line` in the wording sets `chart.presentation.chart_type` (a pie of negative values stays `bar`).
+- Values must be stated in the text being enhanced; nothing is researched or estimated. With fewer than two numbers,
+  `not_chartable` is sent without an extraction call.
+- `requested: true` distinguishes these from the optional suggestion's failure event. Without a chart instruction,
+  Enhance keeps the optional suggestion described above (silent when there is no data).
+- `suggest_graphs: false` or `CHART_SUGGESTIONS_ENABLED=false` turns both off. `/agent/process` returns the prose in
+  `markdown_response` plus the chart in `graph_suggestions` or the error in `graph_suggestion_error`.
 
 ## Enhance request
 

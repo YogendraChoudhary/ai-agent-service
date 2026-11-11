@@ -223,6 +223,8 @@ def install():
     fake_redis = SimpleNamespace(redis_client=FakeRedisClient())
     redis_module.get_redis_manager = lambda: fake_redis
     api.CreditManager = make_cm
+    # The durable billing queue needs a real Redis; the webhooks below are faked, so the delivery worker has nothing to do.
+    api.start_billing_delivery = lambda _redis_client: None
     fire, fire_release = make_webhooks(holder)
     api.fire_credit_deduction = fire
     api.fire_credit_deduction_and_release = fire_release

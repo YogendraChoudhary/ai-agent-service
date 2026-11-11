@@ -61,7 +61,7 @@ class TestCodePipeline(unittest.TestCase):
 
     def test_stream_validation_logs_without_repair_until_frontend_flag(self):
         agent = self.agent()
-        with patch.object(tpa, 'create_agent', return_value=agent):
+        with patch.object(tpa, 'create_agent', return_value=agent), patch.object(settings, 'code_repair_stream_event', False):
             out = list(tpa.process_user_query_stream('add', 'gemini', 'g', force_agent_type='code_writer'))
         self.assertEqual(out, [BROKEN])
         self.assertEqual(agent.run.call_count, 1)

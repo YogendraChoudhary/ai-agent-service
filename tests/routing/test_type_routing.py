@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import api
 import src.text_processing_agent as tpa
+from config import settings as tpa_settings
 from src.text_processing_agent import (
     AGENT_CONFIGS,
     AGENT_FOR_REQUEST_TYPE,
@@ -84,9 +85,11 @@ class TestTextCannotChangeTheAgent(RouteTestCase):
         def fake_create_agent(agent_type, *a, **k):
             self.built.append((agent_type, k.get("plan")))
             raise AgentPathReached({"agent_type": agent_type, **k})
-        p = patch.object(tpa, "create_agent", fake_create_agent)
-        p.start()
-        self.addCleanup(p.stop)
+        # These cases are about the declared-type router; promotion of blog wording is covered in tests/blog.
+        for p in (patch.object(tpa, "create_agent", fake_create_agent),
+                  patch.object(tpa_settings, "blog_intent_regex_enabled", False)):
+            p.start()
+            self.addCleanup(p.stop)
 
     def _agent_for(self, declared, text):
         full = api.build_full_query(declared, text, "")

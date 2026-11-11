@@ -390,8 +390,10 @@ class TestPromotionFromGeneralChat(RuntimeCase):
             pass
         return any(c[0] == "blog_writer" for c in self.factory.created)
 
-    def test_off_by_default(self):
-        self.assertFalse(self.reaches_blog())
+    def test_off_when_either_flag_is_off(self):
+        for flags in ({"blog_ai_enabled": False}, {"blog_intent_regex_enabled": False}):
+            with self.subTest(**flags), patch.multiple(settings, **flags):
+                self.assertFalse(self.reaches_blog())
 
     def test_on_routes_the_request_to_the_blog_pipeline_as_writing(self):
         self.with_flags(blog_ai_enabled=True, blog_intent_regex_enabled=True)

@@ -6,7 +6,7 @@ import pytest
 
 from src.document_edit.blocks import allowed_targets, document_blocks, fingerprint, utf16_length
 from src.document_edit.schema import DocumentPatch, EditPlan
-from src.document_edit.service import EditCancelled, apply_document_patches, edit_document
+from src.document_edit.service import INSERT_MESSAGE, EditCancelled, apply_document_patches, edit_document
 
 DOC = ("# Launch guide\n\n## Introduction\n\nThis introduction is very very useful for readers.\n\n"
        "## Benefits\n\nThe benefits are clear and clear for every team.\n\n"
@@ -348,3 +348,77 @@ def test_forged_url_change_cannot_be_applied():
         after=block.text.replace("example.org", "evil.example"), reason="Forged URL edit")
     with pytest.raises(ValueError, match="protected"):
         apply_document_patches(source, fingerprint(source), [patch])
+
+
+@pytest.mark.parametrize("instruction", [
+    "Add a short FAQ below the Pricing heading",
+    "Insert a table after the Introduction",
+    "Put a disclaimer above the Conclusion",
+    "Add a new section about risks",
+    "Improve the Introduction and add a paragraph after it",
+])
+def test_insert_requests_need_clarification_without_model_calls(instruction):
+    llm = ScriptedEditor(instruction)
+    result, metadata = edit_document(DOC, instruction, llm)
+    assert result == DOC and metadata.status == "needs_clarification"
+    assert metadata.message == "Edit only rewrites existing text; use Draft to add new content."
+    assert not metadata.patches and not llm.calls
+
+
+@pytest.mark.parametrize("instruction", [
+    "Add more warmth to the paragraph below the Introduction heading",
+    "Rewrite the paragraph after the Benefits heading",
+])
+def test_rewrites_that_mention_a_position_still_reach_the_planner(instruction):
+    section = "Benefits" if "Benefits" in instruction else "Introduction"
+    llm = ScriptedEditor(instruction, [b for b in prose() if section in b.section])
+    _, metadata = edit_document(DOC, instruction, llm)
+    assert metadata.status == "proposed" or metadata.status == "no_change"
+    assert llm.calls[0][0].stage == "document_plan"
+
+
+@pytest.mark.parametrize("instruction", [
+    "Delete the Conclusion section", "Remove the second paragraph", "Move the table below the Introduction",
+    "Merge the Benefits paragraphs", "Split the Introduction paragraph into two", "Put the Conclusion first",
+])
+def test_deleting_or_moving_blocks_gets_its_own_message_without_model_calls(instruction):
+    llm = ScriptedEditor(instruction)
+    result, metadata = edit_document(DOC, instruction, llm)
+    assert result == DOC and metadata.status == "needs_clarification" and not llm.calls
+    assert metadata.message.startswith("Edit only rewrites existing text; it can't delete, move")
+
+
+@pytest.mark.parametrize("instruction", [
+    "Add a comma after 'useful' in the Introduction", "Add bold to the key phrase in Benefits",
+    "Remove the repeated words in Benefits", "Delete the word 'very' in the Introduction",
+])
+def test_inline_changes_are_rewrites_and_reach_the_planner(instruction):
+    llm = ScriptedEditor(instruction, prose()[:1])
+    _, metadata = edit_document(DOC, instruction, llm)
+    assert llm.calls and llm.calls[0][0].stage == "document_plan" and metadata.message != INSERT_MESSAGE
+
+
+def test_an_inline_change_does_not_hide_an_insert_in_the_same_request():
+    llm = ScriptedEditor("x")
+    _, metadata = edit_document(DOC, "Add a comma after 'useful' and add a paragraph below Pricing", llm)
+    assert metadata.message == INSERT_MESSAGE and not llm.calls
+
+
+@pytest.mark.parametrize("instruction", [
+    "Add more detail to the paragraph below the Benefits heading", "Add two examples to the Benefits paragraph",
+    "Include statistics in the Introduction", "Elaborate on the Pricing", "Make the Benefits paragraph more detailed",
+])
+def test_requests_for_new_facts_get_an_honest_answer_without_model_calls(instruction):
+    llm = ScriptedEditor(instruction)
+    result, metadata = edit_document(DOC, instruction, llm)
+    assert result == DOC and metadata.status == "needs_clarification" and not llm.calls
+    assert metadata.message.startswith("Edit only rewrites what is already there and can't add new details")
+
+
+def test_an_escaped_line_break_in_a_reply_never_reaches_the_document():
+    blocks = prose()
+    instruction = "Improve the Introduction"
+    llm = ScriptedEditor(instruction, blocks[:1], {blocks[0].id: blocks[0].text.rstrip("\n").replace("very very", "really") + "\\n"})
+    result, metadata = edit_document(DOC, instruction, llm)
+    assert metadata.status == "proposed" and "\\n" not in result
+    assert metadata.patches[0].after == blocks[0].text.replace("very very", "really")

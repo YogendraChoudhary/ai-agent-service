@@ -215,6 +215,11 @@ def test_analysis_stage_input_output_and_call_limits_are_enforced():
     ('Rewrite the conclusion and draft a new section', 'ask', True), ('Help', 'ask', True),
     ('Reescribe la conclusión', 'edit', False), ('Continúa escribiendo', 'draft', False),
     ('अगला अनुच्छेद लिखो', 'draft', False),
+    ('Add a summary below the Pricing heading', 'draft', False), ('Insert a table after the introduction', 'draft', False),
+    ('Put this above the conclusion', 'draft', False), ('Please add below the heading: refunds are free', 'draft', False),
+    ('Add a new paragraph about costs', 'draft', False),
+    ('Add more detail to the paragraph below the heading', 'draft', False), ('Add more warmth to the intro', 'edit', False),
+    ('Rewrite the intro and add a paragraph after it', 'ask', True),
 ])
 def test_intent_suggestions_are_advisory_and_explicit_action_always_wins(query, expected, ambiguous):
     suggestion = suggest_document_intent(query, requested_action='ask')

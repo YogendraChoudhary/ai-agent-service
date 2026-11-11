@@ -51,7 +51,7 @@ RUN_DIR = ROOT / "local_run"
 PROTECTED = ("table", "blockquote", "image", "fence", "html")
 TYPES = {"grammar": "fix_grammar", "simplify": "simplify", "tone": "change_tone", "enhance": "enhance_with_ai"}
 PREFIX = {"grammar": "Fix grammar: ", "simplify": "Simplify: ", "tone": "Change tone to {instruction}: ",
-          "enhance": "Enhance: {instruction}, Text: "}                  # what api.build_full_query sends the single call
+          "enhance": "<instruction>{instruction}</instruction>\n<text>\n"}                  # what api.build_full_query sends the single call
 DEFAULT_INSTRUCTION = {"tone": "friendly and warm", "enhance": ""}
 URL = re.compile(r"https?://[^\s)>\]\"']+")
 TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>|<!--.*?-->", re.S)       # inline HTML: a tag or a comment
@@ -433,7 +433,7 @@ def run_one_live(provider: str, key: str, doc: Doc, op: str, instruction: str, r
     from src.text_processing_agent import process_user_query_stream
 
     request_id = f"eval-longform-{provider}-{doc.id}-{op}"
-    query = PREFIX[op].format(instruction=instruction or "") + doc.text
+    query = PREFIX[op].format(instruction=instruction or "") + doc.text + ("\n</text>" if op == "enhance" else "")
     start_trace(request_id, "longform_evaluation", type=TYPES[op], chat_model=provider)
     started, first, chunks, warnings, failure = time.perf_counter(), None, [], [], None
     try:

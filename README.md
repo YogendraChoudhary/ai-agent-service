@@ -236,7 +236,7 @@ categories and qualifiers. See [the frontend handoff](docs/KEY_POINTS_API_HANDOF
 `python scripts/demo_key_points.py` for a provider-free example (`--live` uses the configured OpenAI key).
 
 `enhance_with_ai` can additionally suggest an editable graph from the original text or Markdown table when
-`CHART_SUGGESTIONS_ENABLED=true` (off until the editor supports it). Suggestions are separate from the improved prose
+`CHART_SUGGESTIONS_ENABLED=true` (the default; an Enhance instruction asking for a chart always gets the chart or a "can't chart this" event). Suggestions are separate from the improved prose
 and require the writer to choose Insert. The graph stores exact decimal values separately from its appearance;
 `POST /agent/charts/edit` changes only explicit fields, and `POST /agent/charts/preview` renders a saved graph.
 Type/color changes preserve the full dataset. See [the frontend handoff](docs/GRAPH_API_HANDOFF.md) for the SSE/JSON
@@ -267,7 +267,7 @@ this delegates to the same patch engine. Keep the existing `complete` selection-
 
 `generate_blog` is not one agent run: `src/blog` plans the post in code (length, sections, tables, quotes, images), has the
 model write a validated outline, drafts the sections in parallel while the pictures generate, and lints each part before
-it is streamed. It ships disabled (`BLOG_AI_ENABLED`); the contract, events and flags are in
+it is streamed. It is on by default (`BLOG_AI_ENABLED`); the contract, events and flags are in
 [the API handoff](docs/API_DOCUMENTATION.md#visually-rich-blog-generation-generate_blog). Try it locally with
 `python scripts/run_local_server.py` then `python scripts/local_test_requests.py` (the blog scenarios), or compare providers
 with `python scripts/evaluate_blog.py --live`. To read saved posts as a reader would, `python scripts/render_blog_preview.py`
@@ -277,7 +277,7 @@ writes one self-contained HTML page; `--compare LABEL OLD.md NEW.md` puts two ge
 structured document (600+ words, or one with a table, quote, picture or code block) can instead go through `src/longform`:
 tables, quotes, pictures, code and links are replaced by locked tokens, the prose is refined in ~1,000-word chunks in
 parallel, every chunk is checked in code (tokens, headings, lists, paragraphs, length), repaired once if it broke a rule,
-and restored exactly as written if it still does. It ships disabled (`LONGFORM_REFINE_ENABLED`); the contract, events and
+and restored exactly as written if it still does. It is on by default (`LONGFORM_REFINE_ENABLED`); the contract, events and
 flags are in [the API handoff](docs/API_DOCUMENTATION.md#long-document-refinement-enhance_with_ai-fix_grammar-change_tone-simplify).
 Check it for free with `python scripts/evaluate_longform.py` (10 documents x 4 operations, scripted models), or compare
 providers on real documents with `python scripts/evaluate_longform.py --live --corpus docs`.

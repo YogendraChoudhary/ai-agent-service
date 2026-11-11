@@ -115,10 +115,11 @@ class TestBlogIntent(unittest.TestCase):
         self.assertEqual(detect_blog_intent("Write a blog post about tea")["rule"], "anchored_blog")
         self.assertEqual(detect_blog_intent("hello")["rule"], "no_blog_cue")
 
-    def test_ships_off(self):
-        self.assertFalse(settings.blog_intent_regex_enabled)
-        self.assertFalse(settings.blog_intent_shadow_mode)
-        self.assertFalse(settings.blog_ai_enabled)
+    def test_ships_on_without_shadow_mode(self):
+        defaults = type(settings).model_fields
+        self.assertTrue(defaults["blog_intent_regex_enabled"].default)
+        self.assertFalse(defaults["blog_intent_shadow_mode"].default)
+        self.assertTrue(defaults["blog_ai_enabled"].default)
 
 
 if __name__ == "__main__":

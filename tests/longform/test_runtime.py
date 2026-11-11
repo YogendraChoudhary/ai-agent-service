@@ -18,20 +18,21 @@ from tests.longform.fakes import FakeAgents, drop_a_token, polish
 from tests.longform.fixtures import FENCE, QUOTE, TABLE, acceptance_document, paragraph
 
 # What api.py builds for the single call, per agent type
-PREFIX = {"grammar": "Fix grammar: ", "simplify": "Simplify: ", "tone": "Change tone to calm: ", "enhance": "Enhance: sharper, Text: "}
+PREFIX = {"grammar": "Fix grammar: ", "simplify": "Simplify: ", "tone": "Change tone to calm: ", "enhance": "<instruction>sharper</instruction>\n<text>\n"}
 
 
 class RuntimeCase(unittest.TestCase):
 
     def setUp(self):
         self.agents = FakeAgents()
-        for p in (patch.object(tpa, "create_agent", self.agents), patch.object(settings, "longform_refine_enabled", True)):
+        for p in (patch.object(tpa, "create_agent", self.agents), patch.object(settings, "longform_refine_enabled", True),
+                  patch.object(settings, "chart_suggestions_enabled", False)):  # these tests count the refinement calls only
             p.start()
             self.addCleanup(p.stop)
 
     def stream(self, agent="grammar", text=None, **kw):
         text = acceptance_document() if text is None else text
-        kw.setdefault("query", PREFIX[agent] + text)
+        kw.setdefault("query", PREFIX[agent] + text + ("\n</text>" if agent == "enhance" else ""))
         kw.setdefault("user_text", text)
         kw.setdefault("force_agent_type", agent)
         kw.setdefault("model_provider", "openai")
@@ -70,8 +71,8 @@ class TestWhenThePipelineRuns(RuntimeCase):
         self.assertEqual(self.shape(out)[0], "model_used")
         self.assertNotIn("event:refine_progress", self.shape(out))
 
-    def test_the_flag_is_off_by_default(self):
-        self.assertFalse(type(settings).model_fields["longform_refine_enabled"].default)
+    def test_the_flag_is_on_by_default(self):
+        self.assertTrue(type(settings).model_fields["longform_refine_enabled"].default)
 
     def test_short_plain_text_keeps_the_single_call(self):
         out = self.stream(text="A short note with a typo in it.")

@@ -30,7 +30,7 @@ class TestTaskRouter(unittest.TestCase):
         for name in ('task_routing_enabled', 'provider_fallback_enabled', 'code_intent_regex_enabled',
                      'code_intent_classifier_enabled', 'code_validation_enabled', 'code_repair_enabled'):
             self.assertTrue(getattr(config, name), name)
-        self.assertFalse(config.code_repair_stream_event)
+        self.assertTrue(config.code_repair_stream_event)
         self.assertFalse(config.code_intent_shadow_mode)
 
     @patch.object(settings, 'task_routing_enabled', True)

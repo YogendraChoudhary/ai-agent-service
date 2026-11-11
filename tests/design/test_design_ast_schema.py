@@ -376,3 +376,53 @@ class TestDiscriminator:
         node = ContainerNode.model_validate(raw)
         types = [c.node_type for c in node.children]
         assert types == ["text", "divider", "vector_illustration", "icon_button", "button"]
+
+
+# ---------------------------------------------------------------------------
+# Button href and grid columns
+# ---------------------------------------------------------------------------
+
+def _button(**extra) -> dict:
+    return {"node_type": "button", "id": "cta", "label": "Go", **extra}
+
+
+@pytest.mark.parametrize("href", [
+    "https://example.com/start?plan=pro#top", "http://example.org", "HTTPS://Example.com/x",
+    "mailto:hello@example.com", "tel:+1-555-0100", "#pricing",
+])
+def test_button_accepts_safe_href(href):
+    assert ButtonNode.model_validate(_button(href=href)).href == href
+
+
+@pytest.mark.parametrize("href", [None, ""])
+def test_button_without_href_is_null(href):
+    assert ButtonNode.model_validate(_button(href=href)).href is None
+
+
+@pytest.mark.parametrize("href", [
+    "javascript:alert(1)", "JavaScript:alert(1)", " javascript:alert(1)", "java\tscript:alert(1)",
+    "data:text/html,<script>alert(1)</script>", "vbscript:msgbox", "//evil.example", "/relative/path",
+    "relative.html", "https://", "https:///nohost", "https:/\\evil.example", "https://exa mple.com",
+    "file:///etc/passwd", "mailto:", "#", "#bad id", "https://example.com/\x00", "https://e.com/" + "a" * 2048, 42,
+])
+def test_button_rejects_unsafe_href(href):
+    with pytest.raises(ValidationError):
+        ButtonNode.model_validate(_button(href=href))
+
+
+def test_grid_columns_bounds_and_layout():
+    grid = {**_container(), "layout": "grid", "columns": 3}
+    assert ContainerNode.model_validate(grid).columns == 3
+    assert ContainerNode.model_validate({**grid, "columns": None}).columns is None
+    for bad in (0, 13):
+        with pytest.raises(ValidationError):
+            ContainerNode.model_validate({**grid, "columns": bad})
+    with pytest.raises(ValidationError):
+        ContainerNode.model_validate({**_container(), "layout": "flex_row", "columns": 2})
+
+
+def test_href_and_columns_survive_an_ast_round_trip():
+    root = {**_container(children=[_button(href="https://example.com/start")]), "layout": "grid", "columns": 2}
+    ast = DesignDocumentAST.model_validate(_minimal_ast(root))
+    again = DesignDocumentAST.model_validate_json(ast.model_dump_json())
+    assert again.root.columns == 2 and again.root.children[0].href == "https://example.com/start"

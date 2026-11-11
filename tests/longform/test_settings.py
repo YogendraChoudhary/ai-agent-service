@@ -22,13 +22,13 @@ def clean_env():
 
 class TestDefaults(unittest.TestCase):
 
-    def test_the_pipeline_ships_off_and_with_the_plans_numbers(self):
+    def test_the_pipeline_ships_on_and_with_the_plans_numbers(self):
         with clean_env():
             s = Settings(_env_file=None)
         self.assertEqual(
             (s.longform_refine_enabled, s.longform_refine_min_words, s.longform_chunk_words, s.longform_parallel,
              s.longform_freeze_quotes, s.longform_repair_enabled, s.longform_word_ratio),
-            (False, 600, 1000, 5, True, True, ""))
+            (True, 600, 1000, 5, True, True, ""))
         self.assertEqual((s.longform_first_chunk_words, s.longform_call_timeout_seconds), (300, 150.0))
 
     def test_the_environment_turns_it_on(self):

@@ -52,7 +52,7 @@ would cost days. Verified against the code:
 | Long-form: "NO frontend work" | Small but real: `refine_progress` events, `done.warnings`, and **the document must be sent as Markdown or the pipeline silently does not run** (§6) |
 | Task routing / code gen: "NO frontend work" | The editor must send `model_source`, must send the specific `type` rather than `general`, and must handle `content_replace` **before** the backend enables streaming repair (§5) |
 | Email: "UI to trigger email generation" | Yes, but the browser must **not** call `/agent/email/*` directly; those routes take a raw provider key (§1, §8) |
-| Blog: "minor" | Correct. Note it ships **disabled** (HTTP 503 until `BLOG_AI_ENABLED=true`) |
+| Blog: "minor" | Correct. On by default (`BLOG_AI_ENABLED`) |
 
 ---
 
@@ -80,11 +80,13 @@ production environment may override them. Confirm with whoever deploys.
 | Design canvas | `DESIGN_CANVAS_ENABLED` | **on** | No `design_ready` ever arrives; the request is answered as ordinary chat text (§4.2) |
 | Voice | `VOICE_FLOW_ENABLED` | **on** | `/v1/voice/*` returns 404 |
 | Email | `EMAIL_AI_ENABLED` | on | 503 on all three routes |
-| Blog | `BLOG_AI_ENABLED` | **off** | `generate_blog` → HTTP 503 `{"error": "AI blog generation is disabled"}` |
+| Blog | `BLOG_AI_ENABLED` | **on** | `generate_blog` → HTTP 503 `{"error": "AI blog generation is disabled"}` |
+| Charts | `CHART_SUGGESTIONS_ENABLED` | **on** | No `graph_suggestion` or `graph_suggestion_unavailable` after Enhance, even when the instruction asks for a chart |
 | Document context | `DOCUMENT_CONTEXT_ENABLED` | **on** | `document_context` → HTTP 503 `DOCUMENT_CONTEXT_DISABLED`; legacy edits unchanged |
-| Long-form | `LONGFORM_REFINE_ENABLED` | **off** | The four text types run as one call, as before |
-| Streaming code repair | `CODE_REPAIR_STREAM_EVENT` | **off** | `content_replace` is never sent |
+| Long-form | `LONGFORM_REFINE_ENABLED` | **on** | The four text types run as one call, as before |
+| Streaming code repair | `CODE_REPAIR_STREAM_EVENT` | **on** | `content_replace` is never sent |
 | Task routing | `TASK_ROUTING_ENABLED` | on | Provider chosen as submitted |
+| Blog promotion | `BLOG_INTENT_REGEX_ENABLED` | **on** | "Write a blog post about …" in `general` is answered by the free-form writer instead of the blog pipeline |
 
 ---
 
@@ -221,7 +223,38 @@ no `design_ready`. Call `/agent/abort` *and* abort the fetch.
 
 ---
 
+### 2.7 Write mode (`type: "general"`, prompt only)
+
+* The answer is written to go straight into the document: the model is told never to add a preface, notes,
+  assumptions, offers or questions ("If you paste the existing list… I can insert…"), and to use a short bracketed
+  placeholder such as `[Company name]` only where a detail is unavoidable. Because the basic models were seen to
+  ignore that, the stream is also checked in code (`src/output_guard.py`):
+  * an answer that only asks for material ("Please provide the list you'd like me to add items to…") is replaced by
+    the `needs_context` event below, with `"source": "model"` and no `content`;
+  * a one-line preface ("Sure! Here's a checklist:") and one closing note about the draft ("Feel free to adjust…",
+    "Let me know if you'd like me to…") are dropped. A drafted email's own lines ("Let me know if you have any
+    questions.", "Could you share your availability?") are kept.
+  The first paragraph is held until it is complete and the last one until the end, so text arrives in slightly larger
+  pieces at the start and end.
+* Charts stay a ```` ```mermaid xychart-beta ```` block, as today.
+* A prompt that refers to a document that was not sent ("rewrite this", "continue my draft", "summarise the document",
+  "fix the grammar in this paragraph") is not answered. The stream sends one named event, no `content`, then `done`;
+  no model runs and nothing is charged. `/agent/process` returns it as `needs_context` with an empty `markdown_response`.
+
+```text
+event: needs_context
+data: {"status":"needs_context","suggested_action":"edit","ambiguous":false,"message":"This refers to your document, which wasn't included. Use Edit to change existing text."}
+```
+
+  `suggested_action` is `draft`, `edit` or `ask` (`ask` with `ambiguous: true` when the wording fits several). A prompt
+  that carries text on a new line (for example the selection appended after the instruction) is always answered.
+  The event comes either from the wording check before any model runs (no `source`, nothing charged) or from the
+  output check above (`"source": "model"`, a model ran, the prompt's characters are charged as text).
+
 ## 3. Voice dictation
+
+> **Not used by the editor.** The editor team keeps AssemblyAI for real-time transcription; `/v1/voice/dictate` is a
+> batch endpoint (formatted text after recording stops) and is not called. This section is kept for reference.
 
 Hold a key or button (or click start, click stop), speak, release: formatted text appears at the caret (lists,
 self-corrections, fillers, capitalisation and spacing handled). Pipeline: `VOICE_FLOW.md`. **This section is what the
@@ -496,7 +529,8 @@ type DesignNode = ContainerNode | TextNode | DividerNode | VectorNode | IconButt
 interface ContainerNode { node_type: 'container'; id: string; layout: 'flex_col' | 'flex_row' | 'grid';
   align_items: 'start' | 'center' | 'end' | 'stretch';
   justify_content: 'start' | 'center' | 'end' | 'space_between' | 'space_around';
-  gap_px: number; style: NodeStyle; children: DesignNode[] /* 1–25 */ }                // NO `editable` field
+  gap_px: number; columns: number | null /* 1–12, only when layout is 'grid' */;
+  style: NodeStyle; children: DesignNode[] /* 1–25 */ }                                  // NO `editable` field
 interface TextSpan { text: string; color: Hex; font_weight: Weight; italic: boolean; underline: boolean }
 interface TextNode { node_type: 'text'; id: string; tag: 'h1' | 'h2' | 'h3' | 'p' | 'span' | 'caption'; spans: TextSpan[] /* ≥1 */;
   align: 'left' | 'center' | 'right'; font_size_px: number /* 10–96 */; line_height: number /* 1–2.5 */; style: NodeStyle; editable: boolean }
@@ -509,24 +543,40 @@ interface IconButtonNode { node_type: 'icon_button'; id: string;
   icon_name: 'arrow_left' | 'arrow_right' | 'chevron_left' | 'chevron_right' | 'plus' | 'close' | 'check' | 'sparkles' | 'search' | 'send';
   color: Hex; size_px: number /* 12–64 */; aria_label: string; style: NodeStyle; editable: boolean }
 interface ButtonNode { node_type: 'button'; id: string; label: string; text_color: Hex; font_size_px: number /* 12–32 */;
-  font_weight: Weight; style: NodeStyle; editable: boolean }
+  font_weight: Weight; href: string | null /* safe link, see below */; style: NodeStyle; editable: boolean }
 ```
 
 Guarantees the server enforces (rely on them): every `id` / `layer_id` is unique and matches `^[a-z0-9_]{2,40}$` · tree
 depth ≤ 6 · ≤ 25 children per container · text-vs-background contrast ≥ 3:1 · SVG `attributes` contain only these keys:
 `d cx cy r rx ry x y x1 y1 x2 y2 width height transform points` (no event handlers, hrefs or `javascript:`/`data:` values).
 On an edit, ids of untouched nodes are preserved, so a selection by id survives an AI edit.
+`button.href`, when not null, is an absolute `http(s)://` URL with a host, a `mailto:` / `tel:` link or an in-page
+`#anchor`, at most 2,048 characters, with no whitespace, control characters or backslashes; `javascript:`, `data:`,
+`vbscript:`, protocol-relative (`//host`) and relative paths are rejected. `container.columns` is null unless
+`layout == "grid"`. Send both back unchanged in `existing_design_ast` and they survive "Edit with AI" (an edit
+request whose AST has an unsafe `href` is repaired by the model, not passed through). Other fields the schema does
+not define are still dropped.
+
+A button link is always one the user gave (in the prompt, or already in `existing_design_ast`); the server never
+lets the model invent or rewrite one. Anything else is removed and reported in `complete.warnings`:
+
+```json
+{"kind": "link_removed", "node_id": "cta", "detail": "The link '#checkout' on 'Buy now' was not in your request, so it was removed."}
+{"kind": "link_not_set", "link": "/checkout", "detail": "'/checkout' can't be used as a button link. Use a full https:// address, a mailto: or tel: link, or a #section anchor."}
+```
+
+Show these to the user (for example next to the button) so a link they asked for never disappears silently.
 
 ### 4.5 Rendering guide (recommendation)
 
 | Node | Render as |
 |---|---|
-| `container` | `div`. `flex_col`/`flex_row` → `display:flex` with column/row; `grid` → `display:grid`. **The schema has no column count for `grid`**: decide a rule (ask the backend team, §9 Q4). `align_items`: start/center/end → `flex-start`/`center`/`flex-end`, `stretch`. `justify_content`: `space_between` → `space-between`, `space_around` → `space-around`. `gap_px` → `gap`. `style` → background, padding (px), `border-radius`, `border: {width}px solid {color}`, `max-width` (px), `width_percent` (%) |
+| `container` | `div`. `flex_col`/`flex_row` → `display:flex` with column/row; `grid` → `display:grid` with `grid-template-columns: repeat({columns}, minmax(0, 1fr))`; when `columns` is null pick your own rule (e.g. auto-fit). `align_items`: start/center/end → `flex-start`/`center`/`flex-end`, `stretch`. `justify_content`: `space_between` → `space-between`, `space_around` → `space-around`. `gap_px` → `gap`. `style` → background, padding (px), `border-radius`, `border: {width}px solid {color}`, `max-width` (px), `width_percent` (%) |
 | `text` | The element named by `tag` (`caption` → `<small>`/`<figcaption>`-like). One `<span style="color;font-weight;font-style;text-decoration">` per span. `align` → `text-align`, `font_size_px`, `line_height` |
 | `divider` | A block with `border-top: {thickness_px}px solid {color}`, `width: {width_percent}%`, vertical margin `margin_y_px` |
 | `vector_illustration` | `<svg viewBox width height>`; one element per layer (`svg_element`), `attributes` set as attributes, plus `fill`, `stroke`, `stroke-width`, `opacity`; tag it `data-layer-id` so each layer is selectable |
 | `icon_button` | `<button aria-label>` with your own icon set keyed by the 10 `icon_name`s, at `size_px` and `color` |
-| `button` | `<button>` with `label`. **There is no link/action field**: the design is static; hooking buttons up is a product decision |
+| `button` | `<button>` with `label`; when `href` is set, an `<a href rel="noopener noreferrer">` styled as the button (re-check the scheme on your side too, since users can edit links) |
 
 Safety (the AST comes from a model): never use `innerHTML`; create elements and set properties. For SVG, set only the
 whitelisted attributes above even though the server already filtered them.
@@ -567,8 +617,8 @@ Small, but not zero:
 2. **Send the specific `type`** (`fix_grammar`, `generate_code`, …), never `general` for an operation that has its own type.
 3. `generate_code` / `explain_code` return Markdown with tagged code fences. Render fences as code blocks.
 4. **`content_replace`** (§2.3). The backend can validate generated code and repair it once; the repaired answer arrives as
-   `content_replace` and **replaces the whole streamed answer**. It is off (`CODE_REPAIR_STREAM_EVENT=false`) *until the
-   frontend supports it*: tell the backend when it ships. Until then streaming only logs validation errors.
+   `content_replace` and **replaces the whole streamed answer**. It is **on** by default (`CODE_REPAIR_STREAM_EVENT=true`):
+   the editor must handle it, or a repaired answer is not shown (the original stays on screen).
 5. `/agent/process` (backend) returns HTTP 422 `{"error", "issues"}` for code that fails validation. That is the Node
    backend's concern, but it may surface it.
 
@@ -576,7 +626,7 @@ Small, but not zero:
 
 ## 6. Long-document refinement (`fix_grammar`, `simplify`, `change_tone`, `enhance_with_ai`)
 
-Off by default (`LONGFORM_REFINE_ENABLED`). Frontend work is small but easy to miss:
+On by default (`LONGFORM_REFINE_ENABLED`). Frontend work is small but easy to miss:
 
 * **Send the document as Markdown.** If the editor sends HTML, the pipeline does not run and the old single-call path is used:
   no error, no `refine_progress`, no structure guarantees. Which format the editor sends is a frontend fact I cannot see;
@@ -592,7 +642,7 @@ Off by default (`LONGFORM_REFINE_ENABLED`). Frontend work is small but easy to m
 
 ## 7. Blog generation (`generate_blog`)
 
-Off by default: until `BLOG_AI_ENABLED=true`, HTTP 503. Full contract: `API_DOCUMENTATION.md` § Visually rich blog generation.
+On by default (`BLOG_AI_ENABLED`; when set to `false`, HTTP 503). With `BLOG_INTENT_REGEX_ENABLED` (also on), "write a blog post about …" typed in Write mode (`general`) is answered by this pipeline too. Full contract: `API_DOCUMENTATION.md` § Visually rich blog generation.
 
 * Send `type: "generate_blog"`, `query` = topic/brief (3–5,000 chars), optional `blog_options`, `document_id`.
 * Order of frames: `start → content (title block) → outline → content… → done → image_ready/image_failed… → stream_end`.
@@ -635,10 +685,10 @@ block-based emails.
 | Q1 — resolved | Voice authentication and pricing | Backend | Built: `Authorization: Bearer <licence key>`, existing text billing by formatted output, no credits for BYOK plans. BYOK needs a supported personal light-model key and never uses platform provider keys. Local Whisper still runs on the API server |
 | Q2 | Does an Eddyter-backend proxy for `/agent/email/*` exist? | Backend | The frontend has nothing to call otherwise |
 | Q3 | Production values of `VOICE_FLOW_ENABLED`, `DESIGN_CANVAS_ENABLED`, `BLOG_AI_ENABLED`, `LONGFORM_REFINE_ENABLED`, `CDN_URL`; voice defaults on in code | Backend / ops | Decides which UI is live |
-| Q4 | `container.layout == "grid"` has no column count in the schema. How should it render? | Backend + Frontend | Today the AST cannot express it; either add `columns` to the schema or define a rule (e.g. auto-fit) |
+| Q4 | ~~`container.layout == "grid"` has no column count~~ **Resolved:** `columns` (1–12) added for grid containers | Backend + Frontend | §4.4 |
 | Q5 | What does the editor send for the four long-form types: Markdown or HTML? | Frontend | HTML silently bypasses the pipeline (§6) |
-| Q6 | Where does a design block live in Lexical, and are buttons meant to be functional? | Frontend + Product | The AST has no link/action field |
-| Q7 | When may `CODE_REPAIR_STREAM_EVENT` be turned on? | Frontend → Backend | Needs `content_replace` shipped first (§5) |
+| Q6 | Where does a design block live in Lexical? | Frontend + Product | Buttons now carry an optional, validated `href` (§4.4); link editing is in the editor |
+| Q7 | ~~When may `CODE_REPAIR_STREAM_EVENT` be turned on?~~ **On by default now** | Frontend | Handle `content_replace` (§5) |
 | Q8 | Do you want live voice captions? | Product | Not possible with the current server: one decode per upload, no interim transcripts |
 | Q9 | Does dictation need to stop by itself after a pause? | Product + Frontend | It used to (server-side, in hands-free mode); it was dropped with the WebSocket. Now the client ends the recording (hold, or click start / click stop). Auto-stop would need a client-side voice-activity detector |
 

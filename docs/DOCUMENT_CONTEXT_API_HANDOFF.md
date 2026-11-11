@@ -130,7 +130,37 @@ Handle named events and ordinary `data.type` events. Process and stream metadata
 
 For empty or oversized default Ask, or unavailable scoped/analysis context, metadata has `status="needs_context"`, `coverage="none"`, zero billable input and no model prompt. The content is a deterministic explanation. Both endpoints return a normal completion with that explanation. Do not present it as a model analysis or offer Insert.
 
-When `suggest_document_intent=true`, `document_intent_suggested` precedes action events in a stream; process returns `document_intent`. It reports `suggested_action`, `requested_action`, `effective_action`, `advisory=true`, `ambiguous` and a reason code. Suggestions inspect only the task, with limited multilingual cues. Explicit action always wins; omission still executes Ask. Mixed/unclear tasks suggest Ask. This heuristic is not a trained multilingual classifier or permission to apply edits.
+### Draft placement
+
+When a Draft task names a place, `document_context_ready` carries `placement`, resolved in code (no model call) against
+the same top-level blocks Edit uses; the draft is written for that place, and the context is centred there:
+
+```json
+"placement": {"position": "after", "text": "## Pricing\n", "start_utf16": 120, "end_utf16": 131}
+```
+
+`text` is the exact text of one top-level block of the snapshot you sent (the same rule as Edit's `before`), with its
+UTF-16 offsets. Insert the draft after or before that block. Agreed meanings:
+
+| Wording | Anchor |
+|---|---|
+| "below/under/after the X heading", "below heading X", "below X" | `after` the heading block |
+| "at the end of section X", "after the X section", "after X", "following X" | `after` the last block of that section, subsections included |
+| "between X and Y" | `before` the heading Y (or `after` section X when only X exists) |
+| "at the start of section X" | `after` the heading block |
+| "above/before the X heading", "before the X section" | `before` the heading block |
+| "at the end / bottom (of the document)" | `after` the last block |
+| "at the top / start of the document" | `before` the first block |
+| "after the second / last paragraph (in X)", "after paragraph 3" | that paragraph |
+| "after the paragraph about refunds", "below the table", "after '<quoted words>'" | the one block that matches |
+| "below this paragraph / section" | the block (or section) at the cursor |
+
+Locations are understood in English only; other languages fall back to the cursor. No named place: `placement` is absent; insert at the cursor as before. A named place that is missing or matches more
+than one block gives `status="needs_clarification"` with the question in `message`, **no `content` frames** and no
+model call or charge (for example "There is no heading named 'Risks'. Name an existing heading, or place the cursor
+where the draft should go."). Metadata now also carries `message` for `needs_context`.
+
+When `suggest_document_intent=true`, `document_intent_suggested` precedes action events in a stream; process returns `document_intent`. It reports `suggested_action`, `requested_action`, `effective_action`, `advisory=true`, `ambiguous` and a reason code. Suggestions inspect only the task, with limited multilingual cues. Explicit action always wins; omission still executes Ask. Requests to place new content ("add … below/after/above …", "insert … after …", "put … above …", "add a new section/paragraph/table") suggest Draft with reason `new_content`. Mixed/unclear tasks suggest Ask. This heuristic is not a trained multilingual classifier or permission to apply edits.
 
 Edit continues to emit `document_edit_ready`, one verified document snapshot and `done`; its process result uses `document_edit`, with `document_context=null`. Legacy event order is unchanged.
 

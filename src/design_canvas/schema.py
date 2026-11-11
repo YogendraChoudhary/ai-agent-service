@@ -11,16 +11,19 @@ TextNode              – rich text block with multi-span (dual-tone) support.
 DividerNode           – horizontal rule.
 VectorIllustrationNode – multi-layer SVG illustration (each layer is selectable).
 IconButtonNode        – navigation arrow / action icon.
-ButtonNode            – labelled call-to-action button.
-ContainerNode         – recursive flex/grid layout container.
+ButtonNode            – labelled call-to-action button, with an optional safe ``href``.
+ContainerNode         – recursive flex/grid layout container (``columns`` for grid).
 DesignDocumentAST     – top-level document root.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Dict, List, Literal, Optional, Union
+import re
 
-from pydantic import BaseModel, Field
+from typing import Annotated, Dict, List, Literal, Optional, Union
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Shared primitives
@@ -29,6 +32,37 @@ from pydantic import BaseModel, Field
 HEX_COLOR_PATTERN = r"^#(?:[0-9A-Fa-f]{3,4}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$"
 NODE_ID_PATTERN = r"^[a-z0-9_]{2,40}$"
 LAYER_ID_PATTERN = r"^[a-z0-9_]{2,40}$"
+MAX_HREF_LENGTH = 2048
+SAFE_HREF_SCHEMES = ("http", "https", "mailto", "tel")
+
+
+def safe_href(value: Optional[str]) -> Optional[str]:
+    """
+    A button link the editor can render as-is: an absolute http(s) URL with a host, a mailto:/tel: link, or an
+    in-page ``#anchor``. Anything else (``javascript:``, ``data:``, ``vbscript:``, protocol-relative ``//host``,
+    relative paths, backslashes, whitespace or control characters used to disguise a scheme) is rejected.
+    An empty string means "no link".
+    """
+    if value is None or value == "":
+        return None
+    if len(value) > MAX_HREF_LENGTH:
+        raise ValueError(f"href must be at most {MAX_HREF_LENGTH} characters")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in value):
+        raise ValueError("href must not contain whitespace, control characters or backslashes")
+    if value.startswith("#"):
+        if not re.fullmatch(r"#[A-Za-z0-9_\-:.]{1,200}", value):
+            raise ValueError("An in-page href must look like #section-id")
+        return value
+    scheme = value.split(":", 1)[0].lower() if ":" in value else ""
+    if scheme not in SAFE_HREF_SCHEMES:
+        raise ValueError("href must be an http, https, mailto or tel link, or an in-page #anchor")
+    if scheme in ("http", "https"):
+        parts = urlsplit(value)
+        if not value.lower().startswith(scheme + "://") or not parts.hostname:
+            raise ValueError("An http(s) href must be an absolute URL with a host")
+    elif len(value) <= len(scheme) + 1:
+        raise ValueError(f"A {scheme}: href needs an address after the colon")
+    return value
 
 
 class TextSpan(BaseModel):
@@ -132,8 +166,19 @@ class ButtonNode(BaseModel):
     text_color: str = Field("#000000", pattern=HEX_COLOR_PATTERN)
     font_size_px: int = Field(15, ge=12, le=32)
     font_weight: Literal["normal", "medium", "semibold", "bold"] = "semibold"
+    href: Optional[str] = Field(
+        None, max_length=MAX_HREF_LENGTH,
+        description="Optional link the button opens: an absolute https:// or http:// URL, mailto:, tel:, or an "
+                    "in-page #anchor. Omit it when the user gave no destination; never invent a URL.")
     style: NodeStyle = Field(default_factory=NodeStyle)
     editable: bool = True
+
+    @field_validator("href", mode="before")
+    @classmethod
+    def _safe_href(cls, value):
+        if value is not None and not isinstance(value, str):
+            raise ValueError("href must be a string")
+        return safe_href(value)
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +194,17 @@ class ContainerNode(BaseModel):
         "start", "center", "end", "space_between", "space_around"
     ] = "center"
     gap_px: int = Field(16, ge=0, le=128)
+    columns: Optional[int] = Field(
+        None, ge=1, le=12,
+        description="Number of equal grid columns (1–12). Only for layout \"grid\"; omit for flex layouts.")
     style: NodeStyle = Field(default_factory=NodeStyle)
     children: List["DesignNode"] = Field(..., min_length=1, max_length=25)
+
+    @model_validator(mode="after")
+    def _columns_need_grid(self):
+        if self.columns is not None and self.layout != "grid":
+            raise ValueError("columns is only valid when layout is \"grid\"")
+        return self
 
 
 # Discriminated union — the ``node_type`` literal discriminator lets Pydantic
