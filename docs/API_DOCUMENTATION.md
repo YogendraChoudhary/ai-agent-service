@@ -39,13 +39,20 @@ http://localhost:5000
 
 ### POST `/agent/process`
 
-Process text using AI with various operations.
+Process text using AI with various operations. **Server-to-server only**: `api_key` is the provider key the Eddyter
+backend resolved, and the backend bills the call.
 
 #### Request Headers
 
 ```
 Content-Type: application/json
+X-Agent-Backend-Secret: <AGENT_BACKEND_SECRET>     # required once AGENT_BACKEND_SECRET is set on the agent
 ```
+
+With `AGENT_BACKEND_SECRET` set, a call without the matching header gets **401**
+`{"error": "Unauthorized", "code": "BACKEND_SECRET_REQUIRED"}` and no model runs. While it is unset the route accepts
+any caller (as before) and the agent logs a warning at startup. Roll out by adding the header on the backend first,
+then setting the variable on the agent.
 
 #### Request Body
 

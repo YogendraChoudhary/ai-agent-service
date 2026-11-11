@@ -205,6 +205,12 @@ class Settings(BaseSettings):
     email_ai_enabled: bool = Field(True, alias="EMAIL_AI_ENABLED")                # False = /agent/email/* return 503
     email_ai_repair_enabled: bool = Field(True, alias="EMAIL_AI_REPAIR_ENABLED")  # one "fix these errors" retry
     email_ai_max_variants: int = Field(3, alias="EMAIL_AI_MAX_VARIANTS")
+    # Shared secret for server-to-server callers, sent in the X-Agent-Backend-Secret header.
+    # * /agent/process (provider key, billed by the caller): when set, every call must carry it (401 otherwise). When
+    #   empty the route stays open as before and startup logs a warning: set it on the backend first, then here.
+    # * /agent/email/*: these take the Eddyter licence key; only a caller with this secret may pass a provider key
+    #   instead (no licence check, no billing here). Empty = that mode is off.
+    agent_backend_secret: str = Field("", alias="AGENT_BACKEND_SECRET")
 
     # ------------------------------------------------------------------
     # Visually rich blog generation (src/blog). The model writes an outline and section bodies; code decides

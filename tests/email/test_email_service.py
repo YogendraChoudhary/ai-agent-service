@@ -270,7 +270,7 @@ class TestRoutes(unittest.TestCase):
         uploaded = {"cdn_url": "https://cdn.test/x.jpg"}
         with patch("src.s3_service.upload_image_from_bytes_detailed", return_value=uploaded) as up:
             r = self.client.post("/agent/email/image", json={
-                "slot": "hero", "image_base64": base64.b64encode(buf.getvalue()).decode()})
+                "api_key": "lic-test", "slot": "hero", "image_base64": base64.b64encode(buf.getvalue()).decode()})
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual((body["width"], body["height"], body["display_width"]), (1200, 600, 600))
@@ -278,7 +278,7 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(up.call_args.args[1], "image/jpeg")
 
     def test_image_bad_base64(self):
-        r = self.client.post("/agent/email/image", json={"slot": "hero", "image_base64": "!!!!not-base64!!!!"})
+        r = self.client.post("/agent/email/image", json={"api_key": "lic-test", "slot": "hero", "image_base64": "!!!!not-base64!!!!"})
         self.assertEqual(r.status_code, 400)
 
 

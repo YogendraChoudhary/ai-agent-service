@@ -20,15 +20,26 @@ the dark/light look come from the `theme` the user picked, which the AI cannot c
 ## 2. Architecture and security (read first)
 
 ```
-Browser (Eddyter UI) ──► Eddyter backend ──► Agent service  /agent/email/*
-                          adds provider key,      returns template JSON
-                          bills credits
+Browser (Eddyter UI) ──► Agent service  /agent/email/*      (same contract as /agent/stream)
+   api_key = licence key     checks the licence, picks the key, reserves and bills credits
 ```
 
-- **Do not call these routes from the browser.** `api_key` is the raw **AI provider key** (OpenAI,
-  Anthropic…), and the routes have **no auth of their own**. They use the same server-to-server contract as
-  `/agent/process`: Eddyter's backend resolves the key (user's own or platform key) and bills the call.
-  CORS is currently open (`*`), so a browser call would technically work, and it would leak the key.
+- **Call these routes from the editor with the Eddyter licence key in `api_key`**, exactly like `/agent/stream`.
+  No backend proxy is needed and no provider key ever reaches the browser.
+- The licence is checked by the same code as `/agent/stream` (`async_validate_and_get_api_key`):
+  * BYOK users (`requires_user_api_keys`) run on their saved keys and are **not billed** here;
+  * everyone else runs on the platform key; `generate` reserves credits before the model call and is billed through
+    the normal credit webhook afterwards (§7.1). `image` makes no model call and is never billed.
+  * Errors are the `/agent/stream` ones: 403 invalid licence or blocked editor (`{"error", "code":
+    "EDITOR_ACCESS_BLOCKED"}`), 402 past-due managed plan, 400 a BYOK user without a key for the model, 402
+    `INSUFFICIENT_CREDITS`, 503 licence or credit service down (§7).
+- `model_source` works as on the other routes: `user` (default) runs the selected `model` first; `default` lets the
+  server pick the writing default (OpenAI's advanced tier). With provider fallback on, a failing provider moves the
+  call to the next one in the writing fallback order.
+- **Server-to-server mode (optional).** A backend that sends `X-Agent-Backend-Secret: <AGENT_BACKEND_SECRET>` may
+  pass a raw provider key in `api_key` instead: no licence check and no billing here (the caller bills). With
+  `AGENT_BACKEND_SECRET` unset (the default) this mode is off, so a provider key from anyone else fails as an invalid
+  licence. Never put the secret in the browser.
 - Every response carries `X-Request-ID` (and `X-Response-Time-Ms`). Log it and show it in error reports.
 
 ---
@@ -65,7 +76,8 @@ type that isn't listed is a 400. Add an **"Auto-detect"** option that omits `cat
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `model` | string | yes | `openai` \| `claude` \| `grok` \| `deepseek` \| `gemini` (case-insensitive) |
-| `api_key` | string | yes | Provider key (added by Eddyter backend) |
+| `model_source` | string | no | `user` (default): run `model` first. `default`: the server picks the writing default |
+| `api_key` | string | yes | The Eddyter **licence key** (a provider key only with the backend secret, §2) |
 | `brief` | string | yes | 3–5000 chars after trimming. What the email is about, in the user's words |
 | `category` | string | no | An id from `/categories`. Omit or `""` = auto-detect |
 | `tone` | string | no | `formal` \| `professional` \| `professional_warm`. Omit = the type's `default_tone` |
@@ -92,7 +104,7 @@ Only link **keys** and asset **descriptions** reach the AI. URLs never do.
 ```json
 {
   "model": "openai",
-  "api_key": "<provider key, added server-side>",
+  "api_key": "<Eddyter licence key>",
   "brief": "We are launching Eddyter AI Assist, a writing assistant built into the editor. It drafts emails from a short brief, rewrites any paragraph in a chosen tone, and checks copy against your brand voice. Available to all workspace plans. Link to the launch page. Add a banner image showing the editor on a laptop.",
   "audience": "Existing customers",
   "allowed_merge_tags": ["first_name", "company_name", "company_address"],
@@ -136,10 +148,11 @@ Turns any user image into the exact file an image slot needs, then uploads it.
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
+| `api_key` | string | yes | The Eddyter **licence key**, checked as on `/agent/stream`. Nothing is billed |
 | `slot` | string | yes | `hero` \| `inline` \| `logo` |
 | `image_base64` | string | yes | Base64 **or a data URL** (`data:image/png;base64,…`, as `FileReader.readAsDataURL` gives). Line breaks are fine. Max 15 MB decoded |
 | `focal_point` | [x, y] | no | Each 0–1; where to centre the crop. Default `[0.5, 0.5]` |
-| `user_id` | string | no | `A-Za-z0-9_-`, ≤ 64. S3 folder and storage-quota owner. Send it |
+| `user_id` | string | no | Ignored for licence callers: the upload always goes to the licence's user (folder and storage quota). Only a backend-secret caller may set it |
 | `action` | string | no | Only `fit` today. `refine` and `generate` are Phase 2 |
 
 Response 200:
@@ -363,12 +376,36 @@ Show them in a review panel, not as errors. Each may carry `block_id`/`field` so
 | Status | When | Body | Suggested UX |
 |---|---|---|---|
 | 400 | Bad request (any field rule in §3), unknown/disabled `category`, signature + social together, unknown field | `{"error"}` | Fix the form; message is safe to show |
+| 400 | BYOK user has no key for the chosen `model` | `{"error": "No API key configured for …"}` | Send them to their API key settings |
+| 402 | Past-due managed plan | `{"error": "Your payment is past due…"}` | Billing prompt |
+| 402 | Not enough credits for the reservation (before any model call) | `{"error": "Insufficient credits", "code": "INSUFFICIENT_CREDITS", "available", "needed"}` | Same UX as `/agent/stream` |
+| 403 | Licence missing, invalid, inactive or expired | `{"error": "Invalid license: …"}` | Same UX as `/agent/stream` |
+| 403 | Editor access blocked by an administrator | `{"error", "code": "EDITOR_ACCESS_BLOCKED"}` | Show the message as-is |
 | 413 | `/image`: user's storage quota exceeded | `{"error"}` | "Storage full" |
 | 422 | The AI's email failed the rules twice (first try + automatic repair) | `{"error", "issues": Issue[]}` | "Couldn't generate a valid email. Try again or rephrase the brief." Offer Retry. Log `issues` |
 | 422 | `/image`: image can't be compressed under 200 KB | `{"error"}` | Ask for a simpler image |
 | 500 | Unexpected server error | `{"error"}` | Retry once; report with `X-Request-ID` |
 | 502 | AI provider failed (bad/expired key, rate limit, outage) | `{"error": "openai request failed: …"}` | "AI service unavailable"; for 401-type messages, prompt to check the API key |
 | 503 | Feature switched off (`EMAIL_AI_ENABLED=false`) | `{"error"}` | Hide the AI entry points (check `/categories` on load: 503 = off) |
+| 503 | Licence or credit service unavailable | `{"error"}` | Retry later |
+
+### 7.1 Billing
+
+Non-BYOK `generate` calls send one credit webhook, the same message `/agent/stream` sends for text:
+
+```json
+{"user_id": "…", "operation_type": "text", "input_chars": 412, "output_chars": 1180, "image_count": 0,
+ "provider": "openai", "model": "gpt-5.2", "duration_ms": 8123, "success": true, "error_code": null}
+```
+
+* `input_chars`: the user's own text the model reads (brief, audience, org name, sender fields, asset descriptions).
+* `output_chars`: the readable text of every returned variant (subjects, preheader, headings, body, buttons, sign-off),
+  not the JSON around it. A typical one-variant email is about 1,000–1,500 characters in total.
+* Price: the existing text rule, 1 credit per started 1,000 characters (`input_chars + output_chars`), so a typical
+  email is 1–2 credits and three variants 3–5. The backend needs no change; it already handles `text`.
+* Before the model call a reservation of that rule for 1,500 output characters per variant is taken (402 if it does
+  not fit); it is released after the charge, or in full when generation fails (400/422/502/500 are not charged).
+* BYOK calls, backend-secret calls and `/agent/email/image` are not billed here.
 
 Validation error messages have the form `"<field>: <reason>"` or `"Missing required fields: <field>"`.
 
@@ -377,7 +414,7 @@ Validation error messages have the form `"<field>: <reason>"` or `"Missing requi
 ## 8. Edge cases (all verified by tests)
 
 Request (each is a 400 before any AI call, `test_email_edge_cases.TestRequestValidation`):
-1. Missing `brief`, `api_key`, or `model` → 400 "Missing required fields: …".
+1. Missing `brief`, `api_key`, or `model` → 400 "Missing required fields: …" (before the licence check).
 2. Brief of only spaces, or under 3 characters after trimming → 400.
 3. Brief over 5000 characters → 400. Long briefs: trim or summarise in the UI.
 4. `model` not one of the five providers → 400.

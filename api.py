@@ -69,6 +69,7 @@ from src.observability import (
     start_trace,
     summarize_images,
     trace_mark,
+    trace_set,
 )
 from src.webhook import (
     fire_credit_deduction,
@@ -202,6 +203,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Failed to initialise Redis manager: {e}")
         logger.error("⚠️  API will not be able to validate licences!")
         redis_manager = None
+
+    if not settings.agent_backend_secret:
+        logger.warning("⚠️  AGENT_BACKEND_SECRET is not set: /agent/process accepts a provider key from any caller. "
+                       "Set the same value on the backend (X-Agent-Backend-Secret header) and here to restrict it.")
 
     if redis_manager is not None:
         try:
@@ -681,11 +686,13 @@ class EmailGenerateRequest(BaseModel):
 
 class EmailImageRequest(BaseModel):
     model_config = {'extra': 'forbid'}
+    api_key: str = Field(..., min_length=1)                     # Eddyter licence key (provider key only with the backend secret)
     slot: str = Field(..., pattern=r'^(hero|inline|logo)$')
     action: str = Field('fit', pattern=r'^fit$')                # refine / generate arrive in phase 2
     image_base64: str = Field(..., min_length=16, max_length=21_000_000)  # ~15 MB decoded
     focal_point: Optional[List[float]] = Field(None, min_length=2, max_length=2)
-    user_id: Optional[str] = Field(None, pattern=r'^[A-Za-z0-9_-]{1,64}$')  # S3 folder + storage quota
+    # S3 folder + storage quota. Licence callers always get their licence's user; only a backend-secret caller may set it.
+    user_id: Optional[str] = Field(None, pattern=r'^[A-Za-z0-9_-]{1,64}$')
 
     @field_validator('focal_point')
     @classmethod
@@ -976,7 +983,7 @@ async def health_check() -> HealthResponse:
 
 
 @app.post('/agent/process', response_model=ProcessResponse)
-async def process_text(request_data: ProcessRequest) -> JSONResponse:
+async def process_text(request_data: ProcessRequest, request: Request) -> JSONResponse:
     """
     Non-streaming text processing endpoint.
 
@@ -997,6 +1004,12 @@ async def process_text(request_data: ProcessRequest) -> JSONResponse:
         query_chars=len(request_data.query),
         document_context_request=request_data.document_context is not None,
     )
+    # api_key here is a raw provider key and nothing is billed, so only the backend may call this route.
+    if settings.agent_backend_secret and not backend_secret_valid(request):
+        logger.warning(f"[{request_id}] /agent/process rejected: missing or wrong X-Agent-Backend-Secret")
+        finish_trace(request_id, 'rejected', error='backend secret required', http_status=401)
+        return JSONResponse(status_code=401, headers={"X-Request-ID": request_id},
+                            content={'error': 'Unauthorized', 'code': 'BACKEND_SECRET_REQUIRED'})
     log_request_body(request_id, '/agent/process', request_data.model_dump())
 
     logger.info(f"[{request_id}] ========== NEW REQUEST ==========")
@@ -1853,10 +1866,78 @@ async def abort_request(request_data: AbortRequest) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# AI email templates (src/email_template). Same server-to-server contract as /agent/process: api_key is the
-# provider key the backend resolved, and the backend bills the call. Output is template JSON; the editor
-# renders HTML from it.
+# AI email templates (src/email_template). Same contract as /agent/stream: api_key is the Eddyter licence key; BYOK
+# users run on their saved keys, everyone else on the platform key, and non-BYOK calls are billed through the credit
+# webhook as text. A server-to-server caller holding AGENT_BACKEND_SECRET may still send a provider key instead (no
+# licence check, no billing here). Output is template JSON; the editor renders HTML from it.
 # ---------------------------------------------------------------------------
+EMAIL_OUTPUT_CHARS_PER_VARIANT = 1500   # upfront reservation only; the charge uses the real output
+_EMAIL_NON_TEXT_KEYS = {'id', 'type', 'variant', 'align', 'alignment', 'size', 'width', 'height', 'href', 'url', 'link',
+                        'src', 'theme', 'color', 'colour', 'background', 'style', 'slot', 'platform', 'layout', 'role'}
+
+
+def backend_secret_valid(request: Request) -> bool:
+    """True only for a caller that sends the configured AGENT_BACKEND_SECRET (constant-time comparison)."""
+    import hmac
+    secret = settings.agent_backend_secret
+    supplied = request.headers.get('X-Agent-Backend-Secret', '')
+    return bool(secret) and bool(supplied) and hmac.compare_digest(supplied.encode(), secret.encode())
+
+
+def email_input_chars(request_data) -> int:
+    """The user's own text the model reads: the brief and the free-text fields around it."""
+    texts = [request_data.brief, request_data.audience or '', request_data.org_name or '',
+             *request_data.sender.values(), *request_data.assets.values()]
+    return sum(len(t) for t in texts)
+
+
+def email_output_chars(result: dict) -> int:
+    """Characters of readable text in the returned templates (subjects, headings, body, buttons), not the JSON around it."""
+    def walk(value, key=''):
+        if isinstance(value, dict):
+            return sum(walk(v, k) for k, v in value.items())
+        if isinstance(value, list):
+            return sum(walk(v, key) for v in value)
+        if isinstance(value, str) and key not in _EMAIL_NON_TEXT_KEYS and not key.endswith(('_asset', '_url', '_color', '_id')) \
+                and not re.match(r'^(?:asset:|link:|https?://|mailto:|#[0-9A-Fa-f]{3,8}$)', value):
+            return len(value)
+        return 0
+    return sum(walk(t.get('template', {})) for t in result.get('templates', []))
+
+
+async def resolve_email_caller(request: Request, request_data, request_id: str, background_tasks: BackgroundTasks) -> dict:
+    """
+    Who is calling and with which keys. Licence callers go through exactly the /agent/stream checks (invalid or
+    blocked licence 403, past-due managed plan 402, no key 400, Redis down 503). Returns user_id, is_byok and, for
+    model calls, candidates + key_for.
+    """
+    if backend_secret_valid(request):
+        from src.task_router import Candidate
+        return {'backend': True, 'user_id': None, 'is_byok': True, 'text_byok': True,
+                'candidates': [Candidate(getattr(request_data, 'model', ''), True)], 'key_for': lambda _p: request_data.api_key}
+    model = getattr(request_data, 'model', None) or 'openai'
+    routed = settings.task_routing_enabled or settings.provider_fallback_enabled
+    # A route without a model call (image fitting) needs a valid licence but no provider key.
+    needs_key = hasattr(request_data, 'model') and not routed
+    api_key, license_meta = await async_validate_and_get_api_key(
+        request_data.api_key, model, request_id, background_tasks, **({} if needs_key else {'allow_missing_key': True}))
+    trace_mark(request_id, 'auth_done', user=license_meta['user_id'])
+    is_byok = license_meta['requires_user_api_keys']
+    text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
+    caller = {'backend': False, 'user_id': license_meta['user_id'], 'is_byok': is_byok, 'text_byok': text_byok}
+    if not hasattr(request_data, 'model'):
+        return caller
+    from src.task_router import Candidate, KeyResolver, resolve_route
+    if routed:
+        key_resolver = KeyResolver(license_meta['user_keys'], None if text_byok else DEFAULT_API_KEYS,
+                                   redis_manager.resolve_api_key_from_user_keys)
+        candidates = resolve_route('writing', model, request_data.model_source, key_resolver.available_providers, True)
+        if not candidates:
+            raise HTTPException(status_code=400, detail='No API key configured for an eligible provider')
+        caller.update(candidates=candidates, key_for=key_resolver)
+    else:
+        caller.update(candidates=[Candidate(model, True)], key_for=lambda _p: api_key)
+    return caller
 @app.get('/agent/email/categories')
 async def email_categories() -> JSONResponse:
     """Email types the frontend can offer, in routing order. Only enabled types (with an example) are listed."""
@@ -1872,10 +1953,12 @@ async def email_categories() -> JSONResponse:
 
 
 @app.post('/agent/email/generate')
-async def email_generate(request_data: EmailGenerateRequest) -> JSONResponse:
+async def email_generate(request_data: EmailGenerateRequest, request: Request,
+                         background_tasks: BackgroundTasks) -> JSONResponse:
     from src.email_template.service import (
-        EmailGenerationError, EmailProviderError, GenerateRequest, generate, make_agno_llm,
+        EmailGenerationError, EmailProviderError, GenerateRequest, generate, make_routed_llm,
     )
+    from src.models import ADVANCED_MODEL_IDS
 
     request_id = str(uuid.uuid4())[:8]
     headers = {"X-Request-ID": request_id}
@@ -1884,6 +1967,30 @@ async def email_generate(request_data: EmailGenerateRequest) -> JSONResponse:
     start_trace(request_id, '/agent/email/generate', chat_model=request_data.model,
                 query_chars=len(request_data.brief))
     log_request_body(request_id, '/agent/email/generate', request_data.model_dump())
+    start_time = time.time()
+    try:
+        caller = await resolve_email_caller(request, request_data, request_id, background_tasks)
+    except HTTPException as e:
+        finish_trace(request_id, 'rejected', error=str(e.detail), http_status=e.status_code)
+        raise
+    user_id, billed = caller['user_id'], not caller['backend'] and not caller['is_byok']
+    if billed and CREDIT_PRECHECK_ENABLED and credit_manager is None:
+        finish_trace(request_id, 'rejected', error='credit service unavailable', http_status=503)
+        raise HTTPException(status_code=503, detail='Credit service unavailable')
+    input_chars = email_input_chars(request_data)
+    reserved_scaled = 0
+    if billed and CREDIT_PRECHECK_ENABLED and credit_manager is not None:
+        reserved_scaled = text_credits_scaled(input_chars, EMAIL_OUTPUT_CHARS_PER_VARIANT * request_data.variants)
+        ok, available_scaled = credit_manager.reserve(user_id, reserved_scaled)
+        if not ok:
+            finish_trace(request_id, 'rejected', error='insufficient credits', http_status=402)
+            return JSONResponse(status_code=402, headers=headers, content={
+                'error': 'Insufficient credits', 'code': 'INSUFFICIENT_CREDITS',
+                'available': available_scaled, 'needed': reserved_scaled})
+
+    def release_reservation():
+        if reserved_scaled:
+            credit_manager.schedule_release(user_id, reserved_scaled, delay_seconds=0)
 
     req = GenerateRequest(
         brief=request_data.brief, category=request_data.category, tone=request_data.tone,
@@ -1894,13 +2001,15 @@ async def email_generate(request_data: EmailGenerateRequest) -> JSONResponse:
         sign_off=request_data.sign_off, social_links=request_data.social_links,
         theme=request_data.theme.model_dump(exclude_none=True) if request_data.theme else None,
     )
-    llm = make_agno_llm(request_data.model, request_data.api_key, request_id=request_id, is_byok=True)
+    llm = make_routed_llm(caller['candidates'], caller['key_for'], request_id=request_id, is_byok=caller['text_byok'])
     try:
         result = await run_in_threadpool(generate, req, llm, request_id)
     except ValueError as e:
+        release_reservation()   # a failed generation is not charged, as on /agent/stream
         finish_trace(request_id, 'rejected', error=str(e), http_status=400)
         return JSONResponse(status_code=400, content={'error': str(e)}, headers=headers)
     except EmailGenerationError as e:
+        release_reservation()
         finish_trace(request_id, 'rejected', error=str(e), http_status=422)
         return JSONResponse(
             status_code=422,
@@ -1909,13 +2018,34 @@ async def email_generate(request_data: EmailGenerateRequest) -> JSONResponse:
             headers=headers,
         )
     except EmailProviderError as e:
+        release_reservation()
         logger.error(f"[{request_id}] email generate provider error — {e}")
         finish_trace(request_id, 'error', error=str(e), http_status=502)
         return JSONResponse(status_code=502, content={'error': str(e)}, headers=headers)
     except Exception as e:
+        release_reservation()
         logger.error(f"[{request_id}] email generate FAILED — {e}")
         finish_trace(request_id, 'error', error=str(e), http_status=500)
         return JSONResponse(status_code=500, content={'error': str(e)}, headers=headers)
+
+    output_chars = email_output_chars(result)
+    provider = llm.used.get('provider') or request_data.model
+    model_id = ADVANCED_MODEL_IDS.get(provider)
+    trace_set(request_id, model_used=f'{provider}/{model_id}', email_output_chars=output_chars,
+              email_billed=billed)
+    if billed:
+        # operation_type "text", priced by characters like any text request: the brief and its fields in, the
+        # templates' readable text out (all variants). BYOK and backend-secret calls are not billed here.
+        duration_ms = int((time.time() - start_time) * 1000)
+        if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
+            fire_credit_deduction_and_release(
+                user_id=user_id, input_chars=input_chars, output_chars=output_chars, operation_type='text',
+                image_count=0, reserved_scaled=reserved_scaled, credit_manager=credit_manager,
+                settle_delay_seconds=CREDIT_SETTLE_DELAY_SECONDS, provider=provider, model=model_id,
+                duration_ms=duration_ms, success=True)
+        else:
+            fire_credit_deduction(user_id, input_chars, output_chars, 'text', 0, provider=provider, model=model_id,
+                                  duration_ms=duration_ms, success=True)
 
     log_response_body(request_id, '/agent/email/generate', result)
     finish_trace(request_id, 'ok', http_status=200)
@@ -1923,7 +2053,8 @@ async def email_generate(request_data: EmailGenerateRequest) -> JSONResponse:
 
 
 @app.post('/agent/email/image')
-async def email_image(request_data: EmailImageRequest) -> JSONResponse:
+async def email_image(request_data: EmailImageRequest, request: Request,
+                      background_tasks: BackgroundTasks) -> JSONResponse:
     """Crop and compress an image to a fixed email slot size, then upload it. Phase 1: action 'fit' only."""
     from src.email_template.images import SlotImageError, fit_to_slot
     from src.s3_service import StorageQuotaExceededError, upload_image_from_bytes_detailed
@@ -1932,6 +2063,9 @@ async def email_image(request_data: EmailImageRequest) -> JSONResponse:
     headers = {"X-Request-ID": request_id}
     if not settings.email_ai_enabled:
         return JSONResponse(status_code=503, content={'error': 'AI email templates are disabled'}, headers=headers)
+    # Licence check as on /agent/stream. No model runs and nothing is billed; the upload goes to the licence's user.
+    caller = await resolve_email_caller(request, request_data, request_id, background_tasks)
+    upload_user = request_data.user_id if caller['backend'] else caller['user_id']
     try:
         b64 = request_data.image_base64
         if b64.startswith('data:'):  # browsers' FileReader.readAsDataURL output
@@ -1940,7 +2074,7 @@ async def email_image(request_data: EmailImageRequest) -> JSONResponse:
         focal = tuple(request_data.focal_point) if request_data.focal_point else None
         fitted = await run_in_threadpool(fit_to_slot, raw, request_data.slot, focal)
         uploaded = await run_in_threadpool(
-            upload_image_from_bytes_detailed, fitted.data, fitted.content_type, request_data.user_id, request_id,
+            upload_image_from_bytes_detailed, fitted.data, fitted.content_type, upload_user, request_id,
         )
     except (binascii.Error, ValueError) as e:  # SlotImageError is a ValueError
         status = 400 if not isinstance(e, SlotImageError) or 'compress' not in str(e) else 422

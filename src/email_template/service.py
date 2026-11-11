@@ -140,6 +140,37 @@ def make_agno_llm(model_provider: str, api_key: str, request_id: Optional[str] =
     return call
 
 
+def make_routed_llm(candidates, key_for, request_id: Optional[str] = None, is_byok: bool = True,
+                    temperature: float = 0.3) -> LLM:
+    """
+    make_agno_llm over the routed providers (task "writing", the request's model_source), in order: a provider that
+    fails moves the call to the next one, as /agent/stream does. `call.used` holds the provider that last answered.
+    """
+    used: dict = {}
+
+    def call(system: str, messages: list[dict]) -> str:
+        last: Optional[EmailProviderError] = None
+        for index, candidate in enumerate(candidates):
+            key = key_for(candidate.provider)
+            if not key:
+                continue
+            try:
+                reply = make_agno_llm(candidate.provider, key, request_id=request_id, is_byok=is_byok,
+                                      temperature=temperature)(system, messages)
+            except EmailProviderError as error:
+                last = error
+                if index + 1 < len(candidates):
+                    logger.warning(f"[{request_id}] email provider {candidate.provider} failed; trying "
+                                   f"{candidates[index + 1].provider}")
+                continue
+            used["provider"] = candidate.provider
+            return reply
+        raise last or EmailProviderError("No API key configured for an eligible provider")
+
+    call.used = used
+    return call
+
+
 def _generate_one(llm: LLM, system: str, first_user: str, ctx: Context, request_id: Optional[str]) -> Result:
     """One variant. Provider errors propagate; generate() decides whether other variants can carry on."""
     messages = [{"role": "user", "content": first_user}]

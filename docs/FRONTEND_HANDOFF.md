@@ -60,8 +60,8 @@ would cost days. Verified against the code:
 
 | Surface | Called by | Credential in `api_key` | Billing |
 |---|---|---|---|
-| `POST /agent/stream`, `POST /agent/abort`, `POST /agent/autocomplete` | The editor (browser) | Eddyter **licence key**, validated against Redis | Agent service reserves and settles credits |
-| `POST /agent/process`, `/agent/email/*` | **Eddyter backend only** | Provider key the backend resolved | Backend bills |
+| `POST /agent/stream`, `POST /agent/abort`, `POST /agent/autocomplete`, `POST /agent/email/generate`, `POST /agent/email/image` | The editor (browser) | Eddyter **licence key**, validated against Redis | Agent service reserves and settles credits (`/agent/email/image` is free) |
+| `POST /agent/process` | **Eddyter backend only** | Provider key the backend resolved, plus `X-Agent-Backend-Secret` when `AGENT_BACKEND_SECRET` is set (401 `BACKEND_SECRET_REQUIRED` without it) | Backend bills |
 | `POST /v1/voice/dictate` | The editor (browser) | Eddyter **licence key** in `Authorization: Bearer <key>`; optional `X-Voice-Token` too | Existing text price by formatted output characters; BYOK plans pay no credits |
 | `GET /v1/voice/status` | The editor (browser) | None | None |
 
@@ -664,10 +664,10 @@ On by default (`BLOG_AI_ENABLED`; when set to `false`, HTTP 503). With `BLOG_INT
 Follow that document; it is accurate (15 block types, all request fields and categories re-checked against the code).
 Three additions:
 
-1. **Browser → Eddyter backend → agent.** The routes take a raw provider key and have no auth of their own. The frontend
-   calls an Eddyter-backend route that adds the key. **That proxy route is not in this repository**; confirm it exists (§9 Q2).
-2. The request also accepts optional `model_source` (`"default"|"user"`, same meaning as §2.1; email always uses the submitted
-   provider, so it has no effect today). It was missing from that document's §3.2 table.
+1. **Call the email routes directly with the licence key**, like `/agent/stream`. `api_key` is the Eddyter licence; the
+   agent checks it, picks the user's own or the platform key, and bills non-BYOK `generate` calls as text. No backend proxy
+   is needed (`EMAIL_API_HANDOFF.md` §2, §7). `/agent/email/image` also needs the licence now.
+2. Optional `model_source` (`"default"|"user"`) works as in §2.1: `default` picks the writing default, with provider fallback.
 3. `GET /agent/email/categories` returns only the *enabled* categories: 7 today (`reminder_deadline`, `policy_notice`,
    `invitation`, `product_launch`, `feature_update`, `announcement`, `general`), matching that document. More are defined
    in the code but switched off; never hard-code the list.
@@ -683,7 +683,7 @@ block-based emails.
 | # | Question | Who | Why it matters |
 |---|---|---|---|
 | Q1 — resolved | Voice authentication and pricing | Backend | Built: `Authorization: Bearer <licence key>`, existing text billing by formatted output, no credits for BYOK plans. BYOK needs a supported personal light-model key and never uses platform provider keys. Local Whisper still runs on the API server |
-| Q2 | Does an Eddyter-backend proxy for `/agent/email/*` exist? | Backend | The frontend has nothing to call otherwise |
+| Q2 | ~~Does an Eddyter-backend proxy for `/agent/email/*` exist?~~ **Not needed:** the routes take the licence key | — | `EMAIL_API_HANDOFF.md` §2 |
 | Q3 | Production values of `VOICE_FLOW_ENABLED`, `DESIGN_CANVAS_ENABLED`, `BLOG_AI_ENABLED`, `LONGFORM_REFINE_ENABLED`, `CDN_URL`; voice defaults off in code | Backend / ops | Decides which UI is live |
 | Q4 | ~~`container.layout == "grid"` has no column count~~ **Resolved:** `columns` (1–12) added for grid containers | Backend + Frontend | §4.4 |
 | Q5 | What does the editor send for the four long-form types: Markdown or HTML? | Frontend | HTML silently bypasses the pipeline (§6) |

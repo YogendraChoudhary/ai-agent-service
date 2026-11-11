@@ -210,7 +210,7 @@ class TestImageEndpoint(Base):
 
     def _post(self, payload):
         with patch("src.s3_service.upload_image_from_bytes_detailed", return_value={"cdn_url": "https://cdn.test/a.jpg"}):
-            return self.client.post("/agent/email/image", json=payload)
+            return self.client.post("/agent/email/image", json={"api_key": "lic-test", **payload})
 
     def test_data_url_prefix_is_accepted(self):
         r = self._post({"slot": "hero", "image_base64": "data:image/png;base64," + self._png()})
@@ -261,7 +261,7 @@ class TestImageEndpoint(Base):
     def test_storage_quota_is_413(self):
         from src.s3_service import StorageQuotaExceededError
         with patch("src.s3_service.upload_image_from_bytes_detailed", side_effect=StorageQuotaExceededError("full")):
-            r = self.client.post("/agent/email/image", json={"slot": "hero", "image_base64": self._png()})
+            r = self.client.post("/agent/email/image", json={"api_key": "lic-test", "slot": "hero", "image_base64": self._png()})
         self.assertStatus(r, 413)
 
 
