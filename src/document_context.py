@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional
 
@@ -9,9 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .document_edit.blocks import fingerprint, utf16_length
 from .longform.markdown_ast import looks_like_html, parse
+from .document_literal import literal_draft_text
 from .document_placement import DraftPlacement, resolve_placement
 
 DocumentAction = Literal["ask", "draft", "edit"]
+# What a request may ask for: "auto" lets the agent pick (src/document_action.py) and is always resolved to one of the above, or to Write.
+DocumentActionRequest = Literal["ask", "draft", "edit", "auto"]
 DocumentScope = Literal["document", "selection", "focused"]
 AnalysisMode = Literal["summary", "contradictions"]
 if TYPE_CHECKING:
@@ -96,6 +100,10 @@ class ContextMetadata(BaseModel):
     placement: Optional["DraftPlacement"] = None
     # The reason when status is not "ready" (also streamed as text for needs_context, as before).
     message: Optional[str] = None
+    # Draft only: "literal" when the task supplied the exact text ("add Acme Inc. below the Contact heading") and it was
+    # returned as written without a model call; "model" when a model writes the draft. null for Ask and whenever no draft is produced
+    # (needs_context, needs_clarification).
+    source: Optional[Literal["model", "literal"]] = None
 
 
 @dataclass(frozen=True)
@@ -150,19 +158,24 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
     else:
         focus_start = focus_end = source_index(text, context.cursor_utf16) if context.cursor_utf16 is not None else len(text)
     metadata = ContextMetadata(action=action, response_kind="draft" if action == "draft" else "chat_answer",
-        status="ready", source_sha256=fingerprint(text), coverage="full", strategy="full", source_chars=len(text))
+        status="ready", source_sha256=fingerprint(text), coverage="full", strategy="full", source_chars=len(text),
+        source="model" if action == "draft" else None)
     if action == "draft":
         cursor = focus_start if (context.cursor_utf16 is not None or (selection and selection.start_utf16 != selection.end_utf16)) else None
         placement, question = resolve_placement(text, query, cursor)
         if question is not None:
             # A named place that cannot be found: no model call, nothing to insert.
             return PreparedContext("", metadata.model_copy(update={"status": "needs_clarification", "coverage": "none",
-                                                                     "strategy": "none", "message": question}), question)
+                                                                     "strategy": "none", "message": question, "source": None}), question)
         if placement is not None:
             # The draft is written for the anchor, not the cursor: the context is centred there.
             anchor = source_index(text, placement.end_utf16 if placement.position == "after" else placement.start_utf16)
             focus_start = focus_end = anchor
             metadata = metadata.model_copy(update={"placement": placement})
+        literal = literal_draft_text(query, re.findall(r"^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", text, re.M))
+        if literal is not None:
+            # The task gave the exact words: insert them as written. No model call, no document context, nothing to bill.
+            return PreparedContext("", metadata.model_copy(update={"coverage": "none", "strategy": "none", "source": "literal"}), literal)
 
     def envelope(start, end, *, outline=(), coverage="full"):
         cuts = sorted({start, end, max(start, min(end, focus_start)), max(start, min(end, focus_end))})
@@ -180,7 +193,7 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
 
     def unavailable(message):
         return PreparedContext("", metadata.model_copy(update={"status": "needs_context", "coverage": "none", "strategy": "none",
-                                                                 "placement": None, "message": message}), message)
+                                                                 "placement": None, "message": message, "source": None}), message)
 
     if action == "ask" and not text.strip():
         return unavailable("There is no document content to answer questions about. Add some text first.")

@@ -34,9 +34,17 @@ this field explicitly enables document editing and takes priority over image, co
 
 ## What the backend does
 
-1. Parse exact source ranges and headings using the existing Markdown parser. Headings, whitespace, tables,
-   quotes, images, code, raw HTML and reference definitions are protected. Paragraph/list blocks up to 12,000
-   characters can be targeted. Oversize paragraphs stay protected rather than being truncated.
+1. Parse exact source ranges and headings using the existing Markdown parser. Whitespace, tables, images, code, raw HTML
+   and reference definitions are protected. Paragraph/list blocks up to 12,000 characters can be targeted. Oversize
+   paragraphs stay protected rather than being truncated. **Headings, titles and plain-text quotes can be targeted too, but
+   only when the instruction is about them** ("make the title shorter", "rename the Contact heading to Get in touch",
+   "shorten the quote"): "the title" is the document's top-level heading; "all the headings" offers every heading; words
+   inside a clause that says what to leave alone ("leave/keep/preserve/skip/ignore …", "do not/never/avoid …", "without/except …") do not count. The clause runs to the next "but/then", to an "and" or
+   comma that starts a new instruction, or to the end of the sentence: "leave the title and the quote alone" protects both, "keep the quote but shorten the title" offers the title,
+   and a title that is kept by name is not offered even when "the headings" are asked for. A general request ("make the intro
+   shorter") never offers the heading above it. A heading stays one heading line at the same level and cannot be emptied (a changed level or an empty heading is
+   refused). A quote is rewritten as its own text and gets its `>` markers back line for line, so its line count cannot
+   change; quotes with nesting, code, tables or images inside stay protected.
 2. Send the full block catalog and request to the model, which selects at most 12 target blocks and explains why.
    Its supporting request quotes must be literal excerpts of the user's instruction. IDs must exist and be editable.
 3. Enforce literal named-heading scope and explicit exclusions independently of the model. Repeated section headings
@@ -101,7 +109,8 @@ The example offsets and fingerprints are illustrative; use the real values retur
 | `needs_clarification` | The intended target/action could not be identified safely | Display `message`; request a more specific prompt |
 | `needs_clarification` (new facts) | The request wants details, examples, facts, statistics or sources the text does not contain ("add more detail to the Benefits paragraph", "include two examples", "elaborate on pricing"). Edit may not invent facts, so no model call is made | `message` is `Edit only rewrites what is already there and can't add new details, examples or facts. Use Draft to add them.` Offer Draft. Style requests ("add more warmth", "make it longer") are still rewrites |
 | `needs_clarification` (restructure) | The request deletes, moves, merges or splits whole sections, paragraphs, tables or lists ("delete the Conclusion section", "move the table below the intro"). No model call | `message` is `Edit only rewrites existing text; it can't delete, move, merge or split sections, paragraphs or tables. Make that change directly in the document.` |
-| `needs_clarification` (insert) | The request asks to add or insert new content ("add X below the heading", "insert a table after …", "add a new section"). Edit only rewrites existing blocks, so no model call is made. In-line changes such as "add a comma after 'However'" or "add bold to the key phrase" are rewrites and still go to the planner | `message` is exactly `Edit only rewrites existing text; use Draft to add new content.` Offer to switch to Draft |
+| `proposed` (small addition) | The request adds a short item **inside an existing line**: a bracketed or quoted literal, a figure, or a named kind of detail, placed next to, before or after a word or phrase ("add (2024) next to the title", "add a phone number after the address", "add Inc. after Acme"). It goes through the planner and the block writer like any rewrite; the patch replaces that one block (a heading, paragraph, list or quote). The writer inserts exactly the text the user wrote, on the same line, and nothing else; this is checked in code: every other word of the block must still be there in order (punctuation may move) and at most 12 words may be added, or the writer is sent back once and then the proposal is `failed`. A request that also rewrites ("make the text shorter and add (2024) next to the title") is not held to that: its writers may change words, may use the numbers the user typed, and are told which part is the in-line addition. If the user names a kind of detail without a value, the patch contains a bracketed placeholder such as `[Phone number]` (never an invented value) | Review and accept as usual. Highlight placeholders so the user fills them |
+| `needs_clarification` (insert) | The request asks to add or insert new content ("add X below the heading", "insert a table after …", "add a new section"). Edit only rewrites existing blocks, so no model call is made. In-line changes such as "add a comma after 'However'" or "add bold to the key phrase" and the small additions above are rewrites and still go to the planner. Anything placed *below/under/above* a block, or after a section, table, list, paragraph or image, is new content ("add a phone number below the address", "add (2024) after the table") | `message` is exactly `Edit only rewrites existing text; use Draft to add new content.` Offer to switch to Draft |
 | `no_change` | Nothing was rewritten: the text already fits, or the request needs material Edit may not invent (for example "expand the conclusion" when there is nothing more to say without new facts) | Keep the document unchanged; show `message` ("No changes were proposed: … Use Draft to add new content.") |
 | `failed` | A provider/validation failure prevented a safe proposal | Keep the document unchanged; show retry |
 
@@ -135,6 +144,15 @@ patches' `after`), not the whole snapshot the stream carries. `no_change`, `need
 nothing. Upfront reservation also estimates
 one document of output; insufficient balance or an excessive per-request credit reservation returns HTTP 402
 before model work. `REQUEST_CREDIT_LIMIT` asks for a smaller document. BYOK restrictions remain unchanged.
+
+## Numbers in small additions
+
+Edit never changes or removes a number, and it never adds one the user did not type. For a small addition the numbers in the
+instruction are allowed to appear once each ("add (2024) next to the title" may add `2024`); an invented number
+(`555-0100` after "add a phone number") or a different year fails the check, gets one repair attempt, and then returns `failed`.
+`/agent/documents/apply` has no instruction to compare with, so it accepts new numbers only in a **pure short insertion**: the
+original block with up to 80 characters put in and nothing removed or reworded. A patch that rewrites text still must keep every
+number, as before.
 
 ## Applying accepted edits
 

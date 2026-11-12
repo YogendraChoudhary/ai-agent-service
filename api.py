@@ -36,7 +36,7 @@ from src.charts.router import router as chart_router
 from src.charts.schema import GraphSuggestion
 from src.document_edit.router import router as document_router
 from src.document_edit.schema import DocumentEditResult
-from src.document_context import AnalysisMode, DocumentAction, DocumentScope, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context, source_index
+from src.document_context import AnalysisMode, DocumentAction, DocumentActionRequest, DocumentScope, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context, source_index
 from src.document_analysis import AnalysisResult
 from src.document_intent import IntentSuggestion, suggest_document_intent
 from src.key_points import HighlightResult, KeyPointValidationError, MAX_TEXT_CHARS
@@ -350,11 +350,11 @@ def check_document_fields(request) -> None:
         if request.type != 'general':
             raise ValueError('document_context is only valid with type general')
         action, scope = request.document_action or 'ask', request.document_scope or 'document'
-        if scope != 'document' and action != 'ask':
+        if scope != 'document' and action not in ('ask', 'auto'):      # auto resolves such a request to Ask
             raise ValueError('Scoped retrieval is only available for Ask')
         if scope == 'selection' and (request.document_context.selection is None or request.document_context.selection.start_utf16 == request.document_context.selection.end_utf16):
             raise ValueError('Selection scope requires a nonempty selection')
-        if request.document_analysis is not None and (action != 'ask' or scope != 'document'):
+        if request.document_analysis is not None and (action not in ('ask', 'auto') or scope != 'document'):
             raise ValueError('Analysis requires Ask with document scope')
         limit = 2000 if request.document_action == 'edit' else 8000
         if not request.query.strip() or len(request.query) > limit or request.secondary_prompt:
@@ -431,6 +431,49 @@ async def document_request_inputs(request):
     return None, prepared
 
 
+def auto_action_by_rules(request):
+    """document_action "auto" decided by the request and its wording alone (no model, no key), or None when that is not enough."""
+    from src.document_action import decide_by_rules
+    if not settings.document_context_enabled:
+        # Same answer an explicit action gets, and before any classifier call is spent on a request that cannot run.
+        raise HTTPException(status_code=503, detail={'error': 'Document context is disabled', 'code': 'DOCUMENT_CONTEXT_DISABLED'})
+    return decide_by_rules(request.query, request.document_context.text, scope=request.document_scope or 'document',
+                           analysis=request.document_analysis)
+
+
+def classify_auto_action(request, *, provider, api_key, is_byok, platform_key, request_id):
+    """The light-tier decision for an "auto" request the rules could not settle. Blocking: run it off the event loop."""
+    from src.document_action import decide_with_model
+    from src.intent_classifier import classify_label
+    selection = request.document_context.selection
+    has_selection = bool(selection and selection.start_utf16 != selection.end_utf16)
+
+    def classify(text, system, labels):
+        return classify_label(text, provider, api_key, system=system, labels=labels, is_byok=is_byok, platform_key=platform_key,
+                              timeout=settings.document_action_classifier_timeout_seconds, request_id=request_id)
+    return decide_with_model(request.query, request.document_context.text, has_selection=has_selection, classify=classify)
+
+
+def request_for_action(request, decision):
+    """
+    The request the pipeline runs once "auto" has been decided. Ask, Draft and Edit keep the document and gain the chosen action; Write
+    is the plain prompt, so the document is not sent to it. An Edit gets the checks an explicit Edit gets at validation time.
+    """
+    if decision.action == 'write':
+        return request.model_copy(update={'document_action': None, 'document_context': None, 'document_scope': None,
+                                          'document_analysis': None, 'suggest_document_intent': False})
+    if decision.action == 'edit':
+        if len(request.query) > 2000:
+            raise HTTPException(status_code=400, detail='With document_context, query must contain 1–2000 characters for Edit; omit secondary_prompt')
+        from src.document_edit.blocks import document_blocks
+        try:
+            document_blocks(request.document_context.text)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+    # The decision event replaces the advisory suggestion: there is nothing left to suggest.
+    return request.model_copy(update={'document_action': decision.action, 'suggest_document_intent': False})
+
+
 class ProcessRequest(BaseModel):
     type: str = Field(..., min_length=1)
     query: str = Field(..., max_length=100_000)
@@ -446,7 +489,7 @@ class ProcessRequest(BaseModel):
     suggest_graphs: bool = True       # Enhance only; also requires CHART_SUGGESTIONS_ENABLED
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
     document_context: Optional[DocumentContext] = None
-    document_action: Optional[DocumentAction] = None
+    document_action: Optional[DocumentActionRequest] = None
     document_scope: Optional[DocumentScope] = None
     document_analysis: Optional[AnalysisMode] = None
     suggest_document_intent: bool = Field(False, strict=True)
@@ -518,7 +561,7 @@ class StreamRequest(BaseModel):
     suggest_graphs: bool = True
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
     document_context: Optional[DocumentContext] = None
-    document_action: Optional[DocumentAction] = None
+    document_action: Optional[DocumentActionRequest] = None
     document_scope: Optional[DocumentScope] = None
     document_analysis: Optional[AnalysisMode] = None
     suggest_document_intent: bool = Field(False, strict=True)
@@ -1023,8 +1066,18 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
     logger.info(f"[{request_id}] ========== NEW REQUEST ==========")
 
     try:
+        had_document_context = request_data.document_context is not None      # auto -> Write drops the document, not the fact that this was one
+        action_resolution = None
+        if request_data.document_action == 'auto':
+            # The backend's provider key serves the classifier as it would a BYOK key: the document task stays with that provider.
+            decision = auto_action_by_rules(request_data) or await run_in_threadpool(
+                classify_auto_action, request_data, provider=request_data.model, api_key=request_data.api_key, is_byok=True,
+                platform_key=None, request_id=request_id)
+            action_resolution = decision.event()
+            trace_set(request_id, document_action=decision.action, document_action_source=decision.source)
+            request_data = request_for_action(request_data, decision)
         chart_request = chart_request_for(request_data)
-        needs_document = write_needs_document_for(request_data)
+        needs_document = None if action_resolution and request_data.document_context is None else write_needs_document_for(request_data)
         document_text, prepared_context = await document_request_inputs(request_data)
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
@@ -1032,7 +1085,7 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
             request_data.query[:100] + '...' if len(request_data.query) > 100
             else request_data.query
         )
-        logger.info(f"[{request_id}] Query preview: " + ('[document task]' if request_data.document_context is not None else query_preview))
+        logger.info(f"[{request_id}] Query preview: " + ('[document task]' if had_document_context else query_preview))
 
         agent_type = request_data.type
         model_provider = request_data.model
@@ -1089,6 +1142,7 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
             prepared_context=prepared_context,
             match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
             document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
+            action_resolution=action_resolution,
             chart_request=chart_request,
             needs_document=needs_document,
         )
@@ -1151,6 +1205,7 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
                 'document_context': meta.get('document_context_ready'),
                 'document_analysis': meta.get('document_analysis_ready'),
                 'document_intent': meta.get('document_intent_suggested'),
+                'document_action_resolved': meta.get('document_action_resolved'),
                 'highlighting': meta.get('highlight_ready'),
                 'needs_context': meta.get('needs_context'),
             },
@@ -1168,7 +1223,7 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
         finish_trace(request_id, 'rejected', error=str(exc.detail), http_status=exc.status_code)
         raise  # let FastAPI's exception handler format the response
     except Exception as e:
-        error = CONTEXT_ERROR if request_data.document_context is not None else str(e)
+        error = CONTEXT_ERROR if had_document_context else str(e)
         finish_trace(request_id, 'error', error=error, http_status=500)
         total_duration = time.time() - start_time
         logger.error(f"[{request_id}] FAILED — {error} ({total_duration:.2f}s)")
@@ -1203,17 +1258,31 @@ async def stream_text(
     logger.info(f"[{request_id}] ========== NEW STREAM REQUEST ==========")
 
     try:
-        chart_request = chart_request_for(request_data)
-        needs_document = write_needs_document_for(request_data)
-        document_text, prepared_context = await document_request_inputs(request_data)
-        context_no_model = (prepared_context is not None and prepared_context.message is not None) or needs_document is not None
+        had_document_context = request_data.document_context is not None
+        action_resolution, defer_action = None, False
+        if request_data.document_action == 'auto':
+            decision = auto_action_by_rules(request_data)
+            if decision is None:
+                defer_action = True      # unclear wording: the classifier needs the resolved key, so it runs right after the licence check
+            else:
+                action_resolution = decision.event()
+                trace_set(request_id, document_action=decision.action, document_action_source=decision.source)
+                request_data = request_for_action(request_data, decision)
+        if defer_action:
+            chart_request = needs_document = document_text = prepared_context = None
+            context_no_model = False
+        else:
+            chart_request = chart_request_for(request_data)
+            needs_document = None if action_resolution and request_data.document_context is None else write_needs_document_for(request_data)
+            document_text, prepared_context = await document_request_inputs(request_data)
+            context_no_model = (prepared_context is not None and prepared_context.message is not None) or needs_document is not None
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
         query_preview = (
             request_data.query[:100] + '...' if len(request_data.query) > 100
             else request_data.query
         )
-        logger.info(f"[{request_id}] Query preview: " + ('[document task]' if request_data.document_context is not None else query_preview))
+        logger.info(f"[{request_id}] Query preview: " + ('[document task]' if had_document_context else query_preview))
 
         agent_type = request_data.type
         model_provider = request_data.model
@@ -1234,10 +1303,22 @@ async def stream_text(
 
         user_id = license_meta['user_id']
         is_byok = license_meta['requires_user_api_keys']
+        text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
+        if defer_action:
+            # Same key rules as the code classifier: a BYOK request stays on its own key, anything else uses the platform's Claude key.
+            decision = await run_in_threadpool(
+                classify_auto_action, request_data, provider=model_provider, api_key=api_key, is_byok=text_byok,
+                platform_key=DEFAULT_API_KEYS.get('anthropic_api_key') if not text_byok else None, request_id=request_id)
+            action_resolution = decision.event()
+            trace_set(request_id, document_action=decision.action, document_action_source=decision.source)
+            request_data = request_for_action(request_data, decision)
+            chart_request = chart_request_for(request_data)
+            needs_document = None if request_data.document_context is None else write_needs_document_for(request_data)
+            document_text, prepared_context = await document_request_inputs(request_data)
+            context_no_model = (prepared_context is not None and prepared_context.message is not None) or needs_document is not None
         if not context_no_model and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is None:
             raise HTTPException(status_code=503, detail='Credit service unavailable')
         key_resolver = None
-        text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
         if not context_no_model and (settings.task_routing_enabled or settings.provider_fallback_enabled):
             from src.task_router import KeyResolver
             key_resolver = KeyResolver(license_meta['user_keys'], None if text_byok else DEFAULT_API_KEYS,
@@ -1388,6 +1469,7 @@ async def stream_text(
                     prepared_context=prepared_context,
                     match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
                     document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
+                    action_resolution=action_resolution,
                     chart_request=chart_request,
                     needs_document=needs_document,
                 )):
@@ -1553,7 +1635,7 @@ async def stream_text(
 
             except Exception as e:
                 had_error = True
-                trace_status, trace_error = 'error', CONTEXT_ERROR if request_data.document_context is not None else str(e)
+                trace_status, trace_error = 'error', CONTEXT_ERROR if had_document_context else str(e)
                 error_code = type(e).__name__
                 logger.error(f"[{request_id}] STREAM FAILED — {trace_error}")
                 yield f"data: {json.dumps({'type': 'error', 'error': trace_error})}\n\n"

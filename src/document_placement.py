@@ -21,7 +21,7 @@ class DraftPlacement(BaseModel):
     end_utf16: int = Field(ge=0)
 
 
-_AFTER = r"below|under|beneath|underneath|after|following"
+_AFTER = r"below|under|beneath|underneath|after|following|next\s+to|beside|alongside|adjacent\s+to"
 _BEFORE = r"above|before|ahead\s+of|preceding"
 _DOCUMENT = r"(?:document|doc|page|article|text|file|post|draft|note|piece)"
 _STRUCTURE = r"(?:heading|title|section|chapter)"
@@ -54,7 +54,7 @@ def _kind_name(word: str) -> str:
 class _Document:
     def __init__(self, text: str, focus: Optional[int]):
         self.text = text
-        self.blocks = [b for b in document_blocks(text) if b.kind != "blank" and b.text.strip()]
+        self.blocks = [b for b in document_blocks(text) if b.kind != "blank" and b.text.strip("\ufeff \t\r\n")]
         self.focus = focus
 
     def placement(self, block: DocumentBlock, position: str) -> DraftPlacement:
@@ -100,14 +100,56 @@ class _Document:
         return before[-1]
 
 
+def _level(block: DocumentBlock) -> int:
+    atx = re.match(r"\s{0,3}(#{1,6})(?:\s|$)", block.text)
+    if atx:
+        return len(atx.group(1))
+    lines = block.text.split("\n")
+    return 1 if len(lines) > 1 and lines[1].strip().startswith("=") else 2
+
+
+def _unnamed_heading(doc: _Document, noun: str, qualifier: str) -> DocumentBlock:
+    """
+    The heading meant by words that name no heading: "the title" (the document's first top-level heading), "the heading" or
+    "this section" (the heading the cursor is under, or the only heading when there is just one).
+    """
+    headings = [b for b in doc.blocks if b.kind == "heading"]
+    if noun == "title" or qualifier in ("document", "page", "main"):
+        first = next((b for b in headings if _level(b) == 1), None) or (headings[0] if headings and doc.blocks[0] is headings[0] else None)
+        if first is None:
+            raise _Unresolved("The document has no title heading. Name an existing heading, or place the cursor where the draft should go.")
+        return first
+    if doc.focus is not None:
+        block = doc.at_focus()
+        found = next((b for b in reversed(headings) if b.start <= block.start), None)
+        if found is None:
+            raise _Unresolved("The cursor is not under a heading. Name the heading, or place the cursor in its section.")
+        return found
+    if len(headings) == 1:
+        return headings[0]
+    raise _Unresolved(f"The document has {'no' if not headings else 'more than one'} heading. Name the one you mean "
+                      "(for example 'below the Pricing heading'), or place the cursor in its section.")
+
+
 def _target(doc: _Document, target: str, after: bool, word: str = "") -> Optional[DraftPlacement]:
     """Placement for the words after a position word, None when they do not name part of the document."""
     position = "after" if after else "before"
     t = _CLAUSE_END.sub("", target.strip())
     t = re.sub(r"^(?:the|this|that|my|our)\s+", lambda m: m.group(0) if m.group(0).lower().startswith("this") else "", t, flags=re.I)
 
+    # "the heading", "this heading", "the title", "the section": no name given, so the one at the cursor, the only one, or the title.
+    this_heading = re.match(r"(?:this|current)\s+(heading|title)\b", t, re.I)
+    match = re.fullmatch(r"(?:(this|current)\s+)?(?:(document|page|main)\s+)?(heading|title|section|chapter)"
+                         r"(?:\s+(?:please|now|too|again|here|instead|if\s+possible|for\s+me|right\s+away)|\s*\(.*\)|\s*[-–—,].*)?", t, re.I)
+    named_so = match and any(_norm(b.section[-1]) == _norm(match.group(0)) for b in doc.blocks if b.kind == "heading" and b.section)
+    if this_heading or (match and not named_so and not (match.group(1) and match.group(3).lower() in ("section", "chapter"))):
+        noun = (this_heading.group(1) if this_heading else match.group(3)).lower()
+        heading = _unnamed_heading(doc, noun, "" if this_heading else (match.group(2) or "").lower())
+        whole_section = noun in ("section", "chapter")
+        return doc.placement(doc.section_end(heading) if after and whole_section else heading, position)
+
     # "this paragraph", "this section", "it": the block at the cursor.
-    match = re.match(r"this\s+(" + _KIND + r"|section|heading)\b", t, re.I)
+    match = re.match(r"this\s+(" + _KIND + r"|section)\b", t, re.I)
     if match:
         block = doc.at_focus()
         if match.group(1).lower() == "section":
@@ -182,6 +224,21 @@ def _target(doc: _Document, target: str, after: bool, word: str = "") -> Optiona
         if after and word.lower() in ("after", "following"):
             return doc.placement(doc.section_end(heading), "after")
         return doc.placement(heading, position)
+
+    # "the Top 10 list", "the Pricing table": a block of that kind under the heading of that name, or the only one whose text has it.
+    match = re.fullmatch(r"(.+?)\s+(" + _KIND + r")", t, re.I)
+    if (match and _kind_name(match.group(2)) != "block" and not re.fullmatch(r"(?:\w+\s+)?" + _DOCUMENT, match.group(1), re.I)
+            and not re.match(_RELATIVE_WORD + r"\b", match.group(1), re.I)):
+        name, kind = match.group(1), match.group(2)
+        under = doc.headings(name)
+        if len(under) == 1:
+            inside = doc.of_kind(kind, under[0])
+            if len(inside) == 1:
+                return doc.placement(inside[0], position)
+        needle = _norm(name)
+        found = [b for b in doc.of_kind(kind) if needle and needle in _norm(b.text)]
+        if len(found) == 1:
+            return doc.placement(found[0], position)
     return None
 
 
@@ -192,6 +249,33 @@ def _heading_target(doc: _Document, name: str, noun: str, after: bool) -> DraftP
     # "after the X section" goes after the whole section; "below the X heading" goes straight after the heading.
     whole_section = noun.lower() in ("section", "chapter") and len(doc.section_end(heading).text) > 0
     return doc.placement(doc.section_end(heading) if whole_section else heading, "after")
+
+
+# Words that point away from where the cursor is, not at a name: "the next list", "the previous table", "the selected paragraph".
+_RELATIVE_WORD = r"(?:current|previous|prior|next|following|preceding|selected|last|first|above|below|other|same|this|that|each|every|any)"
+_NEW_PLACE_WORD = re.compile(r"next\s+to|beside|alongside|adjacent\s+to", re.I)
+_EDGE = re.compile(r"\b(at|to)\s+the\s+(?:very\s+)?(end|bottom|start|beginning|top)\b"
+                   r"(?:\s+of\s+(?:the\s+|this\s+|my\s+|our\s+)?([^.;!?\n]+))?", re.I)
+# "next to the Top 10 list" is not "to the top": a preposition of closeness is not the one that goes with an edge.
+_NOT_EDGE_BEFORE = re.compile(r"\b(?:next|close|adjacent|compared|relative|according|due|similar|opposite|parallel|related|prior|"
+                              r"thanks|owing|up|back|go|going|refer|reply|respond|attached|connected|linked|tied)$", re.I)
+# A name that merely starts with the edge word ("the Top 10 list", "the Top Benefits table", "the Start Here page") continues with a
+# capital letter or a digit; anything else after the edge word ("at the end summarizing the key points", "at the top, please",
+# "to the end of the Pricing section") is the rest of the sentence. (Case-sensitive on purpose.)
+_NAME_CONTINUES = re.compile(r"^\s+[A-Z0-9]")
+
+
+def _edge(task: str):
+    """The 'at/to the end/start/top/bottom (of …)' part of the task, unless the edge word is only part of a name or follows 'next to'."""
+    for match in _EDGE.finditer(task):
+        following = task[match.end(2):]
+        if (match.group(1).lower() == "to" and _NOT_EDGE_BEFORE.search(task[max(0, match.start() - 48):match.start()].rstrip())
+                and not re.match(r"\s+of\b", following, re.I)):
+            continue
+        if _NAME_CONTINUES.match(following):
+            continue
+        return match
+    return None
 
 
 def resolve_placement(text: str, task: str, focus: Optional[int] = None) -> tuple[Optional[DraftPlacement], Optional[str]]:
@@ -209,15 +293,14 @@ def resolve_placement(text: str, task: str, focus: Optional[int] = None) -> tupl
         return None, None
     try:
         # "at the end of the Risks section", "at the top of the document", "at the end".
-        edge = re.search(r"\b(?:at|to)\s+the\s+(?:very\s+)?(end|bottom|start|beginning|top)\b"
-                         r"(?:\s+of\s+(?:the\s+|this\s+|my\s+|our\s+)?([^.;!?\n]+))?", task, re.I)
+        edge = _edge(task)
         if edge:
-            at_end = edge.group(1).lower() in ("end", "bottom")
-            scope = _CLAUSE_END.sub("", (edge.group(2) or "").strip())
+            at_end = edge.group(2).lower() in ("end", "bottom")
+            scope = _CLAUSE_END.sub("", (edge.group(3) or "").strip())
             scope = re.sub(r"\s+" + _STRUCTURE + r"$", "", scope, flags=re.I)
             if not scope or re.fullmatch(r"(?:\w+\s+)?" + _DOCUMENT, scope, re.I):
                 return (doc.placement(doc.blocks[-1], "after") if at_end else doc.placement(doc.blocks[0], "before")), None
-            if doc.headings(scope) or re.search(_STRUCTURE, edge.group(2) or "", re.I):
+            if doc.headings(scope) or re.search(_STRUCTURE, edge.group(3) or "", re.I):
                 heading = doc.heading(scope)
                 return doc.placement(doc.section_end(heading) if at_end else heading, "after"), None
         # "between Pricing and Conclusion": before the second heading, or after the first section.
@@ -233,10 +316,30 @@ def resolve_placement(text: str, task: str, focus: Optional[int] = None) -> tupl
             if re.search(r"\b(?:sections?|headings?|chapters?)\b", between.group(0), re.I):
                 raise _Unresolved(f"I couldn't find the sections '{first}' and '{second}'. Name existing headings, or "
                                   "place the cursor where the draft should go.")
-        for match in re.finditer(r"\b(?:(" + _AFTER + r")|(" + _BEFORE + r"))\s+([^.;!?\n]{1,160})", task, re.I):
-            placement = _target(doc, match.group(3), after=bool(match.group(1)), word=match.group(1) or match.group(2))
+        # "a paragraph about working alongside engineers below the Pricing heading" has two place words, and the first (here a topic) must
+        # not swallow the real one. After a candidate that is one of the words added with "next to"/"beside" and does not resolve, the
+        # scan goes on INSIDE its target; after an older word it goes on past it, exactly as it always did (so "after the preceding
+        # paragraph" is still read as one place). A question about a first candidate is kept only if no later one resolves.
+        pattern = re.compile(r"\b(?:(" + _AFTER + r")|(" + _BEFORE + r"))\s+([^.;!?\n]{1,160})", re.I)
+        first_question, at = None, 0
+        while True:
+            match = pattern.search(task, at)
+            if match is None:
+                break
+            word = match.group(1) or match.group(2)
+            is_new_word = _NEW_PLACE_WORD.fullmatch(re.sub(r"\s+", " ", word)) is not None
+            at = (match.end(1) if match.group(1) else match.end(2)) if is_new_word else match.end()
+            try:
+                placement = _target(doc, match.group(3), after=bool(match.group(1)), word=word)
+            except _Unresolved as unclear:
+                if not is_new_word:
+                    raise
+                first_question = first_question or unclear
+                continue
             if placement is not None:
                 return placement, None
+        if first_question is not None:
+            raise first_question
     except _Unresolved as unclear:
         return None, str(unclear)
     return None, None

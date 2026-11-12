@@ -25,6 +25,7 @@ Several tests use this document. Create it in a new page (headings as headings, 
 >
 > **Benefits** *(heading)*
 > The benefits are clear and clear for every team that adopts the new workflow.
+> *(a quote under it, formatted as a quote:)* Customers say the new workflow saves them time every week.
 >
 > **Pricing** *(heading)*
 > The price is USD 20 per seat per month in 2026.
@@ -93,6 +94,17 @@ Open the sample document and use Draft mode. Check **where** the new text lands.
 | [ ] | After a numbered paragraph | *Draft a sentence after the second paragraph* | New sentence after "A second intro paragraph about goals and timelines." | ~1.5 s |
 | [ ] | Below the table | *Write a caption below the table* | Caption directly under the table | ~1.5 s |
 | [ ] | No place named | Click in the middle of the document, then: *Write the next paragraph* | New paragraph where your cursor is | ~2 s |
+| [ ] | Exact text only | *Add Acme Inc. below the Pricing heading* | Just **Acme Inc.** appears right under the "Pricing" heading. No sentence about Acme, no extra paragraph | Instant, no credits |
+| [ ] | Exact text, other kinds | *Add 555-0100 below the Pricing heading*, then *Add "Built to last." above the Conclusion heading* | Only the number, then only the quoted words (without the quote marks), each at its place. No "Phone:" in front, no bold | Instant, no credits |
+| [ ] | Exact text with formatting | *Add Acme Inc. in bold below the Pricing heading*, then *Add Acme Inc. as a heading below the Contact heading* | Only "Acme Inc.", in bold, then only "Acme Inc." as a heading, each at its place. Nothing else is written | ~1.5 s |
+| [ ] | Asking for writing still writes | *Add a short note about Acme below the Pricing heading* | A short note is written (not just "Acme") | ~1.5 s |
+| [ ] | Blanks instead of made-up facts | *Add a short bio for Priya Shah below the Introduction heading* | A short bio. The document does not say who she is, so a blank in square brackets such as "[role]" stands where the missing fact would be; no invented job title | ~1.5 s |
+| [ ] | "Next to" and "beside" | *Add a note next to the Pricing heading*, then *Add a line beside the Conclusion heading* | New text right after the "Pricing" heading, then right after the "Conclusion" heading | ~1.5 s each |
+| [ ] | Next to a table | *Add a caption next to the table* | Caption directly under the table | ~1.5 s |
+| [ ] | Heading not named, cursor in the section | Click inside the Benefits paragraph, then: *Add a line below the heading* | New line right under the "Benefits" heading | ~1.5 s |
+| [ ] | Heading not named, no cursor | Without clicking in the document: *Add a line below the heading* | Nothing written. Message: "The document has more than one heading. Name the one you mean (for example 'below the Pricing heading'), or place the cursor in its section." | Instant |
+| [ ] | Below the title | *Add a subtitle below the title* | New line right under "Launch guide", above "Introduction" | ~1.5 s |
+| [ ] | "Top" in a name is not the top | *Add a note next to the Top Benefits table* in a document that has such a table, or any heading with "Top" in its name (for example "Top 10 list") | The note goes next to that table or heading, **not** at the top of the document | ~1.5 s |
 | [ ] | Heading that doesn't exist | *Draft a paragraph below the Risks heading* | Nothing written. Message: "There is no heading named 'Risks'. Name an existing heading, or place the cursor where the draft should go." | Instant |
 | [ ] | Unclear which paragraph | *Add a sentence after the paragraph about the launch* | Nothing written. Message: "More than one paragraph mentions 'launch'. Quote its opening words, or place the cursor there." | Instant |
 | [ ] | "This paragraph" without clicking first | Without clicking in the document: *Add a note below this paragraph* | Nothing written. Message: "Place the cursor in the paragraph you mean, or name its heading." | Instant |
@@ -110,12 +122,40 @@ Open the sample document and use Edit mode. Edit only rewrites what is already t
 | [ ] | Change the tone | *Add more warmth to the Introduction* | A warmer Introduction with the same facts | 7–9 s |
 | [ ] | Small fix | *Remove the repeated words in Benefits* | "clear and clear" is fixed; nothing else changes | ~3 s |
 | [ ] | Accepting the changes | Accept a proposed change | The document updates exactly as shown in the proposal | Instant |
-| [ ] | Asking Edit to add something | *Add a short FAQ below the Pricing heading* (also try *Insert a table comparing the plans*) | Nothing changes. Message: "Edit only rewrites existing text; use Draft to add new content." No credits used | Instant |
+| [ ] | Small addition inside a line | *Add (2024) next to the title* | Proposed change: the title becomes "Launch guide (2024)". Nothing else changes. You can accept or reject | 4–6 s |
+| [ ] | Small addition, no value given | *Add a date after the title* | Proposed change: the title gets a blank in square brackets, such as "Launch guide [Date]". The AI does not make up a date | 4–6 s |
+| [ ] | Small addition keeps numbers honest | *Add (2024) next to the title*, accept it, then check the Pricing paragraph | Only the title has "(2024)". "USD 20", "2026" and "50%" are unchanged | — |
+| [ ] | Edit the title | *Make the title more engaging* | Proposed change to the title only. It is still a heading of the same size | 5–8 s |
+| [ ] | Rename a heading | *Rename the Benefits heading to Why it matters* | Proposed change to that heading only; the text under it is untouched | 4–6 s |
+| [ ] | Edit a quote | *Make the quote shorter* | Proposed change to the quote only; it is still a quote (still has its quote bar) | 4–6 s |
+| [ ] | Headings are left alone otherwise | *Make the Introduction more concise* and *Tighten the paragraphs but leave the headings unchanged* | Headings and the quote never appear among the proposed changes | ~5 s |
+| [ ] | Asking Edit to add something | *Add a short FAQ below the Pricing heading* (also try *Insert a table comparing the plans*, *Add a date below the title* or *Add (2024) after the table*; adding *inside* a line, as above, is fine) | Nothing changes. Message: "Edit only rewrites existing text; use Draft to add new content." No credits used | Instant |
 | [ ] | Asking Edit for new facts | *Add two examples to the Benefits paragraph* (also try *Make the Benefits paragraph more detailed*) | Nothing changes. Message: "Edit only rewrites what is already there and can't add new details, examples or facts. Use Draft to add them." No credits used | Instant |
 | [ ] | Asking Edit to delete or move | *Delete the Conclusion section* (also try *Move the table below the intro*) | Nothing changes. Message: "Edit only rewrites existing text; it can't delete, move, merge or split sections, paragraphs or tables. Make that change directly in the document." No credits used | Instant |
 | [ ] | Writing a brand-new sentence | *Write a closing sentence for the Conclusion* | Nothing changes. The message says to use Draft | ~3 s |
 | [ ] | Numbers are protected | Any Edit request on the Pricing section | "USD 20", "2026" and "50%" never change | — |
 | [ ] | Credits | Compare your balance | A proposed change is charged. A request that changes nothing costs nothing | — |
+
+---
+
+## Part 5b: Letting the AI pick the mode (Auto)
+
+Open the sample document and choose **Auto** instead of Ask, Draft, Edit or Write. The result should show which mode the AI picked
+(your editor may call it a label or badge). The pick should match what you asked for.
+
+| Status | Feature | What to do and type | What you should see | Time |
+|---|---|---|---|---|
+| [ ] | A question | *What does Pricing cost?* | Mode **Ask**. The answer in the chat: USD 20 per seat per month. Nothing in the document changes | 2–4 s |
+| [ ] | New text at a place | *Add a one-sentence summary below the Pricing heading* | Mode **Draft**. New sentence under the "Pricing" heading | ~2 s |
+| [ ] | Changing existing text | *Make the Introduction more concise* | Mode **Edit**. Proposed changes in the Introduction only | ~5 s |
+| [ ] | A small addition | *Add (2024) next to the title* | Mode **Edit**. The title becomes "Launch guide (2024)" | 4–6 s |
+| [ ] | Exact text | *Add Acme Inc. below the Pricing heading* | Mode **Draft**. Only "Acme Inc." under "Pricing" | Instant |
+| [ ] | Something standalone | *Write a Python function that checks if an email address is valid* | Mode **Write**. A code block, as in the Write tab. Nothing is read from your document | 5–12 s |
+| [ ] | Unclear wording | *Write a closing sentence for the Conclusion* | Mode **Draft**. One sentence for the Conclusion. The pick may take about 1 s longer than the rows above | ~3 s |
+| [ ] | A big new section is not squeezed into Edit | *Write a new section about security after the Pricing section* | Mode **Draft** (never Edit). New section after Pricing | ~2–3 s |
+| [ ] | Empty page | On an empty page: *Make it shorter* | Mode **Ask**. Message: "There is no document content to answer questions about. Add some text first." | Instant |
+| [ ] | Manual choice still works | Choose Edit yourself and type *Add a short FAQ below the Pricing heading* | No label from Auto. Same "use Draft" message as in Part 5 | Instant |
+| [ ] | Credits | Compare your balance after an Auto Ask, an Auto Draft and an Auto Edit | Charged exactly as if you had chosen that mode yourself. The step that picks the mode costs nothing | — |
 
 ---
 
@@ -190,6 +230,9 @@ Then use Enhance and type the instruction shown.
 |---|---|
 | In Edit, *Expand the Conclusion a little* sometimes changes nothing | Lengthening without new facts is hit and miss; the "no changes" result costs nothing |
 | A "no changes" message in Edit is worded differently each time | The wording comes from the AI |
+| In Auto, a request the AI cannot decide on (for example when its helper is down) is answered as **Ask**, with a note that it was not sure | Ask never changes the document. Choose Draft or Edit yourself and send it again |
+| In Auto, "Write a job description for a junior designer" may come back as Draft or as Write | Both write new text; either is fine |
+| A small addition without a value gives "[Phone number]" or "[Date]" | The AI never invents a phone number or date. Fill the blank in yourself |
 | Draft ignores the place when written in another language (e.g. Spanish) | Only English place words are understood; the text goes where your cursor is |
 | *Add a section between X and Y* when neither section exists | The text goes where your cursor is instead of asking |
 | A design asked for in the normal chat box comes back as text or a picture | Use the design option to create designs |

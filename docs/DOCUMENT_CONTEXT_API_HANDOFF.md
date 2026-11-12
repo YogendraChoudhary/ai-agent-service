@@ -4,7 +4,7 @@ The Python backend supports document-aware Ask, Draft and explicit Edit on both 
 
 ## Requests and actions
 
-Use `type="general"`. Put the actual user task in `query` and reference material in `document_context.text`. `document_action` is `ask`, `draft` or `edit`; omission defaults to Ask when context is present. `document_action` without context is invalid.
+Use `type="general"`. Put the actual user task in `query` and reference material in `document_context.text`. `document_action` is `ask`, `draft`, `edit` or `auto` (the agent picks the mode and reports it; see [Auto mode](#auto-mode-document_action-auto)); omission defaults to Ask when context is present. `document_action` without context is invalid.
 
 ```json
 {
@@ -154,11 +154,92 @@ UTF-16 offsets. Insert the draft after or before that block. Agreed meanings:
 | "after the second / last paragraph (in X)", "after paragraph 3" | that paragraph |
 | "after the paragraph about refunds", "below the table", "after '<quoted words>'" | the one block that matches |
 | "below this paragraph / section" | the block (or section) at the cursor |
+| "next to / beside / alongside X" (X as in the rows above) | `after` that block |
+| "below/above the heading", "under this heading", "next to the heading" (no name) | the heading the cursor is under; the only heading when the document has one; otherwise a question |
+| "below/above the title", "after the document title" | the document's top-level heading (a document that opens with a heading has that as its title) |
+| "next to the Top 10 list", "below the Pricing table" | the one block of that kind under the heading of that name, or the one whose text has the name |
+
+"Top", "start", "end" and "bottom" mean an edge of the document or section when the sentence goes on after them ("at the end
+summarizing the key points", "at the top, please") but not when they begin a name written with a capital letter or a digit, and not after
+"next to"/"close to" unless "of …" follows. In a name they do not: "next to the Top 10 list" is read as the list, not as the top
+of the document, and "close to the End of Year report" is not the end of anything.
 
 Locations are understood in English only; other languages fall back to the cursor. No named place: `placement` is absent; insert at the cursor as before. A named place that is missing or matches more
 than one block gives `status="needs_clarification"` with the question in `message`, **no `content` frames** and no
 model call or charge (for example "There is no heading named 'Risks'. Name an existing heading, or place the cursor
 where the draft should go."). Metadata now also carries `message` for `needs_context`.
+
+### Draft with exact text
+
+When the task supplies the words to insert, Draft returns exactly those words and nothing else ("add Acme Inc. below the Contact
+heading" inserts `Acme Inc.`, not a paragraph about Acme). Recognised in code, without a model call, when the text is quoted
+(`add "Built to last." below the About heading`) or is a short item with a digit, `@`, brackets or a currency sign, or Title Case words
+(`Acme Cloud`, `555-0100`, `hello@acme.com`, `(2024)`, `Springfield, IL`, `Draft v2`). Such an answer arrives as one `content` frame,
+costs nothing and has `document_context_ready.source = "literal"` (`"model"` when a model writes the draft; `null` for Ask and whenever no
+draft is produced, i.e. `needs_context` and `needs_clarification`; the field is new and additive). The words must be followed by nothing but the
+place ("… below the Contact heading", "… below Pricing" when Pricing is a heading, "… at the end of the document"): "… in bold",
+"… twice", a count of things ("add 3 hashtags", "add 5 Stars", "up to 5 slogans", "top 10 tips"), an instruction before the place ("add 5 stars in bold below …"), two quoted items, or a place that is anything but one anchor noun at the end of the line are not literals. With the verb "write" only a quote, a figure, an address, a bracket or a currency sign counts ("write Haiku below …" asks for a haiku). Such a request goes to the model, which applies asked formatting to the supplied text only ("in bold" -> `**text**`, "as a heading" -> `# text`) and otherwise returns it plain. Anything that
+asks for writing ("add a short bio …", "add a summary …"), names more to do ("… and make it bold") or is not clearly a literal goes to
+the model as before, whose Draft prompt carries the same rule in both directions: text the task *supplies* is the whole answer (no
+description, no prefix such as `Phone:`, no markup, no placeholder), and text it names a kind of ("add a note about Acme Cloud …") or a
+topic for is *written*, never replaced by the bare name, from the document's facts and the task's only: plain wording where that suffices, and a short `[bracketed placeholder]` only for a specific detail it cannot do without (a person's role, a date, a figure).
+
+## Auto mode (`document_action: "auto"`)
+
+Send `document_action: "auto"` (with `document_context`, like any action) and the agent decides whether the task is **Ask**, **Draft**,
+**Edit** or **Write**, runs that mode, and says which one it chose. Everything the chosen mode returns is exactly what an explicit request for
+it returns; the only addition is the report below. Explicit `ask`/`draft`/`edit` and the default (Ask) behave as before and send no report.
+
+**How it decides**, cheapest first:
+
+1. *The request.* A `document_scope` other than `document` or a `document_analysis` can only be served by Ask: `source: "request"`.
+2. *The wording (no model, instant).* The rules read at most 900 characters (a long task is judged on its first and last ~450). They answer only when the wording points one way, never on a mix, and Edit only when an edit verb *begins* an instruction ("Polish bakery traditions", "correct me if I'm wrong, but …" and a story about a robot who "wants to rename itself" are not edits). "Suggest names for …" is generative and goes to step 3: a question or request for advice
+   is Ask; new text ("add … below …", "continue writing", "add a new section") is Draft; a change to existing text ("make … shorter",
+   "fix …", "rename the heading", "add (2024) next to the title") is Edit; a standalone piece (blog post, code, image, chart, design, the
+   things Write itself routes on) that does not point at the document is Write. An empty document cannot be edited, so an Edit-looking task
+   there is answered by Ask's "There is no document content…".
+3. *One light-tier model call* when the rules cannot tell (40-55% of the tasks in our sets): Claude Haiku 5.5, or the request's own provider
+   light model for a BYOK request (`gpt-4o-mini`, the Grok non-reasoning model, Gemini Flash-Lite). Its input is the task (the same 900-character digest) and a one-line hint such as `[document: 120 words; no selection]`; the document itself is not sent. Same key rules as
+   the code-intent classifier: platform users go through the platform's Claude key, BYOK users stay on their own key and provider. It is
+   not charged to the user (traced as usage like the code classifier). A burst waits up to the timeout for one of 16 classifier slots
+   rather than being turned into Ask at once. Timeout `DOCUMENT_ACTION_CLASSIFIER_TIMEOUT_SECONDS` (default 4 s,
+   longer than the code classifier's because a wrong mode costs the user more than a slower right one);
+   `DOCUMENT_ACTION_CLASSIFIER_ENABLED=false` skips it.
+4. *Ask.* If that call fails, times out or answers something else, the task runs as Ask (it only reads, so a wrong guess costs a re-ask,
+   not a change to reject) and the report says `ambiguous: true`, `source: "fallback"`.
+
+**The report.** Stream: a named event, sent before anything the chosen mode sends (right after `start`):
+
+```text
+event: document_action_resolved
+data: {"requested_action":"auto","action":"draft","source":"rules","reason":"new_content","ambiguous":false}
+```
+
+`/agent/process` returns the same object as `document_action_resolved` (`null` for every request that did not send `auto`).
+
+| Field | Values |
+|---|---|
+| `action` | `ask`, `draft`, `edit`, `write`: the mode that ran |
+| `source` | `rules`, `model`, `request` (scope/analysis), `fallback` (no answer; ran as Ask) |
+| `reason` | `question_or_advice`, `new_content`, `existing_prose`, `standalone_task`, `scope_requires_ask`, `empty_document`, `model_choice`, `classifier_unavailable`, `mixed_or_unclear_task` |
+| `ambiguous` | `true` when it fell back to Ask because it could not tell. Suggested UI: show the answer, with a "Use Draft/Edit instead" offer |
+
+After the report the stream is the chosen mode's own: Ask/Draft send `document_context_ready` then content; Edit sends
+`document_edit_ready`, one verified snapshot (buffer it, as for explicit Edit) and `done`; Write sends its usual frames
+(`needs_context` is never produced by Auto). Handle each by `action`, and do not insert anything before the report has arrived.
+
+Notes for the editor:
+
+- **Write** runs the plain prompt: the document is **not** sent to it and `document_context` in the response is `null`. Use this for
+  "write a blog post…", code, images, charts and designs; they come back as they do from the Write tab.
+- **Edit** gets the checks an explicit Edit gets, so an unparseable or over-400-block document is HTTP 400 (`too many blocks…`) and an
+  instruction over 2,000 characters is HTTP 400, before any model work. Auto accepts a `query` of up to 8,000 characters otherwise.
+- `suggest_document_intent` is ignored with `auto`: the report replaces the advisory suggestion (no `document_intent_suggested`).
+- Billing is by the mode that ran. A literal Draft and clarifications cost nothing; the decision call is not billed.
+- Measured (82 sample tasks plus 40 held-out phrasings written after the prompt, `scripts/document_actions/eval_auto.py`): the rules decided
+  45-60% of tasks, with 100% agreement with the intended mode; end to end the right mode was chosen 100% (Claude, Grok), 97.5-100% (Gemini)
+  and 95-99% (OpenAI `gpt-4o-mini`; its misses were Draft-or-Write borderline tasks such as a job description). The model call took a
+  median of 0.8-1.4 s (p95 1.2-2.3 s) on top of the chosen mode; rule-decided tasks add no time.
 
 When `suggest_document_intent=true`, `document_intent_suggested` precedes action events in a stream; process returns `document_intent`. It reports `suggested_action`, `requested_action`, `effective_action`, `advisory=true`, `ambiguous` and a reason code. Suggestions inspect only the task, with limited multilingual cues. Explicit action always wins; omission still executes Ask. Requests to place new content ("add … below/after/above …", "insert … after …", "put … above …", "add a new section/paragraph/table") suggest Draft with reason `new_content`. Mixed/unclear tasks suggest Ask. This heuristic is not a trained multilingual classifier or permission to apply edits.
 

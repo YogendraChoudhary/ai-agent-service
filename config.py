@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # Same dial for the basic tier (claude-sonnet-5-5: quick edits, summaries, long-document passages). Empty = the model's own default.
     claude_basic_effort: str = Field("", alias="CLAUDE_BASIC_EFFORT")
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
+    # document_action "auto": the light-tier call that picks Ask / Draft / Edit / Write when the wording alone does not (src/document_action.py).
+    # Longer than the code classifier's: a wrong mode costs the user more than a slower right one. Off = unclear wording resolves to Ask.
+    document_action_classifier_enabled: bool = Field(True, alias="DOCUMENT_ACTION_CLASSIFIER_ENABLED")
+    document_action_classifier_timeout_seconds: float = Field(4.0, gt=0, alias="DOCUMENT_ACTION_CLASSIFIER_TIMEOUT_SECONDS")
     code_validation_enabled: bool = Field(True, alias="CODE_VALIDATION_ENABLED")
     code_repair_enabled: bool = Field(True, alias="CODE_REPAIR_ENABLED")
     # On: the frontend must handle the content_replace SSE event (a repaired answer replaces the streamed one).

@@ -12,7 +12,7 @@ Scoped Ask (`document_scope`), full-source `document_analysis`, style-aware expl
 `suggest_document_intent` are supported. See the [context handoff](DOCUMENT_CONTEXT_API_HANDOFF.md)
 for request validation, evidence/progress events, analysis budgets and intermediate-stage billing.
 
-The additive `document_context` field supports `document_action="ask"`, `"draft"` or `"edit"` on
+The additive `document_context` field supports `document_action="ask"`, `"draft"`, `"edit"` or `"auto"` (the agent picks Ask / Draft / Edit / Write and reports it in `document_action_resolved`) on
 `type="general"` for both process and stream. It is enabled by default (`DOCUMENT_CONTEXT_ENABLED=true`);
 an explicit `false` disables new-path requests with HTTP 503 and code `DOCUMENT_CONTEXT_DISABLED`. Ask/Draft return context coverage and
 billable input metadata; Edit delegates to the existing patch flow. Existing `document_text` requests are unchanged.

@@ -13,6 +13,9 @@ defines Ask/Draft/Edit, the named `document_context_ready` event, source positio
 path is enabled by default (`DOCUMENT_CONTEXT_ENABLED=true`). Do not send every no-selection question as `document_text`:
 that field remains an instruction to propose existing-prose patches. Follow the new handoff for document questions
 and insertion suggestions; the existing edit review/apply contract remains intact.
+Document actions update, 12 November 2026: **`document_action: "auto"`** (the agent picks Ask / Draft / Edit / Write and reports it in
+a new `document_action_resolved` event), Draft returning exactly the text the user gave, Edit small additions and heading/title/quote
+edits, and "next to" / "beside" / unnamed-heading placement. All additive; wiring notes in [section 2.8](#28-document-actions-auto-mode-and-whats-new).
 Verified: 2026-10-29 against HEAD `df292a7`, by reading the code paths named below.
 Licence and billing are implemented in `src/voice_flow/access.py` and covered by `tests/voice_flow/test_access.py`, including production API wiring.
 **Not exercised for this document:** live provider calls, a real browser microphone, the production deployment.
@@ -250,6 +253,53 @@ data: {"status":"needs_context","suggested_action":"edit","ambiguous":false,"mes
   that carries text on a new line (for example the selection appended after the instruction) is always answered.
   The event comes either from the wording check before any model runs (no `source`, nothing charged) or from the
   output check above (`"source": "model"`, a model ran, the prompt's characters are charged as text).
+
+### 2.8 Document actions: Auto mode and what's new
+
+Everything here is for requests that carry `document_context` (see [the context handoff](DOCUMENT_CONTEXT_API_HANDOFF.md#auto-mode-document_action-auto)
+for the full contract). Nothing existing changes: a request that does not send `document_action: "auto"` gets the same frames as before.
+
+**Auto mode.** Send `document_action: "auto"` instead of guessing the mode from the wording. The agent decides Ask / Draft / Edit /
+Write, runs it, and tells you which. New named event (stream), always the first frame after `start`; `/agent/process` returns the same
+object as `document_action_resolved` (`null` when `auto` was not sent):
+
+```text
+event: document_action_resolved
+data: {"requested_action":"auto","action":"edit","source":"rules","reason":"existing_prose","ambiguous":false}
+```
+
+* `action` is `ask`, `draft`, `edit` or `write`. After this frame the stream is that mode's own, unchanged: `document_context_ready` +
+  `content` for ask/draft, `document_edit_ready` + one verified snapshot + `done` for edit (buffer it, do not insert it), and the plain
+  Write frames for write. **Branch on `action`**, not on which frames arrive.
+* `write` means the task is a standalone piece (blog post, code, image, chart, design, email…). The document was not sent to it and the
+  response has no `document_context`. Treat it as the Write tab does.
+* `source` says how it was decided: `rules` (wording, instant), `model` (one light-tier call, about 1 s extra), `request` (a
+  `document_scope`/`document_analysis` request, which only Ask serves) or `fallback`.
+* `ambiguous: true` (with `source: "fallback"`) means it could not tell and ran the task as **Ask**, which only reads. Show the answer
+  and offer "Use Draft / Edit instead"; do not treat it as a failure.
+* `suggest_document_intent` has no effect with `auto` (the report replaces the suggestion). Explicit actions still return it.
+* Errors are the explicit ones: if auto picks Edit and the document is over 400 blocks, or the task is over 2,000 characters, the response
+  is HTTP 400 before any model work, as for `document_action: "edit"`.
+* A suggested UI: keep your manual Ask / Draft / Edit / Write choice, add "Auto" as the default, and show the chosen mode as a small
+  label on the result ("Edit · auto"). If the user then overrides, resend with their explicit action.
+
+**Draft returns the exact text it was given.** "add Acme Inc. below the Contact heading" now inserts `Acme Inc.` and nothing else. When
+this was recognised without a model, `document_context_ready.source` is `"literal"` (new, additive; `"model"` when a model writes the draft, `null` for Ask and for answers with no draft), the reply is
+one `content` frame, and nothing is charged. No frontend change is required.
+
+**Placement words.** Draft placement now understands "next to", "beside" and "alongside" (the draft goes after that block), an unnamed
+"below the heading" (the heading the cursor is under; send `cursor_utf16` so it can be found; with several headings and no cursor you
+get a `needs_clarification` question), "below the title", and "next to the Top 10 list" (the list, no longer the top of the document).
+"top" means the top of the document only when the task clearly says so.
+
+**Edit does more.** Small additions inside a line ("add (2024) next to the title", "add a phone number after the address") are now
+proposed as ordinary patches instead of "use Draft". A named detail without a value arrives as a bracketed placeholder such as
+`[Phone number]`: highlight placeholders in the review so the user fills them in. Headings, titles and plain-text quotes can be edited
+("make the title shorter", "rename the Contact heading", "shorten the quote"); their patches have the same shape as paragraph patches
+(`before`/`after` are the whole block, a quote including its `>` markers). New blocks ("add a FAQ below Pricing") still return the
+"use Draft" message. `/agent/documents/apply` accepts these patches; nothing to change in how you call it.
+
+---
 
 ## 3. Voice dictation
 
