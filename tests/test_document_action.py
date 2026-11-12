@@ -189,7 +189,8 @@ def test_arithmetic_is_not_new_text(task):
 
 
 def test_the_rules_and_the_classifier_read_a_bounded_digest_with_the_start_and_the_end():
-    from src.document_action import DIGEST_CHARS, digest
+    from src.document_action import digest
+    DIGEST_CHARS = settings.document_action_digest_chars
     assert digest("short") == "short"
     long = "A" * 3000 + " rewrite this " + "B" * 3000
     out = digest(long)
@@ -210,20 +211,20 @@ def test_decide_by_rules_is_bounded_for_a_huge_query():
 def test_a_burst_waits_for_a_free_slot_instead_of_giving_up(monkeypatch):
     import threading
     import src.intent_classifier as module
-    slots = [module._LABEL_SLOTS.acquire(timeout=2) for _ in range(16)]       # (an earlier test's slow call may still hold one)
+    slots = [module._LABEL_SLOTS.acquire(timeout=2) for _ in range(module.LABEL_CONCURRENCY)]       # (an earlier test's slow call may still hold one)
     assert all(slots)
     threading.Timer(0.05, module._LABEL_SLOTS.release).start()
     try:
         assert classify_label("hi", "openai", "k", system="s", labels=LABELS, is_byok=True, timeout=1.0, call=Mock(return_value="edit")) == "edit"
     finally:
-        for _ in range(15):
+        for _ in range(module.LABEL_CONCURRENCY - 1):
             module._LABEL_SLOTS.release()
 
 
 def test_when_no_slot_frees_up_within_the_timeout_there_is_no_answer():
     import time
     import src.intent_classifier as module
-    slots = [module._LABEL_SLOTS.acquire(timeout=2) for _ in range(16)]
+    slots = [module._LABEL_SLOTS.acquire(timeout=2) for _ in range(module.LABEL_CONCURRENCY)]
     assert all(slots)
     try:
         started = time.perf_counter()

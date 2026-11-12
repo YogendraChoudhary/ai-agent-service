@@ -9,8 +9,9 @@ from .models import AUTOCOMPLETE_MODEL_IDS, claude_accepts_temperature, claude_l
 _POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='code_intent')
 _SLOTS = threading.BoundedSemaphore(4)
 # classify_label (document_action "auto") has its own workers: a burst of those must not starve the code classifier, nor the reverse.
-_LABEL_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix='label_intent')
-_LABEL_SLOTS = threading.BoundedSemaphore(16)
+LABEL_CONCURRENCY = settings.document_action_classifier_concurrency
+_LABEL_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=LABEL_CONCURRENCY, thread_name_prefix='label_intent')
+_LABEL_SLOTS = threading.BoundedSemaphore(LABEL_CONCURRENCY)
 _SYSTEM = 'Classify the request. Reply code for requests to produce or edit code; otherwise other. One word only.'
 
 

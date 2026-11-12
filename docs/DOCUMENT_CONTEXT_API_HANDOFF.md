@@ -204,7 +204,7 @@ it returns; the only addition is the report below. Explicit `ask`/`draft`/`edit`
    not charged to the user (traced as usage like the code classifier). A burst waits up to the timeout for one of 16 classifier slots
    rather than being turned into Ask at once. Timeout `DOCUMENT_ACTION_CLASSIFIER_TIMEOUT_SECONDS` (default 4 s,
    longer than the code classifier's because a wrong mode costs the user more than a slower right one);
-   `DOCUMENT_ACTION_CLASSIFIER_ENABLED=false` skips it.
+   `DOCUMENT_ACTION_CLASSIFIER_ENABLED=false` skips it (see [Configuration](#configuration-document-actions)).
 4. *Ask.* If that call fails, times out or answers something else, the task runs as Ask (it only reads, so a wrong guess costs a re-ask,
    not a change to reject) and the report says `ambiguous: true`, `source: "fallback"`.
 
@@ -240,6 +240,25 @@ Notes for the editor:
   45-60% of tasks, with 100% agreement with the intended mode; end to end the right mode was chosen 100% (Claude, Grok), 97.5-100% (Gemini)
   and 95-99% (OpenAI `gpt-4o-mini`; its misses were Draft-or-Write borderline tasks such as a job description). The model call took a
   median of 0.8-1.4 s (p95 1.2-2.3 s) on top of the chosen mode; rule-decided tasks add no time.
+
+### Configuration (document actions)
+
+Every number the Auto, exact-text Draft and in-line Edit features added lives in one block of `config.py` and can be overridden by an
+environment variable (listed, commented out, in `.env.example`). Leave a variable unset for the default; a blank value, or a value outside
+the range, stops the service at start-up with a clear error.
+
+| Variable | Default | Range | What it does |
+|---|---|---|---|
+| `DOCUMENT_ACTION_CLASSIFIER_ENABLED` | `true` | true/false | `false`: wording the rules cannot settle resolves to Ask, with no model call |
+| `DOCUMENT_ACTION_CLASSIFIER_TIMEOUT_SECONDS` | `4.0` | 0-30 | longest wait for the Auto decision call (and for a free slot) |
+| `DOCUMENT_ACTION_CLASSIFIER_CONCURRENCY` | `16` | 1-64 | decisions that can wait on the provider at once; read at start-up |
+| `DOCUMENT_ACTION_DIGEST_CHARS` | `900` | 200-940 | how much of a task Auto reads (first and last half); also bounds the work done before the licence check |
+| `DOCUMENT_LITERAL_MAX_REQUEST_CHARS` | `400` | 50-2000 | a Draft request longer than this is never treated as exact text |
+| `DOCUMENT_EDIT_SMALL_INSERTION_CHARS` | `80` | 1-500 | `/agent/documents/apply` accepts new numbers only in a pure insertion up to this long |
+| `DOCUMENT_EDIT_SMALL_ADDITION_MAX_WORDS` | `12` | 1-100 | most words an in-line Edit addition may add to a block |
+
+Not configurable on purpose: the 2,000-character Edit instruction limit (the existing Edit contract) and Gemini's 10-second minimum request
+deadline (a provider fact).
 
 When `suggest_document_intent=true`, `document_intent_suggested` precedes action events in a stream; process returns `document_intent`. It reports `suggested_action`, `requested_action`, `effective_action`, `advisory=true`, `ambiguous` and a reason code. Suggestions inspect only the task, with limited multilingual cues. Explicit action always wins; omission still executes Ask. Requests to place new content ("add … below/after/above …", "insert … after …", "put … above …", "add a new section/paragraph/table") suggest Draft with reason `new_content`. Mixed/unclear tasks suggest Ask. This heuristic is not a trained multilingual classifier or permission to apply edits.
 

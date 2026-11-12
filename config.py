@@ -59,10 +59,6 @@ class Settings(BaseSettings):
     # Same dial for the basic tier (claude-sonnet-5-5: quick edits, summaries, long-document passages). Empty = the model's own default.
     claude_basic_effort: str = Field("", alias="CLAUDE_BASIC_EFFORT")
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
-    # document_action "auto": the light-tier call that picks Ask / Draft / Edit / Write when the wording alone does not (src/document_action.py).
-    # Longer than the code classifier's: a wrong mode costs the user more than a slower right one. Off = unclear wording resolves to Ask.
-    document_action_classifier_enabled: bool = Field(True, alias="DOCUMENT_ACTION_CLASSIFIER_ENABLED")
-    document_action_classifier_timeout_seconds: float = Field(4.0, gt=0, alias="DOCUMENT_ACTION_CLASSIFIER_TIMEOUT_SECONDS")
     code_validation_enabled: bool = Field(True, alias="CODE_VALIDATION_ENABLED")
     code_repair_enabled: bool = Field(True, alias="CODE_REPAIR_ENABLED")
     # On: the frontend must handle the content_replace SSE event (a repaired answer replaces the streamed one).
@@ -241,6 +237,29 @@ class Settings(BaseSettings):
     image_wait_seconds: int = Field(120, alias="IMAGE_WAIT_SECONDS")                # /agent/process waits this long
     # JSON object of per-image credit overrides in scaled units, e.g. {"openai/gpt-image-1": 80}
     image_credits_by_model: str = Field("", alias="IMAGE_CREDITS_BY_MODEL")
+
+    # ------------------------------------------------------------------
+    # Document actions: document_action "auto", exact-text Draft and in-line Edit additions (src/document_action.py,
+    # src/document_literal.py, src/document_edit/, src/intent_classifier.py). Every number those features added is here; the defaults are
+    # the measured ones (docs/DOCUMENT_CONTEXT_API_HANDOFF.md, "Auto mode"). Blank values are not accepted: leave a variable unset to
+    # keep the default.
+    # ------------------------------------------------------------------
+    # The light-tier call that picks Ask / Draft / Edit / Write when the wording alone does not. Off = unclear wording resolves to Ask.
+    document_action_classifier_enabled: bool = Field(True, alias="DOCUMENT_ACTION_CLASSIFIER_ENABLED")
+    # Longer than the code classifier's: a wrong mode costs the user more than a slower right one.
+    document_action_classifier_timeout_seconds: float = Field(4.0, gt=0, le=30, alias="DOCUMENT_ACTION_CLASSIFIER_TIMEOUT_SECONDS")
+    # Decisions that can be waiting on the provider at once (worker threads and slots; read once at start-up). A burst waits up to the
+    # timeout for a slot before the request falls back to Ask.
+    document_action_classifier_concurrency: int = Field(16, ge=1, le=64, alias="DOCUMENT_ACTION_CLASSIFIER_CONCURRENCY")
+    # How much of a task the Auto rules and the classifier read: its first and last half. Bounds the work done before the licence check.
+    # The classifier call is cut at 1,000 characters including a ~50-character hint, so this may not exceed 940.
+    document_action_digest_chars: int = Field(900, ge=200, le=940, alias="DOCUMENT_ACTION_DIGEST_CHARS")
+    # Draft: a request longer than this is never treated as "exact text" (such a request is one short sentence).
+    document_literal_max_request_chars: int = Field(400, ge=50, le=2000, alias="DOCUMENT_LITERAL_MAX_REQUEST_CHARS")
+    # Edit, applying a stored patch: new numbers are accepted only in a pure insertion of at most this many characters.
+    document_edit_small_insertion_chars: int = Field(80, ge=1, le=500, alias="DOCUMENT_EDIT_SMALL_INSERTION_CHARS")
+    # Edit, an in-line addition ("add (2024) next to the title"): at most this many words may be added to the block.
+    document_edit_small_addition_max_words: int = Field(12, ge=1, le=100, alias="DOCUMENT_EDIT_SMALL_ADDITION_MAX_WORDS")
 
     # ------------------------------------------------------------------
     # AI email templates (src/email_template). The model writes JSON blocks; code validates them.

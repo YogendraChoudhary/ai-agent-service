@@ -1,5 +1,7 @@
-"""The exact text a Draft task supplies ("add Acme Inc. below the Contact heading"): pure wording rules, no model, no imports from the document modules."""
+"""The exact text a Draft task supplies ("add Acme Inc. below the Contact heading"): pure wording rules, no model, no imports from the document modules (only config)."""
 import re
+
+from config import settings
 
 # Exact text for Draft: "add Acme Inc. below the Contact heading" supplies the words to insert, not a topic to write about. A draft
 # that elaborates ("Acme Inc. is a company that…") is wrong there, so a request that is clearly a literal is answered with that
@@ -7,7 +9,7 @@ import re
 # symbol, or Title Case words ("Acme Cloud", "Springfield, IL", "Draft v2"), followed by nothing but the place it goes. Anything
 # else still goes to the model, whose Draft prompt carries the same rule for the cases wording alone cannot settle
 # ("put Hiring now above Careers") and the opposite one (a note ABOUT Acme is written, not replaced by "Acme").
-MAX_LITERAL_REQUEST_CHARS = 400      # a literal request is one short sentence; longer text is never matched (bounds the regex work too)
+# (A request longer than settings.document_literal_max_request_chars is never matched: a literal request is one short sentence, and the limit bounds the regex work.)
 _LITERAL_LEAD = (r"(?:(?:please|kindly|just|simply)\s+|(?:can|could|would|will)\s+you\s+(?:please\s+)?|"
                  r"i\s+(?:want|need|would\s+like)\s+(?:you\s+)?to\s+)*")
 _LITERAL_VERB = r"(?:add|insert|put|place|append|prepend|write|type|enter|include)"
@@ -93,7 +95,7 @@ def literal_draft_text(query: str, heading_names=()):
     to write something, names more to do after the place, or is not clearly a literal. `heading_names` are the document's headings
     (any case): a place that is just a heading's name ("below Pricing") is as good as "below the Pricing heading".
     """
-    if len(query) > MAX_LITERAL_REQUEST_CHARS:
+    if len(query) > settings.document_literal_max_request_chars:
         return None
     match = _LITERAL_REQUEST.match(query)
     if match is None:

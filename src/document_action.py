@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 ResolvedAction = Literal["ask", "draft", "edit", "write"]
 LABELS = ("ask", "draft", "edit", "write")
 EDIT_QUERY_LIMIT = 2000      # Edit takes an instruction of at most this many characters (explicit Edit has the same limit)
-DIGEST_CHARS = 900           # the rules and the classifier read at most this much of a task: bounded work, even before the licence check
 
 # Words that tie a task to the open document even when no pattern in document_intent caught it ("…the pricing section below").
 _DOCUMENT_PART = re.compile(r"\b(?:section|paragraph|heading|chapter|document|doc|selection|cursor|above|below)\b", re.I)
@@ -62,8 +61,9 @@ class ActionDecision:
                 "ambiguous": self.ambiguous}
 
 
-def digest(text: str, limit: int = DIGEST_CHARS) -> str:
+def digest(text: str, limit: int | None = None) -> str:
     """The task itself when short; otherwise its beginning and its end, where the instruction usually is ("write …" / "… , then shorten it")."""
+    limit = limit or settings.document_action_digest_chars
     text = text.strip()
     if len(text) <= limit:
         return text

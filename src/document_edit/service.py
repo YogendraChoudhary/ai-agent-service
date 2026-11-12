@@ -5,6 +5,7 @@ import json
 import re
 from collections import Counter
 
+from config import settings
 from src.longform.chunk import chunk_blocks
 from src.longform.freeze import collides, freeze_blocks, thaw
 from src.longform.llm import CallSpec, LLM
@@ -159,13 +160,10 @@ def _numbers_preserved(original: str, proposed: str, added) -> bool:
     return added is True or not (Counter(after) - Counter(before) - added)
 
 
-SMALL_INSERTION_CHARS = 80
-
-
 def is_small_insertion(before: str, after: str) -> bool:
     """`after` is `before` with one short piece of text put in (nothing removed or reworded): the shape of "add (2024) next to the title"."""
     extra = len(after) - len(before)
-    if not 0 < extra <= SMALL_INSERTION_CHARS:
+    if not 0 < extra <= settings.document_edit_small_insertion_chars:
         return False
     prefix = 0
     while prefix < len(before) and before[prefix] == after[prefix]:
@@ -176,8 +174,9 @@ def is_small_insertion(before: str, after: str) -> bool:
     return prefix + suffix >= len(before)
 
 
-def _words_preserved(before: str, after: str, max_added: int = 12) -> bool:
+def _words_preserved(before: str, after: str, max_added: int | None = None) -> bool:
     """Every word of `before` is still in `after`, in order, and not much was added: the shape of a small in-line addition."""
+    max_added = settings.document_edit_small_addition_max_words if max_added is None else max_added
     old, new = re.findall(r"\w+", before), re.findall(r"\w+", after)
     remaining = iter(new)
     return all(word in remaining for word in old) and len(new) - len(old) <= max_added
