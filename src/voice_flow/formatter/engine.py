@@ -20,7 +20,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple
 
 from config import settings
-from src.models import AUTOCOMPLETE_MODEL_IDS, ensure_allowed_model
+from src.models import AUTOCOMPLETE_MODEL_IDS, claude_accepts_temperature, claude_light_request_params, ensure_allowed_model
 from src.voice_flow.formatter.claims import CLEAN_KINDS, POLISHED_KINDS, missing_claims
 from src.voice_flow.formatter.gate import needs_model
 from src.voice_flow.formatter.patterns import GREETING_DETECT_RE
@@ -162,7 +162,7 @@ class OpenAIBackend:
     name = "openai"
     # Model names are not stable (gpt-4o, gpt-4.1, gpt-5 ...), so a prefix list is only the first guess: a model that rejects
     # `temperature` is learned from the 400 at run time and remembered for the life of the process.
-    _KNOWN_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+    _KNOWN_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
     _no_temperature_models: Set[str] = set()
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None):
@@ -249,8 +249,10 @@ class ClaudeBackend:
         if self._client is None:
             self._client = anthropic.AsyncAnthropic(api_key=self.api_key, max_retries=0)
         try:
+            extra = {"temperature": 0} if claude_accepts_temperature(self.model) else {}     # Haiku 5.5 and newer: 400
+            extra.update(claude_light_request_params(self.model))                            # Haiku 5.x: thinking off, effort low
             response = await self._client.messages.create(
-                model=self.model, system=system, messages=turns, max_tokens=max_output_tokens, temperature=0, timeout=timeout)
+                model=self.model, system=system, messages=turns, max_tokens=max_output_tokens, timeout=timeout, **extra)
         except anthropic.APIStatusError as exc:
             raise LlmError(f"claude {exc.status_code}", permanent=exc.status_code in PERMANENT_CODES) from None
         except anthropic.APIConnectionError:

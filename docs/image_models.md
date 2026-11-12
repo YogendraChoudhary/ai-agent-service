@@ -1,3 +1,5 @@
+> **Update 2026-11-12:** `gpt-image-1` no longer exists on the OpenAI API (`The model 'gpt-image-1' does not exist`). The OpenAI default is now `gpt-image-2.5-flare`, with `gpt-image-2.6-flare` then `gpt-image-1.5` as fallbacks. `input_fidelity` is sent only to `gpt-image-1.5`; `background=transparent` is rejected by `gpt-image-2`. Measurements and probes: `docs/MODEL_UPGRADE_BENCHMARK.md`, sections 4.6 and 14. The text below is kept as the history of the earlier choice.
+
 # Image Models & API Capabilities Specification
 
 *Written from provider docs and mocked-SDK tests. Re-run `scripts/image_smoke_test.py` with live keys to verify; the Grok JSON edit and Gemini `image_size` paths have not been exercised against the live APIs.*

@@ -21,7 +21,14 @@ from .models import (
     VISION_CAPABLE_PROVIDERS,
     supports_vision,
     ensure_allowed_model,
+    claude_accepts_temperature,
+    advanced_model_id,
+    claude_effort_params,
+    claude_light_request_params,
+    openai_effort_params,
+    openai_reasoning_family,
 )
+from .autocomplete_join import apply_join_tag, fix_join, is_commentary
 from .security_guardrails import sanitize_web_content
 from .observability import trace_mark, trace_set
 from .document_context import PreparedContext, OUTPUT_TOKENS
@@ -364,8 +371,8 @@ def _output_limit_kwargs(model_provider: str, model_id: str, max_tokens: Optiona
     limit = output_token_budget(model_id, max_tokens)
     if model_provider == 'gemini':
         return {'max_output_tokens': limit}
-    if model_provider == 'openai' and model_id.startswith('gpt-5'):
-        return {'max_completion_tokens': limit}   # gpt-5 rejects max_tokens
+    if model_provider == 'openai' and openai_reasoning_family(model_id):
+        return {'max_completion_tokens': limit}   # gpt-5.x and gpt-6.x reject max_tokens
     return {'max_tokens': limit}                  # Claude, Grok, DeepSeek and the older OpenAI models
 
 
@@ -393,6 +400,7 @@ def get_model(
     cache_model: bool = True,
     managed_retries: bool = False,
     max_tokens: Optional[int] = None,
+    agent_type: Optional[str] = None,
 ):
     """
     Factory function to get or create the appropriate model instance based on provider.
@@ -416,8 +424,7 @@ def get_model(
     client_params = ({'http_options': {'retry_options': {'attempts': 1}}} if model_provider == 'gemini'
                      else {'max_retries': 0}) if managed_retries else None
 
-    tier = ADVANCED_MODEL_IDS if use_advanced else BASIC_MODEL_IDS
-    model_id = tier.get(model_provider)
+    model_id = advanced_model_id(model_provider, agent_type) if use_advanced else BASIC_MODEL_IDS.get(model_provider)
 
     if model_id is None:
         logger.error(f"{log_prefix}Unsupported model provider: {model_provider}")
@@ -428,9 +435,24 @@ def get_model(
     # Check cache first
     cache_tools = needs_tools if model_provider == 'deepseek' else False
     cache_temperature = round(float(temperature), 2)
-    if (model_provider == 'openai' and model_id.startswith('gpt-5')) or model_id == 'deepseek-reasoner':
-        cache_temperature = 0.0
-    cache_key = (model_provider, api_key, use_advanced, cache_tools, cache_temperature, managed_retries, max_tokens)
+    if ((model_provider == 'openai' and openai_reasoning_family(model_id)) or model_id == 'deepseek-reasoner'
+            or (model_provider == 'claude' and not claude_accepts_temperature(model_id))):
+        cache_temperature = 0.0                       # temperature is not sent to these models: one cached instance serves all values
+    claude_output_config = {}
+    if model_provider == 'claude':
+        from config import settings
+        # the thinking-depth dial of each tier; empty (basic tier default) = the model's own default
+        claude_output_config = claude_effort_params(
+            model_id, settings.claude_advanced_effort if use_advanced else settings.claude_basic_effort)
+    openai_effort = {}
+    if model_provider == 'openai' and model_id.lower().startswith('gpt-6'):
+        from config import settings
+        # gpt-6.x only (gpt-5.2, which the blog and code agents stay on, is sent nothing: its default is already "none").
+        # advanced tier: the configured dial; a basic-tier gpt-6 model (not used today) runs at "none"
+        openai_effort = openai_effort_params(model_id, settings.openai_advanced_effort if use_advanced else 'none', needs_tools)
+    cache_key = (model_provider, api_key, use_advanced, model_id, cache_tools, cache_temperature, managed_retries, max_tokens,
+                 tuple(sorted(claude_output_config.items())), tuple(sorted(openai_effort.items())),
+                 needs_tools if openai_effort else False)
     if cache_model:
         with _MODEL_CACHE_LOCK:
             if cache_key in _MODEL_CACHE:
@@ -459,9 +481,9 @@ def get_model(
     limits = _output_limit_kwargs(model_provider, model_id, max_tokens)
 
     if model_provider == 'openai':
-        if model_id.startswith("gpt-5"):
-            # GPT-5 family models reject custom temperature ("Only the default (1) value is supported")
-            model = OpenAIChat(id=model_id, api_key=api_key, client_params=client_params, **limits)
+        if openai_reasoning_family(model_id):
+            # gpt-5.x / gpt-6.x reject a custom temperature ("Only the default (1) value is supported"); effort comes from settings
+            model = OpenAIChat(id=model_id, api_key=api_key, client_params=client_params, **openai_effort, **limits)
         else:
             model = OpenAIChat(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params,
                                **limits)
@@ -469,7 +491,9 @@ def get_model(
         model = Claude(
             id=model_id,
             api_key=api_key,
-            temperature=temperature,
+            # claude-opus-5, claude-sonnet-5 and every newer model answer 400 to any temperature; agno omits it when None
+            temperature=temperature if claude_accepts_temperature(model_id) else None,
+            output_config=claude_output_config or None,
             cache_system_prompt=True,
             cache_tools=True,
             client_params=client_params,
@@ -1980,6 +2004,7 @@ def create_agent(
         cache_model=not is_byok,
         managed_retries=settings.provider_fallback_enabled,
         max_tokens=max_tokens,
+        agent_type=agent_type,
     )
 
     agent_kwargs = {
@@ -2672,7 +2697,7 @@ def process_user_query_stream(
         import json as _json
         import time as _time
         from src.design_canvas.service import execute_design_canvas_harness
-        from src.models import ADVANCED_MODEL_IDS
+        from src.models import design_model_id
 
         sub_mode = getattr(plan, 'design_sub_mode', None) or 'create_from_prompt'
         logger.info(f"{log_prefix}Mode 8 Design Canvas activated (sub_mode={sub_mode})")
@@ -2681,7 +2706,7 @@ def process_user_query_stream(
 
         # Primary candidate for logging and init event
         _dc_candidate = candidates[0] if candidates else Candidate(model_provider, True)
-        _dc_model = ADVANCED_MODEL_IDS.get(_dc_candidate.provider, _dc_candidate.provider)
+        _dc_model = design_model_id(_dc_candidate.provider, _dc_candidate.provider)
 
         # Emit init event immediately (prevent proxy idle timeouts per Section 2.1/2.2)
         yield {
@@ -2734,10 +2759,12 @@ def process_user_query_stream(
                                 c.provider, key, request_id
                             ),
                         )
-                        self.used = (cand.provider, ADVANCED_MODEL_IDS.get(cand.provider, cand.provider))
+                        self.used = (cand.provider, design_model_id(cand.provider, cand.provider))
+                        record_health_ok(cand.provider, self.used[1], byok=is_byok)
                         return output
                     except Exception as err:
                         logger.warning(f"{log_prefix}Design canvas runner attempt failed on {cand.provider}: {err}")
+                        _design_failure_kind(cand.provider, design_model_id(cand.provider, cand.provider), err, is_byok)
                         last_err = err
                         continue
                 if last_err:
@@ -2836,7 +2863,7 @@ def process_user_query_stream(
                                      max_tokens=max_tokens, instructions=graph_instructions)
                 trace_mark(request_id, 'agent_created')
                 use_tools = candidate_plan.use_tools if candidate_plan else config.get('use_tools', False)
-                model_id = (ADVANCED_MODEL_IDS if tier else BASIC_MODEL_IDS)[provider]
+                model_id = advanced_model_id(provider, agent_type) if tier else BASIC_MODEL_IDS[provider]
                 if provider == 'deepseek' and use_tools:
                     model_id = DEEPSEEK_TOOL_MODEL_ID
                 trace_set(request_id, model_used=f'{provider}/{model_id}')
@@ -2871,8 +2898,10 @@ def process_user_query_stream(
                     yield chunk
                 if not sent and not any(not str(k).startswith('__') for k in pending_images):
                     raise RuntimeError(f'The {provider} model returned an empty response')
+                record_health_ok(provider, model_id, byok=is_byok)
                 break
             except Exception as error:
+                _record_stream_failure(provider, agent_type, tier, error, is_byok)
                 # A tool may already have started a billed image even without a text token.
                 has_images_started = any(not str(k).startswith('__') for k in pending_images)
                 if sent or has_images_started or not settings.provider_fallback_enabled or not can_fall_back(error):
@@ -2890,6 +2919,7 @@ def process_user_query_stream(
                 if index + 1 == len(candidates):
                     raise
                 reason = str(status_code(error) or type(error).__name__)
+                HEALTH.record_fallback(provider, candidates[index + 1].provider, reason)
                 fallbacks.append({'from': provider, 'to': candidates[index + 1].provider, 'error': reason})
                 trace_set(request_id, fallbacks=fallbacks)
                 logger.warning('%sProvider fallback %s -> %s (%s)', log_prefix, provider,
@@ -3100,17 +3130,32 @@ def process_user_query(
 AUTOCOMPLETE_SYSTEM_PROMPT = (
     "You are an inline text autocomplete engine integrated into a text editor. "
     "Given the text the user has typed so far, predict the most likely next words or sentence they will type. "
-    "Your output will be CONCATENATED directly to the end of the user's text with no extra characters in between.\n\n"
+    "Your output will be CONCATENATED directly to the end of the user's text.\n\n"
+    "OUTPUT FORMAT. Put your whole answer inside exactly one tag pair. The tag says how your text joins the user's text:\n"
+    "- <new>...</new>: the user's last word is COMPLETE and your text begins the next word. (The system adds the space.)\n"
+    "- <cont>...</cont>: your text carries straight on from the last character: it FINISHES a word the user is still typing, or begins with "
+    "punctuation that attaches to the last word, or the user's text already ends with a space or newline.\n"
+    "Decide first: is the last word complete? A lowercase fragment that is not an English word is NOT complete. The user types letter by letter, "
+    "so very often the last word is cut off in the middle. A fragment such as 'tomor', 'recomm', 'enj', 'colle', 'eng', 'pr' or 'mob' is UNFINISHED: "
+    "use <cont> and write only the missing letters.\n"
+    "Examples:\n"
+    "Text: 'Thanks for your' -> <new>help with this.</new>\n"
+    "Text: 'See you tomor' -> <cont>row at noon.</cont>\n"
+    "Text: 'We need to recomm' -> <cont>end a change.</cont>\n"
+    "Text: 'the new mob' -> <cont>ile app is out.</cont>\n"
+    "Text: 'please pr' -> <cont>epare the report.</cont>\n"
+    "Text: 'We will make' -> <new>it work.</new>\n"
+    "Text: 'There is a chance' -> <new>of rain tonight.</new>\n"
+    "Text: 'Switch it' -> <new>off when you leave.</new>\n"
+    "Text: 'Thanks so much' -> <cont>! I really appreciate it.</cont>\n"
+    "Text: 'Hi Sam,' -> <new>hope you are well.</new>\n"
+    "Text: 'Dear Sam, ' -> <cont>Thank you for the update.</cont>\n"
+    "Write nothing outside the tags: no explanation.\n\n"
     "Rules:\n"
-    "- Output ONLY the completion text that comes AFTER what the user already typed.\n"
-    "- Do NOT repeat or echo ANY part of the text the user already typed.\n"
-    "- SPACING IS CRITICAL: your output is appended character-by-character to the existing text.\n"
-    "  * If the user's text ends mid-word (e.g. 'mor'), start with the remaining letters to finish that word (e.g. 'ning! How are you?').\n"
-    "  * If the user's text ends with a complete word (e.g. 'and'), you MUST start your output with a space (e.g. ' I hope you are well').\n"
-    "  * If the user's text ends with a space or punctuation, do NOT add an extra leading space.\n"
+    "- Output ONLY the completion text inside the tag. Do NOT repeat or echo ANY part of the text the user already typed.\n"
     "- Keep completions short: 1-2 sentences maximum.\n"
     "- Match the style, tone, and language of the existing text.\n"
-    "- If you cannot predict a meaningful completion, respond with an empty string.\n"
+    "- If you cannot predict a meaningful completion, respond with an empty tag, <cont></cont>.\n"
     "- Do NOT add any labels, prefixes, quotation marks, or markdown formatting.\n"
     "- Do NOT explain or comment on the text. Just output the predicted continuation.\n\n"
     "CONTEXT AFTER THE CURSOR:\n"
@@ -3123,7 +3168,7 @@ AUTOCOMPLETE_SYSTEM_PROMPT = (
 # Model IDs for fast/basic variants (used for autocomplete)
 # Autocomplete model IDs live in models.py; aliased here for the existing
 # call sites. Do not reintroduce a literal map — that is how this path ended up
-# pinned to claude-opus-5 and the withdrawn gemini-2.0-flash-lite.
+# pinned to claude-opus-5 (now claude-opus-5-5) and the withdrawn gemini-2.0-flash-lite.
 FAST_MODEL_IDS = AUTOCOMPLETE_MODEL_IDS
 
 # OpenAI-compatible API base URLs for providers that support it
@@ -3153,9 +3198,13 @@ def _strip_echo(text_before: str, suggestion: str) -> str:
     while j < len(suggestion) and suggestion[j].isspace():
         j += 1
 
-    stripped = suggestion[j:]
-    if stripped.lower().startswith(partial.lower()):
-        return suggestion[:j] + stripped[len(partial):]
+    if j:
+        # The model separated the suggestion from the text with a space: it is a NEW word, and one that merely starts with the same letters
+        # as the last word ("...will be an" + " amazing" must not lose the "am"), so there is no echo to strip.
+        return suggestion
+
+    if suggestion.lower().startswith(partial.lower()):
+        return suggestion[len(partial):]
 
     return suggestion
 
@@ -3177,6 +3226,13 @@ def _postprocess_autocomplete(text_before: str, suggestion: str) -> str:
     if not suggestion:
         return ""
 
+    # 0) The model's own statement of the join: its answer sits in <w> (new word: a space goes before it) or <c> (continues on)
+    suggestion, marked = apply_join_tag(text_before, suggestion)
+    if not marked and is_commentary(suggestion):
+        return ""                                    # an explanation instead of an answer: never shown
+    if not suggestion:
+        return ""
+
     # 1) Trailing whitespace and wrapping quotes
     suggestion = suggestion.rstrip()
     if len(suggestion) >= 2:
@@ -3185,8 +3241,9 @@ def _postprocess_autocomplete(text_before: str, suggestion: str) -> str:
         ):
             suggestion = suggestion[1:-1]
 
-    # 2) Simple echo strip on trailing word fragment
-    suggestion = _strip_echo(text_before, suggestion)
+    # 2) Simple echo strip on trailing word fragment (not when the model tagged its answer)
+    if not marked:
+        suggestion = _strip_echo(text_before, suggestion)
 
     if not text_before or not suggestion:
         return suggestion
@@ -3216,7 +3273,8 @@ def _postprocess_autocomplete(text_before: str, suggestion: str) -> str:
     if last in ("?", "!", ".") and first == last:
         suggestion = suggestion[:i] + suggestion[i + 1:]
 
-    return suggestion
+    # 5) The joins the model may still miss: a space after punctuation, never a double space
+    return fix_join(text_before, suggestion)
 
 
 # Connection pool for autocomplete clients to avoid repeated TLS handshake overhead
@@ -3334,12 +3392,12 @@ def _run_design_json_completion(
     Executes a structured JSON completion across Claude, Gemini, or OpenAI.
     """
     import base64
-    from src.models import ADVANCED_MODEL_IDS
+    from src.models import OPENAI_DESIGN_EFFORT, design_model_id, output_token_budget
     from .s3_service import sniff_image_bytes
 
     log_prefix = f"[{request_id}] " if request_id else ""
     provider = (model_provider or "claude").lower()
-    model_id = ADVANCED_MODEL_IDS.get(provider, "claude-opus-5")
+    model_id = design_model_id(provider, "claude-opus-5-5")
     # The real type of the bytes (_design_reference_image keeps them PNG, JPEG or WebP); a JPEG labelled PNG is rejected.
     media_type = sniff_image_bytes(image_bytes)[0] if image_bytes else None
 
@@ -3372,21 +3430,32 @@ def _run_design_json_completion(
             else:
                 anthropic_messages.append({"role": role, "content": content})
 
+        from config import settings
+        claude_kwargs = {"temperature": temperature} if claude_accepts_temperature(model_id) else {}   # Opus 5 and newer: 400
+        effort = claude_effort_params(model_id, settings.claude_advanced_effort)
+        if effort:
+            claude_kwargs["output_config"] = effort
+        # Opus 5.5 always thinks and thinking counts against max_tokens, so the cap leaves room for it on top of the JSON.
+        claude_cap = output_token_budget(model_id, _DESIGN_MAX_OUTPUT_TOKENS)
         resp = client.messages.create(
             model=model_id,
             system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}] if system_prompt else [],
             messages=anthropic_messages,
-            max_tokens=_DESIGN_MAX_OUTPUT_TOKENS,
-            temperature=temperature,
+            max_tokens=claude_cap,
+            **claude_kwargs,
         )
+        if getattr(resp, "stop_reason", None) == "refusal":
+            details = getattr(resp, "stop_details", None)
+            raise ValueError(f"Claude declined the design request ({getattr(details, 'category', None) or 'no category given'})")
         if getattr(resp, "stop_reason", None) == "max_tokens":
-            logger.warning(f"{log_prefix}Claude design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
-            raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
+            logger.warning(f"{log_prefix}Claude design output truncated at max_tokens ({claude_cap})")
+            raise ValueError(f"Design output truncated by model at max_tokens limit ({claude_cap})")
         usage = getattr(resp, "usage", None)
         _record_design_usage(request_id, model_id, usage and (
             (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
             + (getattr(usage, "cache_creation_input_tokens", 0) or 0)), usage and usage.output_tokens)
-        return resp.content[0].text if resp.content else ""
+        # By block type: Opus 5.5 can put a thinking block (no .text) before the answer
+        return "".join(b.text for b in (resp.content or []) if getattr(b, "type", "text") == "text")
 
     elif provider in ("openai", "grok", "deepseek"):
         base_url = OPENAI_COMPATIBLE_BASES.get(provider)
@@ -3410,9 +3479,12 @@ def _run_design_json_completion(
         kwargs = {
             "model": model_id,
             "messages": openai_messages,
-            "temperature": temperature,
-            **_output_limit_kwargs(provider, model_id, _DESIGN_MAX_OUTPUT_TOKENS),  # gpt-5 rejects max_tokens
+            **_output_limit_kwargs(provider, model_id, _DESIGN_MAX_OUTPUT_TOKENS),  # gpt-5.x / gpt-6.x reject max_tokens
         }
+        if provider == "openai" and openai_reasoning_family(model_id):
+            kwargs.update(openai_effort_params(model_id, OPENAI_DESIGN_EFFORT))      # no temperature: a 400 unless effort is "none"
+        else:
+            kwargs["temperature"] = temperature
         if provider == "openai":
             kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
@@ -3470,12 +3542,41 @@ def _run_design_json_completion(
     raise ValueError(f"Unsupported provider for design canvas: {provider}")
 
 
+from .provider_health import HEALTH, classify_error, record_failure, record_ok as record_health_ok
+
+
+def _record_stream_failure(provider, agent_type, advanced, error, byok):
+    """Count a failed text call for the rollout health view; never raises."""
+    try:
+        model_id = advanced_model_id(provider, agent_type) if advanced else BASIC_MODEL_IDS.get(provider)
+        if isinstance(error, RuntimeError) and 'empty response' in str(error):
+            HEALTH.record(provider, model_id, 'empty', byok=byok, detail=str(error))
+        else:
+            record_failure(provider, model_id, error, byok=byok)
+    except Exception:
+        logger.debug('provider health not recorded', exc_info=True)
+
+
+def _design_failure_kind(provider, model_id, error, byok):
+    try:
+        text = str(error).lower()
+        if 'truncated' in text:
+            HEALTH.record(provider, model_id, 'truncated', byok=byok, detail=str(error))
+        elif 'declined the design request' in text:
+            HEALTH.record(provider, model_id, 'refused', byok=byok, detail=str(error))
+        else:
+            record_failure(provider, model_id, error, byok=byok)
+    except Exception:
+        logger.debug('provider health not recorded', exc_info=True)
+
+
 def get_autocomplete_suggestion(
     text_before: str,
     text_after: str,
     model_provider: str,
     api_key: str,
     request_id: str = None,
+    is_byok: bool = False,
 ) -> str:
     """
     Get an inline autocomplete suggestion using direct API calls (no Phidata).
@@ -3528,6 +3629,8 @@ def get_autocomplete_suggestion(
 
         elif model_provider == 'claude':
             client = _get_cached_anthropic_client(api_key)
+            claude_kwargs = {"temperature": 0.3} if claude_accepts_temperature(model_id) else {}   # Haiku 5.5 and newer: 400
+            claude_kwargs.update(claude_light_request_params(model_id))                            # Haiku 5.x: thinking off, effort low
             response = client.messages.create(
                 model=model_id,
                 system=[
@@ -3541,9 +3644,10 @@ def get_autocomplete_suggestion(
                     {"role": "user", "content": user_prompt},
                 ],
                 max_tokens=100,
-                temperature=0.3,
+                **claude_kwargs,
             )
-            suggestion = response.content[0].text if response.content else ""
+            # By block type: a reply can start with a thinking block, and a refusal has no text at all (-> no suggestion)
+            suggestion = "".join(b.text for b in (response.content or []) if getattr(b, "type", None) == "text")
 
         elif model_provider == 'gemini':
             from google.genai import types
@@ -3563,6 +3667,7 @@ def get_autocomplete_suggestion(
         # Minimal deterministic cleanup (whitespace, simple echo, spacing and
         # punctuation at the join). Kept in one place so behaviour stays clear.
         suggestion = _postprocess_autocomplete(text_before, suggestion)
+        record_health_ok(model_provider, model_id, byok=is_byok)
 
         duration = time.time() - start_time
         logger.info(f"{log_prefix}Autocomplete completed in {duration:.2f}s (suggestion_len={len(suggestion)})")
@@ -3572,4 +3677,5 @@ def get_autocomplete_suggestion(
     except Exception as e:
         duration = time.time() - start_time
         logger.error(f"{log_prefix}Autocomplete failed in {duration:.2f}s: {str(e)}")
+        record_failure(model_provider, model_id, e, byok=is_byok)        # swallowed for the user, counted for the rollout
         return ""

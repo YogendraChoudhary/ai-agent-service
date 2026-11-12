@@ -9,6 +9,7 @@ from html import escape
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.document_edit.blocks import fingerprint
+from src.json_reply import strip_json_fence
 from src.longform.llm import CallSpec, LLM
 
 MAX_TEXT_CHARS = 10_000
@@ -158,7 +159,7 @@ def highlight_key_points(source: str, llm: LLM, *, cancel_event=None) -> Highlig
         if cancel_event is not None and cancel_event.is_set():
             return None
         try:
-            return resolve_summary(source, Selection.model_validate_json(reply))
+            return resolve_summary(source, Selection.model_validate_json(strip_json_fence(reply)))
         except ValueError as error:
             if not attempt:
                 problem = str(error) if type(error) is ValueError else "The response did not match the required JSON schema."

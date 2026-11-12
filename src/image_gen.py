@@ -28,7 +28,9 @@ from src.models import (
     get_image_model_fallbacks,
     gemini_effective_resolution,
     gemini_model_for_resolution,
+    openai_image_supports_input_fidelity,
 )
+from src.provider_health import HEALTH, record_ok as record_health_ok
 from src.s3_service import (
     sniff_image_bytes,
     convert_image_format,
@@ -379,7 +381,7 @@ def _is_optional_param_error(err: Exception) -> bool:
     msg = str(err).lower()
     rejected = any(
         w in msg
-        for w in ("unknown parameter", "unrecognized", "unexpected keyword", "unsupported", "not supported",
+        for w in ("unknown parameter", "unrecognized", "unexpected keyword", "unsupported", "not supported", "does not support",
                   "extra inputs", "invalid value", "invalid_value")
     )
     return rejected and any(n in msg for n in _OPTIONAL_PARAM_NAMES)
@@ -697,16 +699,17 @@ def _call_openai_with_fallback(
 ) -> Tuple[bytes, str, str]:
     """
     Call OpenAI SDK with retry on fallback models.
-    Sends size, quality (low/medium/high), output_format, and background for transparency.
-    If the API rejects one of the optional tuning params, retries once with the bare request.
+    Sends size, quality (low/medium/high), output_format, and background for transparency; edits also send input_fidelity
+    on the one model that takes it. If the API rejects one of the optional tuning params, it is dropped (only the one the
+    error names, so the others keep working) and the request is retried.
+    Models tried in order: the one asked for, the configured default, then the fallbacks (a model that no longer exists moves on).
     Returns (raw_bytes, mime_type, model_used).
     """
     log_prefix = f"[{request_id}] " if request_id else ""
     from openai import OpenAI
 
     primary_model = model_id or get_image_model_id("openai")
-    fallback_models = get_image_model_fallbacks("openai")
-    models_to_try = [primary_model] + [m for m in fallback_models if m != primary_model]
+    models_to_try = list(dict.fromkeys([primary_model, get_image_model_id("openai"), *get_image_model_fallbacks("openai")]))
 
     client = OpenAI(api_key=api_key)
     size = params.to_openai_size()
@@ -717,33 +720,40 @@ def _call_openai_with_fallback(
     if params.transparent_bg:
         extras["background"] = "transparent"
 
-    def _request(target_m: str, tuning: Dict[str, Any], first_attempt: bool):
+    def _request(target_m: str, tuning: Dict[str, Any]):
         if reference_image_bytes:
             _, ref_ext = sniff_image_bytes(reference_image_bytes)
             buf = io.BytesIO(reference_image_bytes)
             buf.name = f"edit_input.{ref_ext or 'png'}"
-            kwargs: Dict[str, Any] = dict(model=target_m, image=buf, prompt=prompt, size=size, n=1, **tuning)
-            if first_attempt and tuning:
-                kwargs["input_fidelity"] = "high"  # keep the user's subject recognisable
-            return client.images.edit(**kwargs)
+            return client.images.edit(model=target_m, image=buf, prompt=prompt, size=size, n=1, **tuning)
         return client.images.generate(model=target_m, prompt=prompt, size=size, n=1, **tuning)
 
     last_error = None
     for idx, target_model in enumerate(models_to_try):
         try:
+            tuning = dict(extras)
+            if reference_image_bytes and openai_image_supports_input_fidelity(target_model):
+                tuning["input_fidelity"] = "high"  # keep the user's subject recognisable (gpt-image-2 and newer reject the parameter)
             logger.info(
                 f"{log_prefix}Calling OpenAI image {'edit' if reference_image_bytes else 'generation'} "
                 f"(model={target_model}, size={size}, quality={extras['quality']}, format={params.format})..."
             )
-            try:
-                resp = _request(target_model, extras, True)
-                used_format = params.format
-            except Exception as param_err:
-                if not _is_optional_param_error(param_err):
-                    raise
-                logger.warning(f"{log_prefix}OpenAI rejected tuning params ({param_err}); retrying bare request")
-                resp = _request(target_model, {}, False)
-                used_format = "png"
+            while True:
+                try:
+                    resp = _request(target_model, tuning)
+                    break
+                except Exception as param_err:
+                    if not tuning or not _is_optional_param_error(param_err):
+                        raise
+                    message = str(param_err).lower()
+                    dropped = [name for name in tuning if name in message]       # only what the API named
+                    if not dropped:
+                        raise                                                    # it blames a parameter we did not send: retrying would not help
+                    for name in dropped:
+                        tuning.pop(name)
+                    logger.warning(f"{log_prefix}OpenAI rejected {dropped} ({param_err}); retrying without {'it' if len(dropped) == 1 else 'them'}")
+            used_format = params.format if "output_format" in tuning else "png"   # without output_format the API answers PNG
+            record_health_ok("openai", target_model)
 
             data_obj = resp.data[0]
             b64_json = getattr(data_obj, "b64_json", None)
@@ -760,6 +770,9 @@ def _call_openai_with_fallback(
 
         except Exception as e:
             last_error = e
+            if _is_model_not_found_error(e):
+                # A withdrawn model is a model-level fact (not a user's key problem): count it so the rollout view shows it.
+                HEALTH.record("openai", target_model, "model_missing", detail=str(e))
             if _is_model_not_found_error(e) and idx < len(models_to_try) - 1:
                 logger.warning(
                     f"{log_prefix}OpenAI model '{target_model}' failed ({e}). "

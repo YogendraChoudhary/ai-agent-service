@@ -291,11 +291,11 @@ BYOK restrictions and the streaming `content_replace` contract. Image routing ta
 The agent automatically routes operations across two model tiers to minimize latency and token cost without sacrificing quality:
 
 1. **Basic / Fast Tier (`BASIC_MODEL_IDS`)**:
-   - Models: `gpt-4o-mini`, `gemini-3.5-flash-lite`, `grok-non-reasoning`, `claude-sonnet-5`.
+   - Models: `gpt-4o-mini`, `gemini-3.5-flash-lite`, `grok-non-reasoning`, `claude-sonnet-5-5`.
    - Used for deterministic tasks: `grammar`, `simplify`, `completion`, `emojify`, `table`, `list`, `summarize`, `tone`, `make_shorter`, and `autocomplete`.
    - Tuned with low temperatures (`0.0`–`0.3`) for deterministic formatting and low TTFT (<1s).
 2. **Advanced / Flagship Tier (`ADVANCED_MODEL_IDS`)**:
-   - Models: `gpt-5.2`, `gemini-3.8-flash` (thinking budget tuned), `claude-opus-5`, `grok-4.6`.
+   - Models: `gpt-6.1-terra` (`gpt-5.2` for the blog and code agents), `gemini-3.8-flash` (thinking budget tuned), `claude-opus-5-5`, `grok-4.6`.
    - Used for complex generative tasks: `smart_global`, `enhance`, `make_longer`, and deep web research agents.
 
 ---

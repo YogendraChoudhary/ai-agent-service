@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     design_canvas_enabled: bool = Field(True, alias="DESIGN_CANVAS_ENABLED")
     design_max_repair_attempts: int = Field(2, ge=0, le=5, alias="DESIGN_MAX_REPAIR_ATTEMPTS")
+    # How hard Claude's advanced tier (claude-opus-5-5) thinks: low | medium | high | xhigh | max. Thinking cannot be switched off on
+    # this model and is billed as output, so this is the speed/cost/quality dial. "low" measured as good as "medium" on writing, design
+    # canvas and code, and faster and cheaper (docs/MODEL_UPGRADE_BENCHMARK.md, section 12). The model's own default would be medium.
+    claude_advanced_effort: str = Field("low", alias="CLAUDE_ADVANCED_EFFORT")
+    # reasoning_effort for OpenAI's advanced tier (gpt-6.1-terra): none | low | medium | high | xhigh. "none" measured fastest and as good
+    # as "low" on writing; at the model's default effort the tail was far slower (docs/MODEL_UPGRADE_BENCHMARK.md, section 14).
+    openai_advanced_effort: str = Field("none", alias="OPENAI_ADVANCED_EFFORT")
+    # At startup, look up every configured model and platform key in a background thread (free calls) and log ROLLOUT_ALERT lines for
+    # anything missing or rejected; the result is served at GET /agent/health/providers. scripts/preflight_models.py runs the same check.
+    model_preflight_on_start: bool = Field(True, alias="MODEL_PREFLIGHT_ON_START")
+    # Same dial for the basic tier (claude-sonnet-5-5: quick edits, summaries, long-document passages). Empty = the model's own default.
+    claude_basic_effort: str = Field("", alias="CLAUDE_BASIC_EFFORT")
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
     code_validation_enabled: bool = Field(True, alias="CODE_VALIDATION_ENABLED")
     code_repair_enabled: bool = Field(True, alias="CODE_REPAIR_ENABLED")
@@ -69,6 +81,33 @@ class Settings(BaseSettings):
         if value not in {'clean', 'polished'}:
             logging.getLogger(__name__).warning('Invalid VOICE_DEFAULT_STYLE %r; using clean', value)
             return 'clean'
+        return value
+
+    @field_validator('claude_advanced_effort')
+    @classmethod
+    def validate_claude_effort(cls, value):
+        value = (value or '').strip().lower()
+        if value not in {'low', 'medium', 'high', 'xhigh', 'max'}:
+            logging.getLogger(__name__).warning('Invalid CLAUDE_ADVANCED_EFFORT %r; using low', value)
+            return 'low'
+        return value
+
+    @field_validator('openai_advanced_effort')
+    @classmethod
+    def validate_openai_effort(cls, value):
+        value = (value or '').strip().lower()
+        if value not in {'none', 'low', 'medium', 'high', 'xhigh'}:
+            logging.getLogger(__name__).warning('Invalid OPENAI_ADVANCED_EFFORT %r; using none', value)
+            return 'none'
+        return value
+
+    @field_validator('claude_basic_effort')
+    @classmethod
+    def validate_claude_basic_effort(cls, value):
+        value = (value or '').strip().lower()
+        if value and value not in {'low', 'medium', 'high', 'xhigh', 'max'}:
+            logging.getLogger(__name__).warning('Invalid CLAUDE_BASIC_EFFORT %r; using the model default', value)
+            return ''
         return value
 
     @field_validator('voice_format_provider')

@@ -19,7 +19,7 @@ def limit_of(model):
 class TestBudgetMaths(unittest.TestCase):
 
     def test_reasoning_models_get_headroom_others_do_not(self):
-        for model_id in ("gpt-5.2", "gpt-5", "o3-mini", "grok-4.6"):
+        for model_id in ("gpt-5.2", "gpt-5", "o3-mini", "grok-4.6", "claude-opus-5-5", "claude-sonnet-5-5"):
             with self.subTest(model=model_id):
                 self.assertEqual(reasoning_headroom(model_id), REASONING_HEADROOM_TOKENS)
         for model_id in ("gpt-4o-mini", "claude-opus-5", "claude-sonnet-5", "gemini-3.8-flash", "deepseek-chat",
@@ -48,7 +48,9 @@ class TestGetModel(unittest.TestCase):
                 self.assertEqual({v for v in limit_of(self.model(provider)).values()}, {None})
 
     def test_each_provider_gets_its_own_limit_field(self):
-        self.assertEqual(limit_of(self.model("claude", max_tokens=700)), {"max_tokens": 1024})
+        # the advanced Claude tier is claude-opus-5-5, which always thinks; thinking counts against max_tokens, so it gets headroom
+        self.assertEqual(limit_of(self.model("claude", max_tokens=700)), {"max_tokens": 1024 + REASONING_HEADROOM_TOKENS})
+        self.assertEqual(limit_of(self.model("claude", advanced=False, max_tokens=700)), {"max_tokens": 1024 + REASONING_HEADROOM_TOKENS})
         self.assertEqual(limit_of(self.model("gemini", max_tokens=700)), {"max_output_tokens": 1024})
         self.assertEqual(limit_of(self.model("openai", max_tokens=700))["max_completion_tokens"], 1024 + REASONING_HEADROOM_TOKENS)
         self.assertIsNone(limit_of(self.model("openai", max_tokens=700))["max_tokens"])     # gpt-5 rejects max_tokens

@@ -14,10 +14,12 @@ import src.image_gen as ig
 import src.text_processing_agent as tpa
 from config import settings
 from src.blog.media import IMAGE_STYLE_SUFFIX
-from src.models import ADVANCED_MODEL_IDS
+from src.models import ADVANCED_MODEL_IDS, advanced_model_id
 from src.observability import finish_trace, get_trace, start_trace
 from src.task_router import KeyResolver
 from tests.blog.fakes import FakeAgentFactory, ScriptedLLM, good_body
+
+BLOG_OPENAI = advanced_model_id("openai", "blog_writer")      # the model the blog agent really runs (a pin, see src.models.AGENT_MODEL_PINS)
 
 BRIEF = "Write a blog post for team leads about running remote meetings that people actually want to attend."
 
@@ -152,7 +154,7 @@ class TestStreamHook(RuntimeCase):
 
     def test_the_model_reported_is_the_one_that_answered(self):
         out = self.stream()
-        self.assertEqual(out[0], {"__model_used__": ("openai", ADVANCED_MODEL_IDS["openai"])})
+        self.assertEqual(out[0], {"__model_used__": ("openai", BLOG_OPENAI)})
 
     def test_the_agent_is_built_per_call_with_the_pipelines_prompt_and_budget(self):
         self.stream()

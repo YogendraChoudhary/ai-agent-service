@@ -60,13 +60,19 @@ def call_with_timeout(fn: Callable[[], object], seconds: Optional[float], what: 
     return outcome["value"]
 
 
-def model_id_for(candidate, use_web: bool = False) -> str:
-    """The model id a candidate runs: its tier's id, and DeepSeek's chat model when tools are attached."""
-    from src.models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, DEEPSEEK_TOOL_MODEL_ID
+def model_id_for(candidate, use_web: bool = False, agent_type: Optional[str] = None) -> str:
+    """
+    The model id a candidate runs: its tier's id, and DeepSeek's chat model when tools are attached.
+    Pass the agent type the call is made with: a pinned agent (src.models.AGENT_MODEL_PINS, e.g. OpenAI's blog writer) runs its
+    pinned model, and this id feeds the cost record, the trace and the model reported to the client.
+    """
+    from src.models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, DEEPSEEK_TOOL_MODEL_ID, advanced_model_id
 
     if candidate.provider == "deepseek" and use_web:
         return DEEPSEEK_TOOL_MODEL_ID
-    return (ADVANCED_MODEL_IDS if candidate.advanced else BASIC_MODEL_IDS)[candidate.provider]
+    if candidate.advanced:
+        return advanced_model_id(candidate.provider, agent_type) or ADVANCED_MODEL_IDS[candidate.provider]
+    return BASIC_MODEL_IDS[candidate.provider]
 
 
 class AgnoLLM:
@@ -108,7 +114,7 @@ class AgnoLLM:
         with self._lock:
             live = [c for c in self.candidates if (c.provider, c.advanced) not in self._failed]
         pick = (live or self.candidates or [None])[0]
-        return (pick.provider, model_id_for(pick)) if pick is not None else None
+        return (pick.provider, model_id_for(pick, agent_type=self.agent_type)) if pick is not None else None
 
     def _chain(self, spec: CallSpec) -> list:
         return self.outline_candidates if spec.stage == "outline" and self.outline_candidates else self.candidates
@@ -171,7 +177,7 @@ class AgnoLLM:
         from src.observability import trace_set
         from src.provider_errors import status_code
 
-        entry = {"stage": spec.stage, "unit": spec.unit, "model": f"{candidate.provider}/{model_id_for(candidate, spec.use_web)}",
+        entry = {"stage": spec.stage, "unit": spec.unit, "model": f"{candidate.provider}/{model_id_for(candidate, spec.use_web, self.agent_type)}",
                  "seconds": round(time.perf_counter() - started, 2)}
         if error is not None:
             entry["error"] = str(status_code(error) or type(error).__name__)
@@ -207,7 +213,7 @@ class AgnoLLM:
             content, metrics = response.content, getattr(response, "metrics", None)
         else:
             content, metrics = self._stream(tpa, agent, candidate, history, spec.on_text)
-        model_id = model_id_for(candidate, spec.use_web)
+        model_id = model_id_for(candidate, spec.use_web, self.agent_type)
         record_text_usage(self.request_id, model_id, metrics)
         served = (candidate.provider, model_id)
         with self._lock:

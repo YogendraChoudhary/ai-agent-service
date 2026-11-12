@@ -45,7 +45,7 @@ def outline_chain(setting: Optional[str], candidates: Sequence, available: Optio
     provider, advanced = parsed
     allowed = set(available) if available is not None else {candidates[0].provider}
     fast = Candidate(provider, advanced)
-    if provider not in allowed or model_id_for(fast) in BLOCKED_MODELS:
+    if provider not in allowed or model_id_for(fast, agent_type="blog_writer") in BLOCKED_MODELS:
         return None
     if candidates[0] == fast:
         return None

@@ -14,13 +14,14 @@ import src.text_processing_agent as tpa
 from config import Settings, settings
 from src.blog.llm import AgnoLLM, CallSpec, model_id_for
 from src.blog.runtime import outline_chain, parse_outline_model
-from src.models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS
+from src.models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, advanced_model_id
 from src.observability import finish_trace, get_trace, start_trace
 from src.task_router import Candidate, KeyResolver
 from tests.blog.fakes import FakeAgentFactory, ScriptedLLM, good_outline
 from tests.blog.test_runtime import BRIEF, RuntimeCase
 
 OPENAI, GEMINI, CLAUDE = Candidate("openai", True), Candidate("gemini", True), Candidate("claude", True)
+BLOG_OPENAI = advanced_model_id("openai", "blog_writer")      # the model the blog agent really runs (a pin, see src.models.AGENT_MODEL_PINS)
 
 
 class TestSetting(unittest.TestCase):
@@ -140,15 +141,15 @@ class TestAgnoLLMChains(unittest.TestCase):
             self.call(llm, self.OUTLINE)
             self.assertIsNone(llm.used)                                     # no part has been written yet
             self.assertEqual(llm.outline_used, ("gemini", BASIC_MODEL_IDS["gemini"]))
-            self.assertEqual(llm.drafting_model(), ("openai", ADVANCED_MODEL_IDS["openai"]))
+            self.assertEqual(llm.drafting_model(), ("openai", BLOG_OPENAI))
             self.assertNotIn("model_used", get_trace("om1").attrs)
             self.call(llm, self.UNIT, system="You are a senior editorial writer")
             attrs = get_trace("om1").attrs
         finally:
             finish_trace("om1")
         self.assertEqual(attrs["outline_model"], f"gemini/{BASIC_MODEL_IDS['gemini']}")
-        self.assertEqual(attrs["model_used"], f"openai/{ADVANCED_MODEL_IDS['openai']}")
-        self.assertEqual(llm.used, ("openai", ADVANCED_MODEL_IDS["openai"]))
+        self.assertEqual(attrs["model_used"], f"openai/{BLOG_OPENAI}")
+        self.assertEqual(llm.used, ("openai", BLOG_OPENAI))
 
     def test_a_fast_model_that_fails_falls_back_to_the_drafting_providers_for_that_call(self):
         self.factory.fail = {"gemini": RuntimeError("503 overloaded")}
@@ -181,8 +182,8 @@ class TestAgnoLLMChains(unittest.TestCase):
             finish_trace("om3")
         self.assertEqual([(c["stage"], c["unit"], c["model"], c.get("error")) for c in attrs["llm_calls"]], [
             ("outline", None, f"gemini/{BASIC_MODEL_IDS['gemini']}", "503"),            # the failed attempt is logged too
-            ("outline", None, f"openai/{ADVANCED_MODEL_IDS['openai']}", None),
-            ("unit", "s1", f"openai/{ADVANCED_MODEL_IDS['openai']}", None)])
+            ("outline", None, f"openai/{BLOG_OPENAI}", None),
+            ("unit", "s1", f"openai/{BLOG_OPENAI}", None)])
         self.assertTrue(all(isinstance(c["seconds"], float) and c["seconds"] >= 0 for c in attrs["llm_calls"]))
         self.assertEqual(llm.calls, attrs["llm_calls"])
 
@@ -226,7 +227,7 @@ class TestStreamWithAFastOutline(RuntimeCase):
         self.assertEqual(created[0], ("gemini", False, True))
         self.assertTrue(all(c[:2] == ("openai", True) for c in created[1:]), created)
         self.assertEqual(len(self.factory.llm.calls_for("outline")), 1)
-        self.assertEqual(out[0], {"__model_used__": ("openai", ADVANCED_MODEL_IDS["openai"])})      # who writes the post
+        self.assertEqual(out[0], {"__model_used__": ("openai", BLOG_OPENAI)})      # who writes the post
 
     def test_a_weak_first_outline_is_repaired_by_the_drafting_model(self):
         bad = good_outline({"plan": {"target_words": 1400, "images": 3}})
@@ -269,7 +270,7 @@ class TestStreamWithAFastOutline(RuntimeCase):
         finally:
             finish_trace("om2")
         self.assertEqual(attrs["outline_model"], f"gemini/{BASIC_MODEL_IDS['gemini']}")
-        self.assertEqual(attrs["model_used"], f"openai/{ADVANCED_MODEL_IDS['openai']}")
+        self.assertEqual(attrs["model_used"], f"openai/{BLOG_OPENAI}")
 
 
 if __name__ == "__main__":

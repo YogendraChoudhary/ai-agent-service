@@ -225,6 +225,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Model pre-warming encountered an issue (non-fatal): {e}")
 
+    from src.models import MODEL_ENV_OVERRIDES
+    if MODEL_ENV_OVERRIDES:
+        logger.warning("Model overrides from the environment are active: %s", MODEL_ENV_OVERRIDES)
+    if settings.model_preflight_on_start:
+        import threading
+        from src.model_preflight import run_preflight
+        threading.Thread(target=run_preflight, name="model-preflight", daemon=True).start()
+
     if settings.voice_flow_enabled:
         # Whisper's first decode compiles kernels and Gemini's first call opens a TLS connection; do both before a user waits.
         from src.voice_flow.router import warm_up as warm_up_voice
@@ -1750,6 +1758,7 @@ async def autocomplete_text(
             model_provider=model_provider,
             api_key=api_key,
             request_id=request_id,
+            is_byok=is_byok,
         )
 
         total_duration = time.time() - start_time
@@ -1838,6 +1847,23 @@ async def metrics(limit: int = 50) -> JSONResponse:
         raise HTTPException(status_code=404, detail='Not found')
     from src.observability import latency_stats, recent_summaries
     return JSONResponse(content={'stats': latency_stats(), 'recent': recent_summaries(min(max(limit, 1), 200))})
+
+
+@app.get('/agent/health/providers')
+async def provider_health(request: Request) -> JSONResponse:
+    """
+    What each provider/model answered or failed with in the last 15 minutes, the active alerts (key rejected, model missing, request shape
+    rejected, truncation, refusals, failure rate) and the startup model check. Counts only: no content, no keys. For monitors and
+    rollouts; allowed with the backend secret (X-Agent-Backend-Secret) or when the metrics endpoint is enabled.
+    """
+    if not (settings.metrics_endpoint_enabled or backend_secret_valid(request)):
+        raise HTTPException(status_code=404, detail='Not found')
+    from src.models import MODEL_ENV_OVERRIDES
+    from src.provider_health import HEALTH
+    snapshot = HEALTH.snapshot()
+    snapshot['model_overrides'] = MODEL_ENV_OVERRIDES
+    snapshot['status'] = 'alert' if any(a['severity'] == 'critical' for a in snapshot['alerts']) else ('warning' if snapshot['alerts'] else 'ok')
+    return JSONResponse(content=snapshot)
 
 
 @app.post('/agent/abort', response_model=AbortResponse)

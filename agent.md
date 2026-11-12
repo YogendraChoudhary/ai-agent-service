@@ -193,8 +193,8 @@ The system partitions text operations across two primary tiers to maximize speed
 | Tier | Target Latency (TTFT) | Typical Providers / Model IDs | Use Cases |
 |---|---|---|---|
 | **Basic / Fast Tier** (`BASIC_MODEL_IDS`) | **< 1.0s** | `gpt-4o-mini`, `gemini-3.5-flash-lite`, `grok-4.20-non-reasoning`, `deepseek-chat`, `claude-sonnet-5` | `fix_grammar`, `simplify`, `complete`, `emojify`, `tone`, `make_shorter`, inline edits |
-| **Advanced Tier** (`ADVANCED_MODEL_IDS`) | **1.5s – 3.0s** | `gpt-5.2`, `gemini-3.8-flash`, `grok-4.6`, `deepseek-reasoner`, `claude-opus-5` | `general` (free-form), `enhance_with_ai`, `make_longer`, `generate_blog`, deep research |
-| **Autocomplete Tier** (`AUTOCOMPLETE_MODEL_IDS`) | **< 500ms** | `gpt-4o-mini`, `gemini-3.5-flash-lite`, `claude-haiku-4-5`, `deepseek-chat` | Keystroke-level continuation |
+| **Advanced Tier** (`ADVANCED_MODEL_IDS`) | **1.5s – 3.0s** | `gpt-6.1-terra` (`gpt-5.2` pinned for `blog_writer`, `code_writer`, `code_explainer`), `gemini-3.8-flash`, `grok-4.6`, `deepseek-reasoner`, `claude-opus-5-5` | `general` (free-form), `enhance_with_ai`, `make_longer`, `generate_blog`, deep research |
+| **Autocomplete Tier** (`AUTOCOMPLETE_MODEL_IDS`) | **< 500ms** | `gpt-4o-mini`, `gemini-3.5-flash-lite`, `claude-haiku-5-5`, `deepseek-chat` | Keystroke-level continuation |
 
 ### 4.2 Special Provider Considerations
 
@@ -205,8 +205,8 @@ The system partitions text operations across two primary tiers to maximize speed
 ### 4.3 Task Routing & Provider Fallback Trees (`src/task_router.py`)
 
 When the user specifies no model preference (`model_source: "default"`), Eddyter routes the request by cognitive task:
-- **Code Tasks** (`generate_code`, `explain_code`): Route to **Claude** (`claude-opus-5`). Fallback tree: `claude` ➔ `openai` ➔ `gemini`.
-- **Writing Tasks** (`make_longer`, `generate_email_template`, `generate_blog`): Route to **OpenAI** (`gpt-5.2`). Fallback tree: `openai` ➔ `<requested>` ➔ `claude`.
+- **Code Tasks** (`generate_code`, `explain_code`): Route to **Claude** (`claude-opus-5-5`). Fallback tree: `claude` ➔ `openai` ➔ `gemini`.
+- **Writing Tasks** (`make_longer`, `generate_email_template`, `generate_blog`): Route to **OpenAI** (`gpt-6.1-terra`; `gpt-5.2` for the blog). Fallback tree: `openai` ➔ `<requested>` ➔ `claude`.
 - **Content Tasks** (Standard edits): Route to **Gemini** (`gemini-3.8-flash` / `gemini-3.5-flash-lite`).
 
 Fallback triggers only on **HTTP 429 (rate limits)**, **HTTP 5xx (outages)**, or **timeouts**, strictly **before** the first SSE token is streamed. If an error occurs after streaming starts, the error is returned to avoid output corruption.
@@ -329,7 +329,7 @@ Designed for professional email marketing and transactional campaigns.
 *Orchestrated by [`src/image_gen.py`](file:///Users/codecords/Desktop/Codebase/Agent/agent/src/image_gen.py) and [`src/intent.py`](file:///Users/codecords/Desktop/Codebase/Agent/agent/src/intent.py).*
 
 - **Direct Image Bypass**: If a user enters *"Create a photo of a cyberpunk skyline"*, the request bypasses the text LLM entirely and routes directly to the image adapter, saving 2-4 seconds of chat LLM latency.
-- **Default Image Model**: Google Gemini (`gemini-3.1-flash-lite-image` at ~$0.033 / 3.5s latency). High-resolution requests scale to `gemini-hires` or OpenAI `gpt-image-1`.
+- **Default Image Model**: Google Gemini (`gemini-3.1-flash-lite-image` at ~$0.033 / 3.5s latency). High-resolution requests scale to `gemini-hires` or OpenAI `gpt-image-2.5-flare` (`gpt-image-1` was withdrawn).
 - **Permanent Storage & CDN**: Image bytes or temporary URLs are downloaded, processed via Pillow, and uploaded to AWS S3 (`s3_service.py`), returning permanent CloudFront CDN URLs.
 - **Multimodal Vision Input**: Supports image attachment (`max_reference_images: 3`). Users can upload screenshots or diagrams and ask the editor to summarize, OCR transcribe, or edit visual assets.
 

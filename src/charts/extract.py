@@ -9,6 +9,7 @@ from decimal import Decimal
 
 from pydantic import Field
 
+from src.json_reply import strip_json_fence
 from src.longform.llm import CallSpec, LLM
 from .schema import ChartData, ChartDocument, ChartPoint, SourceReference, StrictModel
 
@@ -103,4 +104,4 @@ def suggest_chart(source: str, llm: LLM) -> ChartDocument | None:
               CallSpec("graph_extract", 0.0, 4096))
     if len(raw) > 30_000:
         raise ValueError("Graph extraction exceeded its output bound")
-    return ground_extraction(source, Extraction.model_validate_json(raw))
+    return ground_extraction(source, Extraction.model_validate_json(strip_json_fence(raw)))

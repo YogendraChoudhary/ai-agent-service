@@ -109,7 +109,8 @@ class TestOpenAIPayload(unittest.TestCase):
     def test_edit_path_sends_image_quality_format_and_fidelity(self):
         client = self._client()
         with patch("openai.OpenAI", return_value=client):
-            _call_openai_with_fallback("k", "add vibe", ImageParams(quality="high"), reference_image_bytes=JPEG)
+            # input_fidelity exists only on gpt-image-1.5; gpt-image-2 and newer (the default) reject the parameter
+            _call_openai_with_fallback("k", "add vibe", ImageParams(quality="high"), reference_image_bytes=JPEG, model_id="gpt-image-1.5")
         client.images.generate.assert_not_called()
         kwargs = client.images.edit.call_args[1]
         self.assertEqual(kwargs["quality"], "high")

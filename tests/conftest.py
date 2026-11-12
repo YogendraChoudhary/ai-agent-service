@@ -7,6 +7,17 @@ import pytest
 # Voice is off by default in production config; the suite exercises the mounted routes.
 # Set before any test module imports config, so the app is built with the router.
 os.environ.setdefault("VOICE_FLOW_ENABLED", "true")
+# The startup model check makes (free) network calls with the real keys in .env; tests never do.
+os.environ.setdefault("MODEL_PREFLIGHT_ON_START", "false")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_provider_health():
+    """The rollout health counters are process-wide; one test's simulated failures must not alarm the next."""
+    from src.provider_health import HEALTH
+    HEALTH.reset()
+    yield
+    HEALTH.reset()
 
 
 @pytest.fixture(autouse=True)

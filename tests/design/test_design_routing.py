@@ -133,7 +133,7 @@ class TestDesignFallbackTree:
         edges["failing"].update({"claude", "gemini"})
         chunks = _stream("Make an onboarding card UI")
         assert edges["providers"] == ["claude", "gemini", "openai"]
-        assert _model_used(chunks) == ("openai", "gpt-5.2")  # the provider that answered, not the first tried
+        assert _model_used(chunks) == ("openai", "gpt-6.1-sol")  # the provider that answered, not the first tried; the design canvas model
 
     def test_users_own_model_choice_still_goes_first(self, edges):
         edges["failing"].add("openai")
@@ -237,9 +237,11 @@ def test_openai_design_call_uses_max_completion_tokens(monkeypatch):
     client = type("Client", (), {"chat": type("Chat", (), {"completions": _Completions()})()})()
     monkeypatch.setattr(tpa, "_get_cached_openai_client", lambda *a, **k: client)
     tpa._run_design_json_completion([{"role": "user", "content": "x"}], None, 0.2, "openai", "k")
-    assert sent["model"] == "gpt-5.2"
+    assert sent["model"] == "gpt-6.1-sol"                      # the design canvas has its own OpenAI model (models.DESIGN_MODEL_IDS)
     assert "max_tokens" not in sent
     assert sent["max_completion_tokens"] >= 4096
+    assert sent["reasoning_effort"] == "low"                   # Sol cannot do "none"; low measured fastest for designs
+    assert "temperature" not in sent                           # a 400 on gpt-6.x unless effort is "none"
 
 
 # ===========================================================================

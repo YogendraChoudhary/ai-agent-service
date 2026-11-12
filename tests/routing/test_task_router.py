@@ -45,7 +45,7 @@ class TestTaskRouter(unittest.TestCase):
         self.assertEqual(self.route(task='writing'), ['openai', 'gemini', 'claude'])
         self.assertEqual(self.route(task='writing', model_source='user'), ['gemini', 'openai', 'claude'])
         route = resolve_route('writing', 'gemini', 'default', {'openai', 'gemini'}, True)
-        self.assertEqual(ADVANCED_MODEL_IDS[route[0].provider], 'gpt-5.2')
+        self.assertEqual(ADVANCED_MODEL_IDS[route[0].provider], 'gpt-6.1-terra')
 
     def test_writing_task_covers_only_make_longer_and_email_template(self):
         self.assertEqual(task_for_request('make_longer', 'expand this')[0], 'writing')
