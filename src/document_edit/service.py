@@ -34,6 +34,8 @@ specific weak paragraphs and give concrete editorial reasons, not the entire doc
 For 'only X', never target Y. Respect all exclusions. If a named segment is missing, multiple candidates fit,
 the instruction is vague or conflicts with itself, return needs_clarification with a specific question and no targets.
 If nothing needs changing, return no_change with no targets. Maximum 12 target blocks per request.
+Block IDs are internal: never write them in message or reason. Refer to a paragraph by quoting its first few words
+in double quotes, e.g. the paragraph starting "Our team has grown…".
 This mode refines existing prose/lists only. Preserve numbers/facts, headings, URLs, lists and structure.
 Requests to change figures, insert/delete sections, change tables/code/images, fetch new facts or create charts
 need clarification instead of a misleading prose edit. Never answer document questions as edit requests.
@@ -55,6 +57,54 @@ Keep all locked tokens exactly once and in order. Keep links, emphasis, list ite
 line breaks. Do not add a heading, paragraph, table, quote, code, HTML or image. Never change numeric facts,
 invent facts or add a preface. Write the requested tone or clarity change in this block only.
 """
+
+
+# A full ID (b41_0123456789ab) or the short form a model sometimes writes (b41), optionally after "block"/"paragraph".
+# IDs are lower-case, so prose such as "vitamin B12" is never matched.
+_BLOCK_REF = re.compile(r"\b(?:(?P<word>[Bb]lock|[Pp]aragraph)\s+)?(?P<index>b\d+)(?P<hash>_[a-f0-9]{12})?\b")
+
+
+def _opening_words(text: str, words: int = 6) -> str:
+    """The first few words of a block as a reader sees them, without Markdown markers."""
+    line = next((l for l in text.splitlines() if l.strip()), "")
+    line = re.sub(r"^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)", "", line)
+    line = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", line)
+    line = re.sub(r"[*_`~|]+", "", line)
+    found = line.split()
+    preview = " ".join(found[:words]).rstrip(",;:.")
+    return preview + ("…" if len(found) > words else "")
+
+
+def _without_block_ids(message: str, blocks: list[DocumentBlock], limit: int) -> str:
+    """Block IDs stay internal; a user identifies a paragraph by its opening words."""
+    by_index = {b.id.split("_", 1)[0]: b for b in blocks}
+
+    def readable(match):
+        block = by_index.get(match.group("index"))
+        in_brackets = message[match.start() - 1:match.start()] == "(" and message[match.end():match.end() + 1] == ")"
+        if block is None and not (match.group("hash") or match.group("word") or in_brackets):
+            return match.group(0)  # a bare "b7" that is no block of this document is ordinary text
+        preview = _opening_words(block.text) if block else ""
+        if not preview:
+            return "that paragraph"
+        if match.group("word"):
+            noun = {"list": "list", "heading": "heading"}.get(block.kind, "paragraph")
+            starts_sentence = not message[:match.start()].strip() or message[:match.start()].rstrip()[-1] in ".?!"
+            return f'{"The" if starts_sentence else "the"} {noun} starting "{preview}"'
+        return f'"{preview}"'
+
+    text = _BLOCK_REF.sub(readable, message)
+    text = re.sub(r"\s*\(\s*that paragraph\s*\)", "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r" +([,.;:?!])", r"\1", text)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _readable_result(result: DocumentEditResult, blocks: list[DocumentBlock]) -> DocumentEditResult:
+    targets = [t.model_copy(update={"reason": _without_block_ids(t.reason, blocks, 300)}) for t in result.targets]
+    patches = [p.model_copy(update={"reason": _without_block_ids(p.reason, blocks, 300)}) for p in result.patches]
+    return result.model_copy(update={"message": _without_block_ids(result.message, blocks, 500),
+                                     "targets": targets, "patches": patches})
 
 
 class EditCancelled(Exception):
@@ -128,6 +178,11 @@ def apply_document_patches(source: str, base_sha256: str, patches: list[Document
 
 
 def edit_document(source: str, instruction: str, llm: LLM, *, cancel_event=None, match_style=False) -> tuple[str, DocumentEditResult]:
+    text, result = _edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style)
+    return text, _readable_result(result, document_blocks(source))
+
+
+def _edit_document(source: str, instruction: str, llm: LLM, *, cancel_event=None, match_style=False) -> tuple[str, DocumentEditResult]:
     base = fingerprint(source)
 
     def unchanged(status, message):

@@ -422,3 +422,36 @@ def test_an_escaped_line_break_in_a_reply_never_reaches_the_document():
     result, metadata = edit_document(DOC, instruction, llm)
     assert metadata.status == "proposed" and "\\n" not in result
     assert metadata.patches[0].after == blocks[0].text.replace("very very", "really")
+
+
+def test_clarification_shows_opening_words_instead_of_internal_block_ids():
+    intro, benefits = prose()[:2]
+    short_intro, short_benefits = intro.id.split("_")[0], benefits.id.split("_")[0]
+    plan = {"status": "needs_clarification", "targets": [],
+            "message": f"Which paragraph should change: the first one ({short_intro}) or block {benefits.id}?"}
+    llm = ScriptedEditor("Improve that paragraph", plan=plan)
+    result, metadata = edit_document(DOC, llm.instruction, llm)
+    assert result == DOC and metadata.status == "needs_clarification"
+    assert metadata.message == ('Which paragraph should change: the first one ("This introduction is very very useful…") '
+                                'or the paragraph starting "The benefits are clear and clear…"?')
+    assert short_intro not in metadata.message and short_benefits not in metadata.message
+
+
+def test_proposed_reasons_hide_block_ids_but_patches_keep_them():
+    intro = prose()[0]
+    instruction = "Remove repetition from the Introduction."
+    plan = {"status": "ready", "message": f"Paragraph {intro.id} repeats a word.",
+            "targets": [{"block_id": intro.id, "request_quote": instruction, "reason": f"({intro.id.split('_')[0]}) says 'very' twice."}]}
+    llm = ScriptedEditor(instruction, plan=plan, replies={intro.id: intro.text.replace("very very", "very")})
+    _, metadata = edit_document(DOC, instruction, llm)
+    assert metadata.status == "proposed"
+    assert metadata.message == 'The paragraph starting "This introduction is very very useful…" repeats a word.'
+    assert metadata.targets[0].reason == metadata.patches[0].reason == '("This introduction is very very useful…") says \'very\' twice.'
+    assert metadata.targets[0].block_id == metadata.patches[0].block_id == intro.id
+
+
+@pytest.mark.parametrize("message", ["Vitamin B12 is mentioned; which paragraph?", "Is plan b999 the one?"])
+def test_text_that_only_looks_like_an_id_is_left_alone(message):
+    llm = ScriptedEditor("Improve it", plan={"status": "needs_clarification", "message": message, "targets": []})
+    _, metadata = edit_document(DOC, llm.instruction, llm)
+    assert metadata.message == message
