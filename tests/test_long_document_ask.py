@@ -42,6 +42,13 @@ def long_source(parts: int = 60, planted: "dict[int, str] | None" = None) -> str
 FACT = "The Quillfeather warehouse in Bergen ships two hundred and forty parcels every Tuesday."
 SOURCE = long_source(planted={37: FACT})
 QUESTION = "How many parcels does the Bergen warehouse ship each Tuesday?"
+SIMILAR_SECTIONS = "# Handbook 📘\n\n" + "".join(
+    f"## Section {number}: Policy\n\n"
+    + (f"Clause {number} applies to all teams. This includes local records and reviewed reports. " * 22)
+    + ("The approved amount is 417 vouchers." if number == 4 else "The fallback amount is 987 vouchers.")
+    + "\n\n"
+    for number in (*range(1, 13), 40, "4.1")
+)
 
 
 def ask(query=QUESTION, source=SOURCE, **kw):
@@ -127,6 +134,54 @@ class TestDefaultScopeAndTheSwitch:
 
 
 class TestRetrieval:
+    @pytest.mark.parametrize("scope", ["auto", "focused", "document"])
+    def test_named_section_excludes_similar_headings_and_outside_selection(self, scope):
+        start = source_cursor(SIMILAR_SECTIONS, "## Section 4:")
+        end = source_cursor(SIMILAR_SECTIONS, "## Section 5:")
+        outside = {"start_utf16": 0, "end_utf16": 5}
+        result = ask("Summarize section 4", source=SIMILAR_SECTIONS, scope=scope, context={"selection": outside})
+        assert result.metadata.coverage == "partial"
+        assert result.metadata.references and all(start <= r.start_utf16 < r.end_utf16 <= end for r in result.metadata.references)
+        assert "417 vouchers" in result.prompt and "987 vouchers" not in result.prompt
+
+    @pytest.mark.parametrize("query", ['Summarize section 4', 'Summarize section "4. Policy"'])
+    def test_a_small_named_section_keeps_its_nested_headings(self, query):
+        source = "# Manual\n\n## 4. Policy\n\nPolicy details.\n\n### Approval\n\nApproved on Tuesday.\n\n## 40. Policy\n\nSeparate policy.\n"
+        result = ask(query, source=source, scope="auto")
+        assert result.metadata.strategy == "retrieval"
+        assert "Approved on Tuesday" in result.prompt and "Separate policy" not in result.prompt
+
+    def test_a_decimal_section_number_can_be_requested_directly(self):
+        result = ask("Summarize section 4.1", source=SIMILAR_SECTIONS, scope="auto")
+        assert {r.section[-1] for r in result.metadata.references} == {"## Section 4.1: Policy"}
+
+    def test_explicit_selection_scope_outside_the_section_returns_no_context(self):
+        start = source_cursor(SIMILAR_SECTIONS, "## Section 5:")
+        end = source_cursor(SIMILAR_SECTIONS, "## Section 6:")
+        selection = {"start_utf16": start, "end_utf16": end}
+        result = ask("Summarize section 4", source=SIMILAR_SECTIONS, scope="selection", context={"selection": selection})
+        assert result.metadata.status == "needs_context" and "outside the requested section" in result.message
+        assert result.prompt == "" and result.metadata.billable_input_chars == 0
+
+    def test_explicit_selection_scope_uses_only_its_overlap_with_the_section(self):
+        start = source_cursor(SIMILAR_SECTIONS, "The approved amount")
+        section_end = source_cursor(SIMILAR_SECTIONS, "## Section 5:")
+        end = source_cursor(SIMILAR_SECTIONS, "## Section 6:")
+        selection = {"start_utf16": start, "end_utf16": end}
+        result = ask("Summarize section 4", source=SIMILAR_SECTIONS, scope="selection", context={"selection": selection})
+        assert result.metadata.strategy == "selection"
+        assert result.metadata.references and all(start <= r.start_utf16 < r.end_utf16 <= section_end for r in result.metadata.references)
+        assert "417 vouchers" in result.prompt and "987 vouchers" not in result.prompt
+
+    @pytest.mark.parametrize("headings, message", [
+        ("## Section 40: Policy\n\nOther policy.\n", "No heading matches"),
+        ("## Section 4: Policy\n\nFirst policy.\n\n## Section 4: Policy\n\nSecond policy.\n", "More than one heading matches"),
+    ])
+    def test_unresolved_named_section_returns_no_context(self, headings, message):
+        result = ask("Summarize section 4", source=headings, scope="auto")
+        assert result.metadata.status == "needs_context" and message in result.message
+        assert result.prompt == "" and result.metadata.billable_input_chars == 0
+
     def test_porter_stemming_finds_other_word_forms(self):
         """The question shares no exact word with the passage ("refurbished"/"refurbishing", "lighthouse"/"lighthouses"): only stemming connects them."""
         source = long_source(planted={20: "Stakeholders praised the refurbishing of abandoned lighthouses along the northern coast."})
@@ -299,7 +354,7 @@ class TestHttp:
     @pytest.mark.parametrize("path", ["/agent/process", "/agent/stream"])
     def test_auto_retrieves_the_section_for_a_section_summary(self, runtime, path):
         client, state = runtime
-        source = SOURCE.replace("## Part 37:", "## Section 4:")
+        source = SIMILAR_SECTIONS
         response = client.post(path, json=request_body(query="Summarize section 4", document_context={"text": source}))
         assert response.status_code == 200, response.text
         if path == "/agent/stream":
@@ -307,9 +362,10 @@ class TestHttp:
         else:
             meta = response.json()["document_context"]
         assert (meta["status"], meta["strategy"], meta["coverage"]) == ("ready", "retrieval", "partial")
-        assert any(FACT in ref["quote"] and "Section 4:" in ref["section"][-1] for ref in meta["references"])
+        assert any("417 vouchers" in ref["quote"] for ref in meta["references"])
+        assert {ref["section"][-1] for ref in meta["references"]} == {"## Section 4: Policy"}
         call, = state["calls"]
-        assert FACT in call["prompt"]
+        assert "417 vouchers" in call["prompt"] and "987 vouchers" not in call["prompt"]
 
     def test_process_answers_a_long_document_from_passages(self, runtime):
         client, state = runtime

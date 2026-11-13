@@ -75,7 +75,33 @@ def search_terms(text):
     return list(dict.fromkeys(terms))
 
 
-def retrieve_context(context, query, scope, *, prefer_cursor=True):
+def _section_range(text, target):
+    name, number = target
+    headings = []
+    start = int(text.startswith('\ufeff'))
+    for block in parse(text[start:]):
+        if block.kind == 'heading':
+            title = re.sub(r'^ {0,3}#{1,6}[ \t]+|[ \t]+#+[ \t]*$', '', block.text.splitlines()[0])
+            title = re.sub(r'\s*\{[#.][^}\n]{0,100}\}\s*$', '', title)
+            headings.append((start, block.level, ' '.join(title.split()).casefold()))
+        start += len(block.text)
+    name = name.casefold()
+    if number is None:
+        matches = [i for i, (_, _, title) in enumerate(headings) if title == name]
+    else:
+        number = number.casefold()
+        prefix = re.compile(rf'^(?:{re.escape(name)}|{re.escape(number)})(?=$|[\s:.)–—-])(?![.\-]\d)')
+        matches = [i for i, (_, _, title) in enumerate(headings) if prefix.match(title)]
+    if len(matches) != 1:
+        message = 'More than one heading matches' if matches else 'No heading matches'
+        raise ValueError(f'{message} “{target[0]}”. Quote the full heading title or select the relevant text.')
+    index, = matches
+    start, level, _ = headings[index]
+    end = next((at for at, depth, _ in headings[index + 1:] if depth <= level), len(text))
+    return start, end
+
+
+def retrieve_context(context, query, scope, *, prefer_cursor=True, target=None):
     """
     Scoped Ask: the passages of the document that best match the question, as exact quoted excerpts with references.
 
@@ -88,11 +114,20 @@ def retrieve_context(context, query, scope, *, prefer_cursor=True):
     if scope == 'selection' and not has_selection:
         raise ValueError('Selection scope requires a nonempty selection')
     base, end = (source_index(text, selection.start_utf16), source_index(text, selection.end_utf16)) if scope == 'selection' else (0, len(text))
-    chunks = [SourceChunk(c.id, c.start + base, c.end + base, c.text, c.section) for c in chunk_source(text[base:end], 1600)]
-    if not text[base:end].strip():
+    if target is not None:
+        try:
+            section_start, section_end = _section_range(text, target)
+        except ValueError as error:
+            return unavailable_context(context, 'ask', scope, str(error))
+        base, end = max(base, section_start), min(end, section_end)
+        if base >= end:
+            return unavailable_context(context, 'ask', scope, 'The selection is outside the requested section. Select text in that section or clear the selection scope.')
+    scoped_text = text[base:end]
+    if not scoped_text.strip():
         return unavailable_context(context, 'ask', scope, 'There is no source content in the requested scope.')
+    chunks = [SourceChunk(c.id, c.start + base, c.end + base, c.text, c.section) for c in chunk_source(scoped_text, 1600)]
     ranked = []
-    if scope == 'selection' and len(text[base:end].encode('utf-8')) < 3500:
+    if (scope == 'selection' or target is not None) and len(scoped_text.encode('utf-8')) < 3500:
         ranked = list(range(len(chunks)))
     else:
         terms = search_terms(query)[:32]
@@ -107,6 +142,10 @@ def retrieve_context(context, query, scope, *, prefer_cursor=True):
                         'SELECT rowid FROM passages WHERE passages MATCH ? ORDER BY bm25(passages, 4.0, 1.0), rowid', (expression,))]
         except sqlite3.OperationalError:
             return unavailable_context(context, 'ask', scope, 'Document retrieval is unavailable on this server. Send a smaller source or selection.')
+        if target is not None:
+            # A heading-only query should still cover descendants and chunks that do not repeat the heading terms.
+            matched = set(ranked)
+            ranked.extend(i for i in range(len(chunks)) if i not in matched)
         if has_selection or (prefer_cursor and context.cursor_utf16 is not None):
             focus = source_index(text, selection.start_utf16) if has_selection else source_index(text, context.cursor_utf16)
             focused = next((i for i, c in enumerate(chunks) if c.start <= focus < c.end or focus == c.end == len(text)), None)

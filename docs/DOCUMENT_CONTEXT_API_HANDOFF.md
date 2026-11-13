@@ -46,7 +46,7 @@ Explicit Edit runs the existing edit validation against the complete exact sourc
 
 ## Context limits and scope
 
-Default Ask provides the complete source or returns `needs_context` without running a model. It never silently substitutes partial retrieval for a whole-document task. To answer a local question against a larger source, explicitly set `document_scope="auto"` (recommended: [Long-document Ask](#long-document-ask)), `"focused"` or `"selection"`. For global analysis, explicitly set `document_analysis="summary"` or `"contradictions"`. A deployment can make `auto` the behaviour of the default scope with `DOCUMENT_LARGE_ASK=auto`; it is then still reported as partial, never silent.
+Default Ask resolves numbered sections and quoted section titles first. For other questions it provides the complete source or returns `needs_context` without running a model. To answer a local question against a larger source, set `document_scope="auto"`, `"focused"` or `"selection"`. For global analysis, set `document_analysis="summary"` or `"contradictions"`. A deployment can make `auto` the behaviour of the default scope with `DOCUMENT_LARGE_ASK=auto`. See [Long-document Ask](#long-document-ask).
 
 Scoped Ask uses exact source chunks and a request-local in-memory SQLite FTS5 index with BM25 ranking. It supports Unicode terms and CJK bigrams; it is lexical retrieval, not embedding similarity. Deployed Python must include FTS5. Unavailable search, no matching passages or an unpackable selection returns `needs_context` without a model call. Captured focus may supply a passage even without a lexical match. Retrieved references have server-assigned `r0`, `r1`, … identifiers, exact quotes, heading paths and UTF-16 ranges. Partial answers must remain scoped to those passages; retrieved evidence does not establish whole-document coverage.
 
@@ -58,7 +58,9 @@ No provider token-count request is added to the hot path. Before production enab
 
 ## Long-document Ask
 
-Ask used to stop at about 6,000 bytes of document (the whole-document allowance), so a 10 KB Word file with tables, an imported PDF or any real report got "too large to review in full" and the client had to know to retry with `document_scope="focused"`. These changes make a long document answerable without that:
+When Ask specifies one section by number or quoted title, such as “Summarize section 4” or `Summarize section "Risk Factors"`, the backend resolves the heading before retrieval. It sends only excerpts from that section, including any subsections, up to the existing retrieval budget. A missing or ambiguous heading returns `needs_context` with no model call. This applies even when the document fits in full or the caller omits the scope. With explicit `selection` scope, Ask uses the overlap with the named section. A selection outside that section returns `needs_context`.
+
+For other Ask requests, the scope behaves as follows.
 
 | What you send | Document fits | Document does not fit, question is about a part | Document does not fit, question needs the whole document |
 |---|---|---|---|

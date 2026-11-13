@@ -19,16 +19,19 @@ _DOC = r"(?:document|doc|paper|article|text|essay|report|page|file|manual|chapte
 _DOC_REFERENCE = rf"(?:the|this|my|our)\s+(?:(?:entire|whole|full|complete)\s+)?{_DOC}\b"
 _THING = r"(?:points?|ideas?|themes?|arguments?|findings?|takeaways?|take-aways?|contributions?|conclusions?|topics?|claims?|messages?|lessons?|results?|highlights?|sections?|steps?|risks?|recommendations?)"
 _SECTION = r"(?:sections?|subsections?|chapters?|paragraphs?|parts?|appendix|appendices)"
+_HEADING_LABELS = {"section", "subsection", "chapter", "part", "appendix"}
+_SECTION_NUMBER = r"\d+(?:\.\d+)*[a-z]?|[a-z]|[ivxlcdm]{2,}"
 _QUOTED_TITLE = r'''(?:"[^"\n]{1,100}"|'[^'\n]{1,100}'|“[^”\n]{1,100}”|‘[^’\n]{1,100}’)'''
 _TITLE_WORD = rf"(?!(?:the|this|my|our|of|in|within|from|on|about|by|and|or|including|especially|all|every|each|{_DOC})\b)[\w-]+"
 _SECTION_TITLE = rf"(?:{_QUOTED_TITLE}|{_TITLE_WORD}(?:\s+(?:(?:and|or|of)\s+)?{_TITLE_WORD}){{0,4}})"
 _SECTION_TARGET = re.compile(
-    rf"\b(?:{_SECTION}\s+(?:\d+(?:\.\d+)*[a-z]?|[a-z]|[ivxlcdm]{{2,}})\b|{_SECTION}\s+{_QUOTED_TITLE}"
+    rf"\b(?:(?P<label>{_SECTION})\s+(?P<number>{_SECTION_NUMBER})(?!\w|[.\-]\d)|(?P<quoted_label>{_SECTION})\s+(?P<quoted>{_QUOTED_TITLE})"
     rf"|(?:first|second|third|last|final|\d+(?:st|nd|rd|th))\s+{_SECTION}\b"
     rf"|the\s+(?:{_SECTION_TITLE}\s+{_SECTION}\b|{_SECTION}\s+(?:on|about|titled|called)\s+{_SECTION_TITLE}"
     r"|(?:introduction|preface|foreword|background|methods|results|discussion|conclusion|appendix)\b))"
     rf"(?:\s+(?:of|in|from)\s+{_DOC_REFERENCE})?", re.I,
 )
+_NUMBERED_LIST_TAIL = re.compile(r"\s*(?:,\s*|(?:and|or|to|through)\s+|[-–—]\s*)\d", re.I)
 _ENTIRE_DOC = rf"\b(?:entire|whole|full|complete)\s+{_DOC}\b"
 _ACROSS_DOC = rf"\b(?:throughout|across|over)\s+(?:the\s+|this\s+|my\s+|our\s+)?(?:entire\s+|whole\s+)?{_DOC}\b"
 _EXPLICIT_WHOLE = re.compile(
@@ -73,3 +76,20 @@ def asks_whole_document(query: str) -> bool:
     if _MAIN_THING.search(text) and not _CODE_TARGET.search(text):
         return True
     return any(pattern.search(text) for pattern in _WHOLE)
+
+
+def requested_section(query: str) -> tuple[str, str | None] | None:
+    """A single quoted or numbered heading, with an optional bare-number form."""
+    text = " ".join(query.split())
+    matches = list(_SECTION_TARGET.finditer(text))
+    if len(matches) != 1 or _EXPLICIT_WHOLE.search(_SECTION_TARGET.sub("[section]", text)):
+        return None
+    match = matches[0]
+    label = (match["label"] or match["quoted_label"] or "").lower()
+    if label not in _HEADING_LABELS:
+        return None
+    if match["number"]:
+        if _NUMBERED_LIST_TAIL.match(text, match.end()):
+            return None
+        return f'{label} {match["number"]}', match["number"]
+    return match["quoted"][1:-1].strip(), None
