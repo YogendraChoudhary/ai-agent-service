@@ -452,6 +452,6 @@ def test_proposed_reasons_hide_block_ids_but_patches_keep_them():
 
 @pytest.mark.parametrize("message", ["Vitamin B12 is mentioned; which paragraph?", "Is plan b999 the one?"])
 def test_text_that_only_looks_like_an_id_is_left_alone(message):
-    llm = ScriptedEditor("Improve it", plan={"status": "needs_clarification", "message": message, "targets": []})
+    llm = ScriptedEditor("Improve the Introduction", plan={"status": "needs_clarification", "message": message, "targets": []})
     _, metadata = edit_document(DOC, llm.instruction, llm)
     assert metadata.message == message

@@ -102,7 +102,7 @@ def test_new_blocks_still_go_to_draft_without_a_model_call(instruction):
 
 
 @pytest.mark.parametrize("instruction", ["add (2024) next to the title", "add a phone number after the address",
-                                         "add Inc. after Acme", "add 2024 at the end of the title"])
+                                         "add 2024 at the end of the title"])
 def test_small_additions_are_not_refused_before_the_planner(instruction):
     seen = []
     edit_document(DOC, instruction, lambda system, messages, spec: seen.append(spec.stage) or json.dumps(

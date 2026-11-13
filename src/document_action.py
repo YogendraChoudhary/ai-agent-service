@@ -97,6 +97,12 @@ def decide_by_rules(query: str, document_text: str, *, scope: str = "document", 
         return ActionDecision("ask", "request", "scope_requires_ask")
     task = digest(query)
     blank = not document_text.strip()
+    if not blank and len(query.strip()) <= EDIT_QUERY_LIMIT:
+        from .document_edit.in_place import in_place_request
+        in_place = in_place_request(query)
+        if (in_place is not None and (in_place.phrase is not None or in_place.replacement is not None or in_place.ambiguous)
+                and not _question_shaped(task)):
+            return ActionDecision("edit", "rules", _REASON["edit"])
     points_at_document = refers_to_document(task) or asks_to_insert(task) or bool(_DOCUMENT_PART.search(task))
     if not points_at_document and _standalone_task(task):
         return ActionDecision("write", "rules", "standalone_task")

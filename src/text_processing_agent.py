@@ -32,7 +32,7 @@ from .autocomplete_join import apply_join_tag, fix_join, is_commentary
 from .net_safety import is_public_ip
 from .security_guardrails import sanitize_web_content
 from .observability import trace_mark, trace_set
-from .document_context import PreparedContext, OUTPUT_TOKENS
+from .document_context import ContextRange, PreparedContext, OUTPUT_TOKENS
 from .blog.prompts import section_system_prompt
 from typing import Optional, Dict, Any, Union
 from dotenv import load_dotenv
@@ -2295,6 +2295,7 @@ def process_user_query_stream(
     cancel_event: Optional[threading.Event] = None,
     suggest_graphs: bool = True,
     document_text: Optional[str] = None,
+    document_edit_selection: ContextRange | None = None,
     prepared_context: Optional[PreparedContext] = None,
     match_document_style: bool = False,
     document_intent: Optional[dict] = None,
@@ -2402,7 +2403,7 @@ def process_user_query_stream(
         yield from stream_document_edit(document_text, user_text if user_text is not None else query,
             candidates=candidates, key_for=key_resolver if routed else (lambda _provider: api_key),
             is_byok=is_byok, user_id=user_id, request_id=request_id, report_model=report_model, cancel_event=cancel_event,
-            match_style=match_document_style)
+            match_style=match_document_style, selection=document_edit_selection)
         return
 
     query_lower = query.lower()
@@ -3023,6 +3024,7 @@ def process_user_query_with_images(
     operation_type: str = "general",
     suggest_graphs: bool = True,
     document_text: Optional[str] = None,
+    document_edit_selection: ContextRange | None = None,
     prepared_context: Optional[PreparedContext] = None,
     match_document_style: bool = False,
     document_intent: Optional[dict] = None,
@@ -3072,6 +3074,7 @@ def process_user_query_with_images(
         operation_type=operation_type,
         suggest_graphs=suggest_graphs,
         document_text=document_text,
+        document_edit_selection=document_edit_selection,
         prepared_context=prepared_context,
         match_document_style=match_document_style,
         document_intent=document_intent,

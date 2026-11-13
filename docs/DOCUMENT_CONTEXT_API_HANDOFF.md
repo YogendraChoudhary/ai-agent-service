@@ -42,7 +42,7 @@ Both endpoints accept these additional fields:
 
 The nested context/range schemas reject unknown fields. Do not send both `document_text` and `document_context`. Secondary prompts, design AST, image inputs/settings and blog options conflict with document-context requests. Existing typed operations such as `complete`, `fix_grammar` and `generate_blog` do not accept ambient context.
 
-Explicit Edit runs the existing edit validation against the complete exact source, including its 400-block limit. The block writer also receives up to three read-only style samples from untargeted prose, preferring the same section. Samples exclude protected/excluded areas and fit a total 2,000 serialized UTF-8 bytes. They cannot become additional patch targets. Legacy `document_text` requests receive no new style samples. Supported changes, protected content, atomic validation and stale-source HTTP 409 behavior are unchanged. See [the edit handoff](DOCUMENT_EDIT_API_HANDOFF.md).
+Edit validates the complete exact source, including its 400-block limit. Send a nonempty `document_context.selection` to limit the edit to that text. For an exact replacement, `Replace "old text" with "new text"` also works when the original phrase occurs once. If there is a selection, the phrase must occur once within it. Exact wording uses Python directly. A generated correction may return only the scoped replacement, and an unclear target returns `needs_clarification` without a patch. The existing section-edit writer can still use up to three read-only style samples from untargeted prose, up to 2,000 serialized UTF-8 bytes in total. See [the edit handoff](DOCUMENT_EDIT_API_HANDOFF.md).
 
 ## Context limits and scope
 

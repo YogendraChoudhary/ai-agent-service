@@ -14,13 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 def stream_document_edit(source, instruction, *, candidates, key_for, is_byok, user_id=None,
-                         request_id=None, report_model=False, cancel_event=None, match_style=False):
+                         request_id=None, report_model=False, cancel_event=None, match_style=False, selection=None):
     llm = AgnoLLM(candidates, key_for, is_byok=is_byok, user_id=user_id, request_id=request_id,
                   agent_type="document_editor", timeout=float(settings.longform_call_timeout_seconds) or None,
                   cancel_event=cancel_event)
     trace_set(request_id, mode="document_edit", agent_type="document_editor")
     try:
-        text, result = edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style)
+        text, result = edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style, selection=selection)
     except EditCancelled:
         return
     except Exception as error:

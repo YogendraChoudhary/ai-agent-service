@@ -1,4 +1,4 @@
-# Editing document sections without a selection
+# Editing document text and sections
 
 The Python backend can locate paragraphs from a user's prompt and return a reviewable editing proposal for the
 current complete document. No cursor or selection is required. Untargeted text is copied from the original source;
@@ -33,6 +33,16 @@ this field explicitly enables document editing and takes priority over image, co
 - `document_id` still does not retrieve a document. Always send the actual authorized current snapshot.
 
 ## What the backend does
+
+For an in-place edit, send `document_context.text`, `document_context.selection`, and `document_action="edit"`.
+The range uses inclusive start and exclusive end in UTF-16 code units. It must fit within one editable block.
+`Replace "old text" with "new text"` also works with no selection when the exact phrase occurs once. With a
+selection, a named phrase must occur once inside it. `Write "new text" in place` replaces the selected text verbatim.
+Literal edits use no model. Missing, repeated or conflicting targets return `needs_clarification` with no patch.
+Quote the original and replacement when either contains multiple clauses or punctuation that could end the instruction.
+For generated corrections the model receives only the editable text and nearby read-only context. Python rejects
+extra sentences, unrequested additions in proofreading and changes to protected structure before proposing a patch.
+The broad section-edit flow below applies when the user requests a section or document rewrite without an exact target.
 
 1. Parse exact source ranges and headings using the existing Markdown parser. Whitespace, tables, images, code, raw HTML
    and reference definitions are protected. Paragraph/list blocks up to 12,000 characters can be targeted. Oversize
@@ -174,7 +184,8 @@ The placeholder array above represents objects, not strings. Response:
   content changes or invalid input. Nothing is persisted or partially applied.
 - IDs are **snapshot-bound**, not permanent editor node IDs. Positions are zero-based UTF-16 code-unit offsets,
   compatible with JavaScript string slicing even when text contains emoji. Do not treat them as UTF-8 byte offsets.
-- Every patch replaces a complete editable source block. Blank lines and other blocks are copied untouched.
+- A patch can cover a complete editable block or an exact range within it. The `before` text must match that
+  range in the original snapshot. All source outside the range is copied verbatim.
 - The endpoint validates input snapshots, not user authorization. The application backend must enforce document
   ownership and use its normal save/version checks. Hashes are stale-snapshot checks, not signatures.
 
@@ -185,7 +196,8 @@ The placeholder array above represents objects, not strings. Response:
 2. For an instruction to edit existing prose without a selection, send `document_text` plus the instruction as
    `query`; send no cursor or selection fields on this legacy edit path. Questions and new drafting use the separate
    [document-context contract](DOCUMENT_CONTEXT_API_HANDOFF.md), which is enabled by default. New
-   `document_action="edit"` requests also use this same patch flow. Keep legacy selection-based operations unchanged.
+   `document_action="edit"` requests also use this patch flow. For an in-place request, capture and send
+   the selection with the exact document snapshot. Display the returned range as the proposed change.
 3. Buffer document-mode output. Show targeted paragraph highlights, before/after text and reasons. Display
    clarifications in the chat. Provide Accept and Dismiss; proposals do not save automatically.
 4. Before acceptance, confirm the current serialized document still matches `base_sha256`. Call `/apply` through
