@@ -86,7 +86,9 @@ Body: `{"error": "<message for the user>"}` (or `{"detail": …}` from FastAPI's
 
 ## 5. Warning codes (`warnings[].code`)
 
-`images_omitted`, `hidden_text_removed`, `hidden_characters_removed`, `white_text`, `tracked_changes_accepted`, `text_boxes`, `equations_skipped`, `comments_skipped`, `macros_ignored`, `table_merged_cells`, `tables_not_rebuilt` (names the pages), `pages_truncated`, `output_truncated`, `little_text` (a JavaScript page), `nesting_too_deep`, plus the upload endpoint's `possible_prompt_injection` and `hidden_characters`. Each has a `message` written for the user. Suggested UI: show them as a notice above the imported text.
+`images_omitted`, `hidden_text_removed`, `hidden_characters_removed`, `white_text`, `tracked_changes_accepted`, `text_boxes`, `equations_skipped`, `comments_skipped`, `macros_ignored`, `table_merged_cells`, `table_alignment_conflicts`, `tables_not_rebuilt` (names the pages), `pages_truncated`, `output_truncated`, `little_text` (a JavaScript page), `nesting_too_deep`, plus the upload endpoint's `possible_prompt_injection` and `hidden_characters`. Each has a `message` written for the user. Suggested UI: show them as a notice above the imported text.
+
+HTML tables carry explicit left, center, and right cell alignment into the Markdown separator row. The header takes precedence. Without an explicit header alignment, a consistent body-cell alignment sets the column. Markdown can represent one alignment per column, so conflicting values produce `table_alignment_conflicts`.
 
 ---
 

@@ -28,6 +28,7 @@ ddgs
 # Markdown block parser behind src/longform/markdown_ast.py (blog lint, structure-preserving refinement).
 # It arrives transitively today (agno -> rich); pinned because the parser is now a direct dependency.
 markdown-it-py==4.2.0
+PyYAML                    # Recognizes Markdown front matter without loading or rewriting its values.
 
 # HTML parsing for agno's WebsiteReader, which backs the read_web_page tool.
 # Not pulled in by agno itself — without it every page read fails with an

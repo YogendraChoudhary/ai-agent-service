@@ -138,6 +138,22 @@ class TestTables:
         out = md('<table><tr><th>Name</th><th align="right">N</th></tr><tr><td>a</td><td>1</td></tr></table>')
         assert out == "| Name | N |\n| --- | --: |\n| a | 1 |"
 
+    def test_alignment_comes_from_cell_declarations(self):
+        html = ('<table><tr><th style="border-left: 1px solid">Name</th><th>Units</th>'
+                '<th align="center" style="text-align: right !important; text-align: left">Total</th></tr>'
+                '<tr><td>A</td><td style="text-align: center">12</td><td>19</td></tr>'
+                '<tr><td>B</td><td align="center">9</td><td>3</td></tr></table>')
+        result = html_to_markdown(html, main_content=False)
+        assert result.markdown.splitlines()[1] == "| --- | :-: | --: |"
+        assert result.warnings == []
+
+    def test_conflicting_body_alignments_warn_when_markdown_cannot_represent_them(self):
+        html = ('<table><tr><th align="left">Name</th><th>Units</th></tr>'
+                '<tr><td align="right">A</td><td align="right">12</td></tr>'
+                '<tr><td>B</td><td align="center">9</td></tr></table>')
+        assert md(html).splitlines()[1] == "| :-- | --- |"
+        assert codes(html) == {"table_alignment_conflicts"}
+
     def test_pipe_in_a_cell_is_escaped(self):
         out = md("<table><tr><th>a</th><th>b</th></tr><tr><td>x|y</td><td>z</td></tr></table>")
         assert "x\\|y" in out

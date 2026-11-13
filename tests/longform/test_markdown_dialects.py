@@ -44,12 +44,28 @@ class TestFrontMatter:
         text = "---\n# a comment\ntags:\n  - a\n  - b\nauthor:\n  name: X\n---\nBody\n"
         assert kinds(text)[0] == ("other", "front_matter")
 
+    @pytest.mark.parametrize("yaml", [
+        '{title: "My Post", tags: [docs, finance]}\n',
+        '? "custom key"\n: Value\n',
+        'defaults: &defaults {draft: true}\npost: {<<: *defaults, title: "My Post"}\n',
+        '{}\n',
+    ])
+    def test_yaml_mappings_are_kept_as_original_text(self, yaml):
+        front_matter = "---\n" + yaml + "...\n"
+        text = front_matter + "\n# Body\n"
+        block, *_ = parse(text)
+        assert block.flavor == "front_matter" and block.text == front_matter
+        assert heading_lines(text) == [(1, "# Body")]
+        assert join(parse(text)) == text
+
     @pytest.mark.parametrize("text", [
         "---\nJust some prose in a rule pair\n---\n\nBody\n",          # prose between two rules
         "---\n---\nBody\n",                                           # two rules, nothing between
         "---\ntitle: never closed\n\nBody text and more\n",
         "Intro\n\n---\ntitle: not at the very start\n---\n\nBody\n",   # front matter is only ever the first thing in the file
         "---\n**Note:** emphasis is not a key\n---\n\nBody\n",
+        "---\n- a\n- b\n---\n\nBody\n",
+        "---\ntitle: [unclosed\n---\n\nBody\n",
     ])
     def test_a_pair_of_rules_is_not_front_matter(self, text):
         assert all(flavor != "front_matter" for _, flavor in kinds(text))
@@ -204,6 +220,11 @@ class TestDraftPlacementKeepsFrontMatterFirst:
         doc = "---\ntitle: X\n---\n"
         placement, _ = resolve_placement(doc, "add a summary at the top", None)
         assert placement.position == "after" and doc[placement.start_utf16:placement.end_utf16] == doc
+
+    def test_draft_starts_below_yaml_mapping_in_flow_style(self):
+        doc = "---\n{title: Quarterly report, tags: [docs, finance]}\n---\n\n# Sales\n"
+        placement, question = resolve_placement(doc, "add a summary at the top", None)
+        assert question is None and placement.position == "before" and placement.text == "# Sales\n"
 
     def test_a_document_without_front_matter_is_unchanged(self):
         doc = "# Heading\n\nFirst.\n"

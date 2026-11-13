@@ -54,6 +54,19 @@ _LANG = [re.compile(p, re.I) for p in (r"(?:^|\s)language-([\w+#.-]+)", r"(?:^|\
 _WS = re.compile(r"[ \t\r\n\f\v  -   　]+")
 _BR = ""
 _TRACKING_SIZE = re.compile(r"^\s*[0-2]\s*(?:px)?\s*$")
+_TABLE_ALIGNMENT = {"left": ":--", "center": ":-:", "right": "--:"}
+_TEXT_ALIGN = re.compile(r"\s*text-align\s*:\s*(left|center|right|start|end|justify|match-parent|inherit|initial|revert(?:-layer)?|unset)"
+                         r"\s*(!\s*important)?\s*", re.I)
+
+
+def _cell_alignment(cell) -> str:
+    # An explicit inline declaration takes precedence over the legacy HTML attribute.
+    matches = [m for rule in (cell.get("style") or "").split(";") if (m := _TEXT_ALIGN.fullmatch(rule))]
+    if matches:
+        match = next((m for m in reversed(matches) if m[2]), matches[-1])
+        return match[1].lower()
+    align = (cell.get("align") or "").strip().lower()
+    return align if align in _TABLE_ALIGNMENT else ""
 
 
 @dataclass
@@ -530,9 +543,11 @@ class _Converter:
             return
         self.count("tables")
         grid: List[List[str]] = []
+        alignments: List[List[str]] = []
         merged = False
         for r in cells:
             line: List[str] = []
+            row_alignment: List[str] = []
             for c in r:
                 text = self.finish(self.cell_inline(c, depth + 1), single_line=True).replace("|", "\\|")
                 line.append(text)
@@ -542,18 +557,24 @@ class _Converter:
                     span = 1
                 if span > 1 or (c.get("rowspan") or "1") not in ("1", ""):
                     merged = True
-                line.extend([""] * (min(span, MAX_TABLE_COLS) - 1))
+                padding = max(0, min(span, MAX_TABLE_COLS) - 1)
+                line.extend([""] * padding)
+                row_alignment.extend([_cell_alignment(c), *([""] * padding)])
             grid.append(line)
+            alignments.append(row_alignment)
         if merged:
             self.count("table_merged_cells")
         grid = [r + [""] * (width - len(r)) for r in grid]
         if all(re.fullmatch(r"\*\*[^*]+\*\*", c) or not c for c in grid[0]):          # a bold header row (Word) is already a header
             grid[0] = [c[2:-2] for c in grid[0]]
         align = []
-        for c in cells[0] + [None] * 0:
-            style = ((c.get("style") or "") + " " + (c.get("align") or "")).lower()
-            align.append(":-:" if "center" in style else "--:" if "right" in style else ":--" if "left" in style else "---")
-        align = (align + ["---"] * width)[:width]
+        for column in range(width):
+            header = alignments[0][column] if column < len(alignments[0]) else ""
+            body = {row[column] for row in alignments[1:] if column < len(row) and row[column]}
+            choice = header or (next(iter(body)) if len(body) == 1 else "")
+            align.append(_TABLE_ALIGNMENT.get(choice, "---"))
+            if any(_TABLE_ALIGNMENT.get(value) != _TABLE_ALIGNMENT.get(choice) for value in body):
+                self.count("table_alignment_conflicts")
         lines = ["| " + " | ".join(grid[0]) + " |", "| " + " | ".join(align) + " |"]
         lines += ["| " + " | ".join(r) + " |" for r in grid[1:]]
         self.add(out, "\n".join(lines))
@@ -757,6 +778,9 @@ def html_to_markdown(html: "str | bytes", *, base_url: str = "", main_content: b
     if conv.stats.get("table_merged_cells"):
         warnings.append({"code": "table_merged_cells", "message": f"{conv.stats['table_merged_cells']} table(s) had merged cells; the merged cells "
                                                                   "became empty cells."})
+    if conv.stats.get("table_alignment_conflicts"):
+        warnings.append({"code": "table_alignment_conflicts", "message": "Some table columns use different alignments in different cells. "
+                         "Markdown uses one alignment per column, so these columns use the header alignment or the Markdown default."})
     if too_deep:
         warnings.append({"code": "nesting_too_deep", "message": "Part of the page is nested too deeply to be read (over 250 levels) and was left out."})
     if conv.truncated:

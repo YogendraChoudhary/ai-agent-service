@@ -19,6 +19,13 @@ from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple
 
 from markdown_it import MarkdownIt
+from yaml import YAMLError, parse as parse_yaml
+from yaml.events import DocumentEndEvent, MappingStartEvent, StreamEndEvent
+
+try:
+    from yaml import CSafeLoader as SafeLoader
+except ImportError:
+    from yaml import SafeLoader
 
 KINDS = ("heading", "paragraph", "image", "table", "blockquote", "list", "fence", "html", "hr", "blank", "other")
 PROSE_KINDS = ("paragraph", "list", "blockquote")
@@ -86,7 +93,6 @@ FRONT_MATTER_MAX_LINES = 300
 MATH_BLOCK_MAX_LINES = 200
 
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_FM_YAML_KEY = re.compile(r"""^(?:["'][^"'\n]{1,80}["']|[\w][^:\n]{0,80}?)\s*:(?:\s|$)""")
 _FM_TOML_LINE = re.compile(r"""^(?:[\w."'\-]{1,80}\s*=|\[{1,2}[^\]\n]{1,80}\]{1,2}\s*$)""")
 _FOOTNOTE_DEF = re.compile(r"^ {0,3}\[\^[^\]\s]{1,60}\]:")
 
@@ -115,26 +121,36 @@ def _front_matter_end(lines: Sequence[str]) -> Optional[int]:
     """One past the closing delimiter when the document opens with YAML (---) or TOML (+++) front matter, else None."""
     if not lines:
         return None
-    opener = lines[0].rstrip()
+    opener = lines[0].removeprefix("\ufeff").rstrip()
     if opener == "---":
-        closers, content = ("---", "..."), _FM_YAML_KEY
-    elif opener == "+++":
-        closers, content = ("+++",), _FM_TOML_LINE
-    else:
+        for i in range(1, min(len(lines), FRONT_MATTER_MAX_LINES)):
+            if lines[i].rstrip() in ("---", "..."):
+                # Read parser events only, so tags and aliases are never resolved and the original text stays intact.
+                try:
+                    events = parse_yaml("".join(lines[1:i]), Loader=SafeLoader)
+                    next(events, None)                     # stream start
+                    next(events, None)                     # document start, if nonempty
+                    if isinstance(next(events, None), MappingStartEvent):
+                        for event in events:
+                            if isinstance(event, DocumentEndEvent):
+                                return i + 1 if isinstance(next(events, None), StreamEndEvent) else None
+                except YAMLError:
+                    pass
+                return None
+        return None
+    if opener != "+++":
         return None
     seen_entry = False
     for i in range(1, min(len(lines), FRONT_MATTER_MAX_LINES)):
         line = lines[i].rstrip("\r\n")
-        if line.rstrip() in closers:
-            return i + 1 if seen_entry else None            # "---" twice with nothing between is two rules, not front matter
+        if line.rstrip() == "+++":
+            return i + 1 if seen_entry else None
         if not line.strip() or line[0] in " \t" or line.lstrip().startswith("#"):
             continue                                        # blank, nested/continued, or a comment
-        if opener == "---" and line.startswith("- "):
-            continue                                        # a top-level list
-        if content.match(line):
+        if _FM_TOML_LINE.match(line):
             seen_entry = True
             continue
-        return None                                         # prose, not metadata: the opening "---" was a thematic break
+        return None
     return None
 
 

@@ -30,6 +30,7 @@ import api
 import src.document_upload.router as upload_router
 from config import Settings, settings
 from src.document_context import DocumentContext, prepare_context
+from src.document_edit.blocks import document_blocks, utf16_length
 from src.redis_manager import RedisManager
 
 VALID_MD = "# Hello\n\nThis is a **test** document.\n"
@@ -184,6 +185,28 @@ class TestHappyPath:
         client, hdrs = backend_client
         body = _upload(client, text, headers=hdrs).json()
         assert body["text"] == text and body["char_count"] == len(text) and body["sha256"] == _sha256(text)
+
+    def test_upload_and_apply_keep_yaml_and_table_alignment(self, backend_client):
+        client, headers = backend_client
+        source = ("---\r\n{title: Quarterly report, tags: [docs, finance]}\r\n---\r\n\r\n"
+                  "# Sales\r\n\r\n| Name | Units | Total |\r\n| :--- | :---: | ---: |\r\n| A | 12 | 19 |\r\n")
+        upload = _upload(client, source, headers=headers).json()
+        assert upload["features"] == ["front_matter"]
+        assert upload["headings"] == [{"title": "Sales", "level": 1}]
+        assert upload["text"] == source
+
+        metadata, heading, _ = [block for block in document_blocks(source) if block.kind != "blank"]
+        def apply(block, after):
+            patch = {"block_id": block.id, "start_utf16": utf16_length(source[:block.start]),
+                     "end_utf16": utf16_length(source[:block.end]), "before": block.text, "after": after, "reason": "Test edit"}
+            return client.post("/agent/documents/apply", headers=headers, json={
+                "document_text": upload["text"], "base_sha256": upload["sha256"], "patches": [patch]})
+
+        assert apply(metadata, metadata.text.replace("Quarterly report", "Other report")).status_code == 400
+        response = apply(heading, "# Quarterly sales\r\n")
+        assert response.status_code == 200, response.text
+        edited = source.replace("# Sales", "# Quarterly sales")
+        assert response.json() == {"document_text": edited, "result_sha256": _sha256(edited)}
 
     def test_output_is_accepted_by_document_context_with_the_same_hash(self, backend_client):
         """The handoff promises the returned text is ready for document_context.text and the hash matches source_sha256."""
