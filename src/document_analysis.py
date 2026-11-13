@@ -32,6 +32,62 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
+def fit_text(value, limit, json_limit=None):
+    """
+    `value` shortened to at most `limit` UTF-8 bytes (and `json_limit` once JSON-encoded), cut at a word boundary where it can be.
+
+    Models cannot count bytes: on a real 58 KB paper the first extraction reply carried a 125-character quote against a limit of 120, and one such
+    overflow aborted the whole analysis. A prefix of an exact quote is still an exact quote, so shortening cannot introduce invented evidence, and the
+    exact-membership check still runs afterwards. Only length is repaired: wrong content (an absent quote, an unknown evidence id) still fails the analysis.
+    """
+    value = value.strip()
+
+    def fits(candidate):
+        return len(candidate.encode('utf-8')) <= limit and (json_limit is None or len(encode(candidate).encode('utf-8')) <= json_limit)
+
+    if fits(value):
+        return value
+    low, high = 0, len(value)                       # the longest prefix that fits (both measures only grow with length)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(value[:middle]):
+            low = middle
+        else:
+            high = middle - 1
+    cut = value[:low]
+    space = cut.rfind(' ')
+    return (cut[:space] if space >= len(cut) // 2 else cut).rstrip()
+
+
+def normalize_extraction(raw):
+    """Repair length overflows in an extraction reply (at most two claims, 120-byte statement and quote)."""
+    if not isinstance(raw, dict) or not isinstance(raw.get('claims'), list):
+        return raw
+    claims = []
+    for claim in raw['claims'][:2]:
+        if isinstance(claim, dict):
+            claim = {key: (fit_text(value, 120, 160) if key in ('statement', 'quote') and isinstance(value, str) else value) for key, value in claim.items()}
+        claims.append(claim)
+    return {**raw, 'claims': claims}
+
+
+def normalize_synthesis(raw):
+    """Repair length overflows in a synthesis reply (at most eight findings, 240-byte text, four distinct evidence ids each)."""
+    if not isinstance(raw, dict) or not isinstance(raw.get('findings'), list):
+        return raw
+    findings = []
+    for finding in raw['findings'][:8]:
+        if isinstance(finding, dict):
+            finding = dict(finding)
+            if isinstance(finding.get('text'), str):
+                finding['text'] = fit_text(finding['text'], 240)
+            ids = finding.get('evidence_ids')
+            if isinstance(ids, list) and all(isinstance(i, str) for i in ids):
+                finding['evidence_ids'] = list(dict.fromkeys(ids))[:4]
+        findings.append(finding)
+    return {**raw, 'findings': findings}
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
@@ -201,8 +257,8 @@ def analyze_document(prepared, llm, *, cancel_event=None, budget=None):
 
     def extract(chunk):
         try:
-            result = Extraction.model_validate(budget.call(llm, MAP_SYSTEM, map_data(plan, chunk),
-                'document_analysis_extract', MAP_OUTPUT_BYTES, chunk.id))
+            result = Extraction.model_validate(normalize_extraction(budget.call(llm, MAP_SYSTEM, map_data(plan, chunk),
+                'document_analysis_extract', MAP_OUTPUT_BYTES, chunk.id)))
             for claim in result.claims:
                 if claim.quote not in chunk.text:
                     raise ValueError('Extracted quote is absent from its source chunk')
@@ -222,8 +278,8 @@ def analyze_document(prepared, llm, *, cancel_event=None, budget=None):
                 ledger.append({'id': ref.id, 'statement': claim.statement, 'quote': claim.quote})
             yield {'__event__': {'event': 'document_analysis_progress', 'data': {
                 'stage': 'extract', 'completed_chunks': len(completed), 'total_chunks': len(plan.chunks)}}}
-        synthesis = Synthesis.model_validate(budget.call(llm, REDUCE_SYSTEM,
-            {'mode': plan.mode, 'USER_TASK': plan.query, 'evidence': ledger}, 'document_analysis_reduce', REDUCE_OUTPUT_BYTES))
+        synthesis = Synthesis.model_validate(normalize_synthesis(budget.call(llm, REDUCE_SYSTEM,
+            {'mode': plan.mode, 'USER_TASK': plan.query, 'evidence': ledger}, 'document_analysis_reduce', REDUCE_OUTPUT_BYTES)))
         by_id = {r.id: r for r in refs}
         candidates = []
         for i, finding in enumerate(synthesis.findings):

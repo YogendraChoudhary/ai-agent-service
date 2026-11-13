@@ -17,6 +17,9 @@ DocumentAction = Literal["ask", "draft", "edit"]
 # What a request may ask for: "auto" lets the agent pick (src/document_action.py) and is always resolved to one of the above, or to Write.
 DocumentActionRequest = Literal["ask", "draft", "edit", "auto"]
 DocumentScope = Literal["document", "selection", "focused"]
+# What a request may ask for: "auto" is Ask over the whole document when it fits, else over the passages that match the question (never for a
+# question that needs the whole document). It is always resolved to "document" or "focused"; the metadata reports which.
+DocumentScopeRequest = Literal["document", "selection", "focused", "auto"]
 AnalysisMode = Literal["summary", "contradictions"]
 if TYPE_CHECKING:
     from .document_analysis import AnalysisPlan
@@ -136,20 +139,28 @@ def estimated_tokens(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+WHOLE_DOCUMENT_MESSAGE = ("This question needs the whole document, which is too large to read in one request. Ask about a specific part (name a section or "
+                          "select the text), or use the document summary or contradiction analysis, which reads every part; no document analysis was run.")
+
+
 def prepare_context(context: DocumentContext, query: str, action: str = "ask", *,
-                    scope: DocumentScope = 'document', analysis: AnalysisMode | None = None) -> PreparedContext:
+                    scope: DocumentScopeRequest = 'document', analysis: AnalysisMode | None = None) -> PreparedContext:
     if action not in OUTPUT_TOKENS:
         raise ValueError("Only Ask and Draft use read-only context preparation")
-    if scope not in ('document', 'selection', 'focused') or (scope != 'document' and action != 'ask'):
+    if scope not in ('document', 'selection', 'focused', 'auto') or (scope != 'document' and action != 'ask'):
         raise ValueError('Scoped retrieval is only available for Ask')
     if analysis is not None:
         if analysis not in ('summary', 'contradictions') or scope != 'document' or action != 'ask':
             raise ValueError('Analysis requires Ask with document scope')
         from .document_analysis import prepare_analysis
         return prepare_analysis(context, query, analysis)
-    if scope != 'document':
+    if scope in ('selection', 'focused'):
         from .document_retrieval import retrieve_context
         return retrieve_context(context, query, scope)
+    # Whole document if it fits. If it does not: "auto" (or the server-wide DOCUMENT_LARGE_ASK=auto on an Ask with no scope) answers a question about a
+    # part from the matching passages, labelled partial; a question that needs the whole document is refused, as it always was.
+    from config import settings
+    large_ask_auto = action == 'ask' and (scope == 'auto' or settings.document_large_ask == 'auto')
     text = context.text
     selection = context.selection
     if selection and selection.start_utf16 != selection.end_utf16:
@@ -201,6 +212,12 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
     data = envelope(start, end)
     if not fits(data):
         if action == "ask":
+            if large_ask_auto:
+                from .document_question import asks_whole_document
+                if asks_whole_document(query):
+                    return unavailable(WHOLE_DOCUMENT_MESSAGE)
+                from .document_retrieval import retrieve_context
+                return retrieve_context(context, query, 'focused', prefer_cursor=False)
             return unavailable("This document is too large to review in full in one request. Send a smaller document or section; no document analysis was run.")
         blocks, at = [], 1 if text.startswith('\ufeff') else 0
         for block in parse(text[at:]):

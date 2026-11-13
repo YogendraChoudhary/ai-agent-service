@@ -11,6 +11,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from .document_edit.blocks import DocumentBlock, document_blocks, utf16_length
+from .longform.markdown_ast import is_front_matter
 
 
 class DraftPlacement(BaseModel):
@@ -299,7 +300,12 @@ def resolve_placement(text: str, task: str, focus: Optional[int] = None) -> tupl
             scope = _CLAUSE_END.sub("", (edge.group(3) or "").strip())
             scope = re.sub(r"\s+" + _STRUCTURE + r"$", "", scope, flags=re.I)
             if not scope or re.fullmatch(r"(?:\w+\s+)?" + _DOCUMENT, scope, re.I):
-                return (doc.placement(doc.blocks[-1], "after") if at_end else doc.placement(doc.blocks[0], "before")), None
+                if at_end:
+                    return doc.placement(doc.blocks[-1], "after"), None
+                # Front matter has to stay the first thing in the file, so "the top" is just below it.
+                if is_front_matter(doc.blocks[0].text):
+                    return (doc.placement(doc.blocks[1], "before") if len(doc.blocks) > 1 else doc.placement(doc.blocks[0], "after")), None
+                return doc.placement(doc.blocks[0], "before"), None
             if doc.headings(scope) or re.search(_STRUCTURE, edge.group(3) or "", re.I):
                 heading = doc.heading(scope)
                 return doc.placement(doc.section_end(heading) if at_end else heading, "after"), None

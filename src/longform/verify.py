@@ -12,7 +12,10 @@ docs/rich_content_engine_plan.md). Nothing here calls a model.
   paragraphs  `grammar`: the same count; the other operations: within 25%
   order       the headings, lists and runs of paragraphs come in the same sequence (no lead-in paragraph under a heading)
   structure   no table, quote, image, code or HTML appeared or went missing
-  length      words within the operation's ratio window
+  tables      a table the model works on keeps its columns and rows; its separator row is put back as written
+  numbers     (shorten, lengthen) no figure that the passage does not have
+  translated  (translate) no more than 15% of the passage's lines come back word for word: a passage left in the source language
+  length      words within the operation's ratio window (a wider one when the answer crosses between Han/Kana/Thai and another script)
 """
 
 from __future__ import annotations
@@ -20,10 +23,11 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .chunk import Chunk, analyse
-from .freeze import BLOCK_TOKEN_LINE, stray_link_marks, token_list
+from .freeze import BLOCK_TOKEN_LINE, stray_link_marks, strip_tokens, token_list
+from .markdown_ast import parse, script_share, table_shape, word_count
 
 PARAGRAPH_TOLERANCE = 0.25
 MIN_WORD_SLACK = 5                       # a short passage may move a few words whatever the ratio says
@@ -117,6 +121,66 @@ def snap_blocks(core: str, chunk: Chunk) -> str:
     return "\n".join(out)
 
 
+def snap_tables(core: str, chunk: Chunk) -> str:
+    """
+    A table the model translated keeps the separator row it was given, `|:---|---:|` with its alignment colons: a model that
+    redraws it would change the table's alignment without changing its shape. Lossless: only that one line moves, and only for a
+    table whose shape (columns and rows) is the same as the passage's.
+    """
+    if not chunk.structure.tables:                       # no table in view (every operation but translate): nothing to snap, nothing to parse
+        return core
+    want = [b for b in parse(chunk.frozen) if b.kind == "table"]
+    blocks = parse(core)
+    got = [(i, b) for i, b in enumerate(blocks) if b.kind == "table"]
+    if len(got) != len(want):
+        return core
+    texts = [b.text for b in blocks]
+    for (i, block), original in zip(got, want):
+        if table_shape(block) != table_shape(original):
+            continue
+        mine, theirs = block.text.splitlines(keepends=True), original.text.splitlines(keepends=True)
+        if len(mine) >= 2 and len(theirs) >= 2:
+            mine[1] = theirs[1].rstrip("\r\n") + mine[1][len(mine[1].rstrip("\r\n")):]
+            texts[i] = "".join(mine)
+    return "".join(texts)
+
+
+_NUMBER = re.compile(r"\d[\d.,]*\d|\d")
+
+
+def figures(text: str) -> set:
+    """The numbers in `text` as digit strings (1,000 and 1000 are the same figure), tokens and link references left out."""
+    return {re.sub(r"\D", "", n) for n in _NUMBER.findall(strip_tokens(text))}
+
+
+UNTRANSLATED_SHARE = 0.15                # more of the lines unchanged than this and the passage was not translated (correct: 0%; skipped: 22-100%)
+UNTRANSLATED_MIN_LINES = 4               # a shorter passage has too few lines to judge
+_LINE_MARKS = re.compile(r"[|>#*_`]|^\s*(?:[-+]|\d+[.)])\s+")
+
+
+def _prose_lines(text: str) -> List[Tuple[str, str]]:
+    """(flattened, as written) for each line of `text` that carries words to translate (two or more): markers, tokens, case and spacing left out."""
+    lines = []
+    for line in strip_tokens(text).splitlines():
+        flat = " ".join(_LINE_MARKS.sub(" ", line).split()).lower()
+        if word_count(flat) >= 2:
+            lines.append((flat, " ".join(line.split())))
+    return lines
+
+
+def unchanged_lines(passage: str, answer: str) -> Tuple[int, int]:
+    """(lines of the passage that the answer repeats word for word, lines of the passage that have words): 0 changed is a skipped passage."""
+    want = _prose_lines(passage)
+    kept = {flat for flat, _ in _prose_lines(answer)}
+    return sum(1 for flat, _ in want if flat in kept), len(want)
+
+
+def unchanged_examples(passage: str, answer: str, limit: int = 4) -> List[str]:
+    """The first `limit` lines of the passage that the answer repeats word for word, as they were written (cut at 90 characters)."""
+    kept = {flat for flat, _ in _prose_lines(answer)}
+    return [(shown if len(shown) <= 90 else shown[:87] + "...") for flat, shown in _prose_lines(passage) if flat in kept][:limit]
+
+
 def _diff(want: Sequence[str], got: Sequence[str]) -> Tuple[List[str], List[str]]:
     missing = list((Counter(want) - Counter(got)).elements())
     extra = list((Counter(got) - Counter(want)).elements())
@@ -131,12 +195,15 @@ def _names(tokens: Sequence[str]) -> str:
     return ", ".join(tokens[:6]) + (f" and {len(tokens) - 6} more" if len(tokens) > 6 else "")
 
 
-def verify(chunk: Chunk, output: str, *, ratio: Tuple[float, float] = (0.85, 1.25), paragraphs: str = "within") -> Verdict:
+def verify(chunk: Chunk, output: str, *, ratio: Tuple[float, float] = (0.85, 1.25), paragraphs: str = "within",
+           numbers: bool = False, wide_ratio: Optional[Tuple[float, float]] = None, must_change: bool = False) -> Verdict:
     """
     Check `output` (the model's answer for `chunk`) against the chunk. `paragraphs` is "equal" (grammar: the same count) or
-    "within" (the others: within 25%). The returned text is the answer with wrappers removed and the chunk's own edges.
+    "within" (the others: within 25%). `numbers` forbids a figure the passage does not have. `wide_ratio` replaces `ratio` when the
+    answer is in a different script family from the passage (Han/Kana/Thai against the rest). `must_change` (translate) refuses an answer
+    that repeats most of the passage's lines word for word. The returned text is the answer with wrappers removed and the chunk's own edges.
     """
-    text = with_edges(snap_blocks(unwrap(output, chunk.frozen), chunk), chunk)
+    text = with_edges(snap_tables(snap_blocks(unwrap(output, chunk.frozen), chunk), chunk), chunk)
     want, issues = chunk.structure, []
 
     got_tokens = token_list(text)
@@ -186,8 +253,31 @@ def verify(chunk: Chunk, output: str, *, ratio: Tuple[float, float] = (0.85, 1.2
         issues.append(Issue("structure", "Blocks appeared or went missing (" + "; ".join(changes) + "). Do not create a table, "
                                          "quote, image or code block, and do not remove one."))
 
+    if want.tables and got.tables != want.tables:                # only where a table is in view: a table that appears from nowhere is the structure check's
+        issues.append(Issue("tables", f"A table changed shape: the passage has {len(want.tables)} table(s) with "
+                                      f"{[(t.header, len(t.rows)) for t in want.tables]} (columns, body rows), the answer {len(got.tables)} with "
+                                      f"{[(t.header, len(t.rows)) for t in got.tables]}. Keep every table's columns and rows, and its separator row."))
+    if numbers:
+        added = sorted(figures(text) - figures(chunk.frozen), key=lambda n: (len(n), n))
+        if added:
+            issues.append(Issue("numbers", f"The answer has figures that are not in the passage ({', '.join(added[:6])}). "
+                                           "Add no new numbers, dates or amounts."))
+
+    if must_change:
+        same, total = unchanged_lines(chunk.frozen, text)
+        if total >= UNTRANSLATED_MIN_LINES and same > UNTRANSLATED_SHARE * total:
+            shown = "; ".join(f'"{line}"' for line in unchanged_examples(chunk.frozen, text))
+            issues.append(Issue("untranslated", f"{same} of the passage's {total} lines are unchanged, so they were not translated (for example: "
+                                                f"{shown}). Translate every sentence, heading, list item, table cell, quote, caption and image alt "
+                                                "text into the target language; do not return any of them in the source language."))
+
     low, high = ratio
-    floor, ceiling = min(round(low * want.words), want.words - MIN_WORD_SLACK), max(round(high * want.words), want.words + MIN_WORD_SLACK)
+    if wide_ratio and abs(script_share(text) - script_share(chunk.frozen)) > 0.3:
+        low, high = wide_ratio
+    # A short passage may move a few words whatever the ratio says, but only in the direction its window allows: a window that lies
+    # below 1 (shorten) must not let the passage stay as long as it was, and one above 1 (lengthen) must not let it stay as short.
+    floor = round(low * want.words) if low > 1 else min(round(low * want.words), want.words - MIN_WORD_SLACK)
+    ceiling = round(high * want.words) if high < 1 else max(round(high * want.words), want.words + MIN_WORD_SLACK)
     if want.words and not floor <= got.words <= ceiling:
         issues.append(Issue("length", f"The answer has {got.words} words; the passage has {want.words} and the answer must have "
                                       f"between {floor} and {ceiling}. Return the whole passage, not a summary or an expansion."))

@@ -18,7 +18,8 @@ from tests.longform.fakes import FakeAgents, drop_a_token, polish
 from tests.longform.fixtures import FENCE, QUOTE, TABLE, acceptance_document, paragraph
 
 # What api.py builds for the single call, per agent type
-PREFIX = {"grammar": "Fix grammar: ", "simplify": "Simplify: ", "tone": "Change tone to calm: ", "enhance": "<instruction>sharper</instruction>\n<text>\n"}
+PREFIX = {"grammar": "Fix grammar: ", "simplify": "Simplify: ", "tone": "Change tone to calm: ", "enhance": "<instruction>sharper</instruction>\n<text>\n",
+          "translation": "Translate to Spanish: ", "make_longer": "Make longer: ", "make_shorter": "Make shorter: "}
 
 
 class RuntimeCase(unittest.TestCase):
@@ -110,11 +111,21 @@ class TestWhenThePipelineRuns(RuntimeCase):
 
     def test_the_other_agent_types_never_use_it(self):
         text = acceptance_document()
-        for agent in ("translation", "summarize", "make_longer", "make_shorter", "emojify", "completion", "table", "list"):
+        for agent in ("summarize", "emojify", "completion", "table", "list"):
             with self.subTest(agent=agent):
                 self.agents.created.clear()
                 list(tpa.process_user_query_stream("Do it: " + text, model_provider="openai", api_key="k",
                                                    force_agent_type=agent, user_text=text))
+                self.assertEqual(self.agents.agent_types(), [agent])
+
+    def test_translate_shorten_and_lengthen_use_it_too_and_a_short_plain_text_keeps_the_single_call(self):
+        for agent in ("translation", "make_shorter", "make_longer"):
+            with self.subTest(agent=agent):
+                self.agents.created.clear()
+                self.stream(agent=agent)
+                self.assertEqual(set(self.agents.agent_types()), {"longform_refiner"})
+                self.agents.created.clear()
+                self.stream(agent=agent, text="A short plain note about nothing in particular.")
                 self.assertEqual(self.agents.agent_types(), [agent])
 
     def test_the_first_chunk_is_small_by_default_and_the_setting_turns_that_off(self):
@@ -157,13 +168,24 @@ class TestWhatEveryModelCallGets(RuntimeCase):
         for agent in OPERATIONS:
             with self.subTest(operation=agent):
                 self.agents.created.clear()
-                tier = tpa.AGENT_CONFIGS[agent].get("use_advanced", True)
+                tier = OPERATIONS[agent].advanced if OPERATIONS[agent].advanced is not None else tpa.AGENT_CONFIGS[agent].get("use_advanced", True)
                 out = self.stream(agent=agent)
                 self.assertEqual({c[3]["plan"].advanced_model for c in self.agents.created}, {tier})
                 ids = ADVANCED_MODEL_IDS if tier else BASIC_MODEL_IDS
                 self.assertEqual(out[0], {"__model_used__": ("openai", ids["openai"])})
         self.assertTrue(tpa.AGENT_CONFIGS["enhance"].get("use_advanced", True))               # enhance stays on the advanced tier
         self.assertFalse(tpa.AGENT_CONFIGS["grammar"].get("use_advanced", True))
+
+    def test_a_tier_override_can_be_switched_off(self):
+        with patch.object(settings, "longform_tier_overrides", False):
+            self.agents.created.clear()
+            self.stream(agent="make_shorter")
+            self.assertEqual({c[3]["plan"].advanced_model for c in self.agents.created},
+                             {tpa.AGENT_CONFIGS["make_shorter"].get("use_advanced", True)})
+        self.agents.created.clear()
+        self.stream(agent="make_shorter")
+        self.assertEqual({c[3]["plan"].advanced_model for c in self.agents.created}, {True})       # on: advanced, although its single call is basic
+        self.assertFalse(tpa.AGENT_CONFIGS["make_shorter"].get("use_advanced", True))
 
     def test_each_call_carries_the_operations_prompt_temperature_and_a_budget(self):
         for agent, operation in OPERATIONS.items():
@@ -173,9 +195,11 @@ class TestWhatEveryModelCallGets(RuntimeCase):
                 for agent_type, provider, key, kw in self.agents.created:
                     self.assertEqual((agent_type, provider, key), ("longform_refiner", "openai", "user-key"))
                     self.assertEqual(kw["instructions"], system_prompt(agent))
-                    self.assertEqual(kw["temperature"], operation.temperature)
+                    # the operation's own temperature; a repair call (made when the first answer broke a rule) is always at 0
+                    self.assertIn(kw["temperature"], {operation.temperature, 0.0})
                     self.assertGreaterEqual(kw["max_tokens"], 1024)
                     self.assertFalse(kw["plan"].use_web)                         # no tools: the passage is the only input
+                self.assertIn(operation.temperature, {kw["temperature"] for *_, kw in self.agents.created})   # the first pass uses it
 
     def test_the_users_account_details_reach_the_model_call(self):
         self.stream(user_id="user-7", is_byok=True)

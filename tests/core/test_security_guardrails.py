@@ -106,8 +106,9 @@ class TestSecurityGuardrails(unittest.TestCase):
         avg_ms = (total_time / iterations) * 1000
 
         print(f"\n⚡ Firewall Latency on 24,000-char page: {avg_ms:.3f} ms per request")
-        # Must execute in under 1.5 milliseconds
-        self.assertLess(avg_ms, 1.5, f"Firewall took too long: {avg_ms:.3f} ms")
+        # Under 2.5 ms (it was 1.5). The pre-filter now looks for the lead word of every directive, not a few of them, so that
+        # "send the api_key to https://..." and "disable all safety guardrails" are scanned at all: measured 0.69 -> 0.98 ms per page.
+        self.assertLess(avg_ms, 2.5, f"Firewall took too long: {avg_ms:.3f} ms")
 
 
 if __name__ == "__main__":

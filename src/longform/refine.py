@@ -28,7 +28,7 @@ from src.observability import trace_mark, trace_set
 from .chunk import Chunk, chunk_blocks
 from .freeze import collides, freeze_blocks, thaw
 from .llm import LLM, CallSpec
-from .markdown_ast import looks_like_html, normalise, parse, restyle, word_count
+from .markdown_ast import looks_like_html, normalise, parse, restyle, scan, word_count
 from .ordered_stream import run_ordered
 from .prompts import Operation, ratio_window, system_prompt, user_message
 from .verify import Issue, repair_message, verify
@@ -73,12 +73,18 @@ def qualifies(text: Optional[str], min_words: int = 600) -> bool:
         return False
     if word_count(body) >= min_words:
         return True
-    return any(b.kind in STRUCTURE_KINDS or b.images for b in parse(body))
+    if any(b.kind in STRUCTURE_KINDS or b.images or b.flavor for b in parse(body)):
+        return True
+    return bool(set(scan(body).features) - {"emoji_codes"})            # math, task boxes, wikilinks...: markup a model must not "fix"
 
 
-def chunk_max_tokens(chunk: Chunk) -> int:
-    """D15: the answer is the passage again, so 1.6 x its estimated tokens (never below 1,024)."""
-    return max(1024, int(1.6 * len(chunk.frozen) / 3.5))
+def chunk_max_tokens(chunk: Chunk, operation: Optional[Operation] = None) -> int:
+    """
+    D15: the answer is the passage again, so 1.6 x its estimated tokens (never below 1,024). A translation needs more (the same
+    sentence takes two to four times the tokens in Hindi, Thai or Japanese than in English) and an expansion needs more.
+    """
+    factor = operation.output_factor if operation is not None else 1.6
+    return max(1024, int(factor * len(chunk.frozen) / 3.5))
 
 
 def refine_chunk(llm: LLM, operation: Operation, instruction: Optional[str], chunk: Chunk, config: RefineConfig,
@@ -91,10 +97,12 @@ def refine_chunk(llm: LLM, operation: Operation, instruction: Optional[str], chu
 
     system = system_prompt(operation.name)
     messages = [{"role": "user", "content": user_message(operation, instruction, chunk)}]
-    unit, tokens = f"c{chunk.index + 1}", chunk_max_tokens(chunk)
+    unit, tokens = f"c{chunk.index + 1}", chunk_max_tokens(chunk, operation)
     ratio = ratio_window(operation, config.word_ratio)
     reply = llm(system, messages, CallSpec("chunk", operation.temperature, tokens, unit=unit))
-    verdict = verify(chunk, reply, ratio=ratio, paragraphs=operation.paragraphs)
+    check = dict(ratio=ratio, paragraphs=operation.paragraphs, numbers=operation.no_new_numbers, wide_ratio=operation.wide_ratio,
+                 must_change=operation.must_change)
+    verdict = verify(chunk, reply, **check)
     first_issues = [i.kind for i in verdict.issues]
 
     repaired = False
@@ -102,8 +110,7 @@ def refine_chunk(llm: LLM, operation: Operation, instruction: Optional[str], chu
         logger.info(f"[{request_id}] {unit} needs repair: {first_issues}")
         logger.debug(f"[{request_id}] {unit} first answer ({len(reply.split())} words, the passage has {words_in}): {reply[:300]!r}")
         messages += [{"role": "assistant", "content": reply}, {"role": "user", "content": repair_message(verdict.issues)}]
-        verdict = verify(chunk, llm(system, messages, CallSpec("chunk_repair", 0.0, tokens, unit=unit)), ratio=ratio,
-                         paragraphs=operation.paragraphs)
+        verdict = verify(chunk, llm(system, messages, CallSpec("chunk_repair", 0.0, tokens, unit=unit)), **check)
         repaired = True
     seconds = round(time.perf_counter() - started, 2)
     if verdict.issues:
@@ -126,7 +133,7 @@ def refine_stream(text: str, instruction: Optional[str], operation: Operation, l
     config = config or RefineConfig()
     started = time.perf_counter()
     body, style = normalise(text)
-    frozen, vault = freeze_blocks(parse(body), freeze_quotes=config.freeze_quotes)
+    frozen, vault = freeze_blocks(parse(body), freeze_quotes=config.freeze_quotes, expose=operation.expose)
     chunks = chunk_blocks(frozen, config.chunk_words, config.first_chunk_words)
     trace_set(request_id, mode="longform")
     trace_mark(request_id, "refine_planned")

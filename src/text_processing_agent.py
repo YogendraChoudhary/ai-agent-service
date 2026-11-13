@@ -29,6 +29,7 @@ from .models import (
     openai_reasoning_family,
 )
 from .autocomplete_join import apply_join_tag, fix_join, is_commentary
+from .net_safety import is_public_ip
 from .security_guardrails import sanitize_web_content
 from .observability import trace_mark, trace_set
 from .document_context import PreparedContext, OUTPUT_TOKENS
@@ -637,7 +638,7 @@ def _resolve_public_addresses(hostname: str) -> tuple[str, ...]:
         except ValueError:
             addresses = []
             break
-        if not ip.is_global:
+        if not is_public_ip(ip):                      # stricter than ip.is_global: NAT64/6to4/Teredo forms of private addresses, multicast
             addresses = []
             break
         if addr not in addresses:
@@ -1492,7 +1493,10 @@ REFINE_LENGTH_RULES = {
     "tone": "Keep the length about the same (within 15%).",
     "simplify": "The text may become somewhat shorter, but every point stays: simplify, do not summarise.",
 }
-REFINEMENT_AGENTS = tuple(REFINE_LENGTH_RULES)
+REFINEMENT_AGENTS = tuple(REFINE_LENGTH_RULES)       # the agents whose single call has an output budget (refinement_max_tokens)
+# Every agent that may take the long-document path (src/longform). Translate, shorten and lengthen join the four above; their single
+# calls keep their provider default budget, exactly as before.
+PIPELINE_AGENTS = REFINEMENT_AGENTS + ("translation", "make_shorter", "make_longer")
 
 
 @lru_cache(maxsize=1)
@@ -2670,7 +2674,7 @@ def process_user_query_stream(
                 user_text, candidates=candidates, key_for=key_for,
                 is_byok=is_byok, user_id=user_id, request_id=request_id, cancel_event=cancel_event)
 
-    if (agent_type in REFINEMENT_AGENTS and user_text is not None and settings.longform_refine_enabled and not image_urls):
+    if (agent_type in PIPELINE_AGENTS and user_text is not None and settings.longform_refine_enabled and not image_urls):
         longform = _longform()
         if longform is not None and longform[0](user_text, settings.longform_refine_min_words):
             # A long or structured document: frozen, chunked, refined in parallel and verified in code, instead of one call

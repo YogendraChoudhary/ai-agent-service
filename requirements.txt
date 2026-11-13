@@ -47,3 +47,9 @@ google-genai          # Google GenAI SDK — used for Gemini autocomplete and im
 faster-whisper
 python-multipart  # POST /v1/voice/dictate takes the recording as multipart/form-data (FastAPI refuses to start the route without it)
 Pillow                # Image processing, dimension sniffing, and format conversion
+
+# Document import (src/document_import): DOCX, PDF and web pages to Markdown. Both are pure Python (no compiled code) and permissively
+# licensed; PyMuPDF is faster but AGPL, so it is not used. lxml is also pulled in by ddgs.
+lxml
+mammoth==1.13.0            # DOCX -> HTML (BSD-2-Clause)
+pdfminer.six==20260107     # PDF text and layout (MIT)

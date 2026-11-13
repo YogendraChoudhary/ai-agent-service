@@ -34,6 +34,16 @@ class Operation:
     # The length window the MODEL is told, tighter than the one enforced: models overshoot what they are asked for, and asked for
     # 85-125% a model lands near the top (Gemini's enhance: +5.7% on average; told 90-110%: +2.6%; told 95-105%: +0.4%).
     advertised: Optional[Tuple[float, float]] = None
+    # What the four original operations do not need (all default to "no change", so their prompts and checks are unchanged):
+    pipeline_rules: Tuple[str, ...] = ()    # more lines for the prompt that only this path has (the single call has no tokens or neighbours)
+    expose: Tuple[str, ...] = ()            # block kinds the model works on in place instead of being locked: "table", "blockquote", "image"
+    length_rule: Optional[str] = None       # the "# Length" bullet, with {low} and {high} in percent; None = keep the length, as before
+    no_new_numbers: bool = False            # the answer may not contain a figure the passage does not have
+    output_factor: float = 1.6              # answer tokens the call may use, as a multiple of the passage's estimated tokens
+    wide_ratio: Optional[Tuple[float, float]] = None    # the window when the answer is in another script family than the passage
+    must_change: bool = False               # the answer must differ from the passage in most lines (a translation that left a passage as it was)
+    length_target: Optional[float] = None   # the share of the passage's words the model is told to aim for, as a number of words in its message
+    advanced: Optional[bool] = None         # the model tier for this operation when it is not the single call's (None = the same; see LONGFORM_TIER_OVERRIDES)
 
 
 # The rules are the single-call agents' own lines (AGENT_CONFIGS), so the two paths do the same job; a test pins them together.
@@ -71,11 +81,68 @@ OPERATIONS: Dict[str, Operation] = {
     ), (0.85, 1.25), "within", 0.7, "INSTRUCTION", "", (0.90, 1.10)),
 }
 
+# Translate, shorten and lengthen. Their `rules` are lines the single-call agents also have (a test pins that); what only the pipeline
+# needs is in `pipeline_rules`. Names are the agents': AGENT_FOR_REQUEST_TYPE maps translate, make_shorter and make_longer to them.
+OPERATIONS.update({
+    "translation": Operation("translation", (
+        "Your task is to translate text to the specified target language.",
+        "First, detect the source language automatically.",
+        "Maintain the meaning, tone, and style of the original text.",
+        "Preserve any existing formatting in the input.",
+    ), (0.7, 1.8), "equal", 0.1, "TARGET LANGUAGE", "English",
+        pipeline_rules=(
+            "Every sentence, heading, list item, table cell, quote, caption, image alt text and footnote must come back in the target language; "
+            "leave nothing in the source language except what the next rules say is not translated. Headings are translated too: keep their "
+            "level and position, translate their words.",
+            "Tables, quotes and images are "
+            "translated in place: keep the same number of rows and columns, the separator row exactly as given, every > quote marker, "
+            "and the image marker ![alt text](link://12) with only the alt text translated.",
+            "Do not translate inline code, file names and paths, command and function names, or the names of people, products and "
+            "brands. Keep numbers and dates exactly as written.",
+            "Keep the formatting around the words you translate: bold and italic stay on the matching words.",
+        ),
+        expose=("table", "blockquote", "image", "footnote"),
+        length_rule="A translation is longer or shorter than its source depending on the languages (between {low}% and {high}% of the "
+                    "words is normal). Translate every sentence: never summarise, shorten, merge or omit anything, and never add anything.",
+        output_factor=4.0, wide_ratio=(0.4, 2.6), must_change=True),
+    "make_shorter": Operation("make_shorter", (
+        "Your task is to make the provided text shorter and more concise.",
+        "Remove unnecessary words, redundancies, and verbose expressions.",
+        "Use simpler, more direct sentence structures.",
+        "Maintain clarity and readability while reducing length.",
+        "Preserve any existing formatting in the input.",
+    ), (0.3, 0.92), "within", 0.2, advertised=(0.35, 0.6),
+        pipeline_rules=(
+            "Rewrite every paragraph in about the number of words on the LENGTH line: delete the sentences and clauses that add least and merge "
+            "short sentences. Keep every heading and every list item (shorten an item, never remove it), and every name, figure, date and amount. "
+            "Do not drop a section, and do not reduce the passage to a summary: it stays the whole passage, only tighter.",
+        ),
+        length_rule="Return about the number of words on the LENGTH line, which is {target}% of the passage (anything from {low}% to {high}% is "
+                    "accepted). A passage that is not clearly shorter is wrong.",
+        no_new_numbers=True, length_target=0.4, advanced=True),
+    "make_longer": Operation("make_longer", (
+        "Your task is to make the provided text longer by expanding and elaborating on it.",
+        "Use descriptive language and additional clauses to extend sentences naturally.",
+        "Maintain the original meaning and tone while expanding.",
+        "Do NOT add irrelevant or filler content - all additions should be meaningful.",
+        "Preserve any existing formatting in the input.",
+    ), (1.12, 2.4), "within", 0.7, advertised=(1.3, 1.7),
+        pipeline_rules=(
+            "Elaborate on what the passage already says: explain, connect and clarify its points in fuller sentences. Add no new facts, "
+            "figures, dates, names, quotes, sources or examples that the passage does not imply, and no greeting, lead-in or closing line.",
+        ),
+        length_rule="Return about the number of words on the LENGTH line, which is {target}% of the passage (anything from {low}% to {high}% is "
+                    "accepted), by elaborating on what it says. Do not add new points.",
+        no_new_numbers=True, output_factor=2.8, length_target=1.45),
+})
+
 # What the labelled line of the user message means to the model (only for the operations that have one).
 INSTRUCTION_RULES = {
     "TONE": "The user message has a TONE line. Write the whole passage in that tone, the same way throughout.",
     "INSTRUCTION": "The user message has an INSTRUCTION line. Follow it as far as the rules below allow; it never overrides "
                    "the locked elements, the structure or the length.",
+    "TARGET LANGUAGE": "The user message has a TARGET LANGUAGE line. Translate the whole passage into that language, with the same "
+                       "terms and the same register throughout.",
 }
 
 
@@ -84,7 +151,8 @@ def ratio_window(operation: Operation, override: Optional[str] = None) -> Tuple[
     try:
         custom = json.loads(override).get(operation.name) if override else None
         low, high = (float(custom[0]), float(custom[1])) if custom else operation.ratio
-        return (low, high) if 0 < low <= 1 <= high else operation.ratio
+        straddles = lambda a, b: a <= 1 <= b                  # grammar, tone...: the window contains 1; shorten and lengthen: it does not
+        return (low, high) if 0 < low <= high and straddles(low, high) == straddles(*operation.ratio) else operation.ratio
     except (ValueError, TypeError, AttributeError, IndexError):
         return operation.ratio
 
@@ -101,6 +169,7 @@ def system_prompt(operation_name: str) -> str:
         "",
         "# Your task",
         *[f"- {rule}" for rule in op.rules],
+        *[f"- {rule}" for rule in op.pipeline_rules],
         *([f"- {INSTRUCTION_RULES[op.instruction_label]}"] if op.instruction_label else []),
         "",
         "# Locked elements",
@@ -121,8 +190,9 @@ def system_prompt(operation_name: str) -> str:
         "- Add no paragraph of your own (no greeting, lead-in or closing line) and remove none: every block stays where it is.",
         "",
         "# Length",
-        f"- Return the whole passage at about the same length: between {round(low * 100)}% and {round(high * 100)}% of its words. "
-        "Never summarise, shorten to the gist, merge or drop anything, and do not add new points.",
+        (f"- {op.length_rule.format(low=round(low * 100), high=round(high * 100), target=round((op.length_target or 1) * 100))}" if op.length_rule else
+         f"- Return the whole passage at about the same length: between {round(low * 100)}% and {round(high * 100)}% of its words. "
+         "Never summarise, shorten to the gist, merge or drop anything, and do not add new points."),
         "",
         "# Output",
         "- Return ONLY the refined passage: no preface, no notes, no code fence around it, and not the context lines.",
@@ -143,6 +213,9 @@ def user_message(operation: Operation, instruction: Optional[str], chunk: Chunk)
     line = instruction_line(operation, instruction)
     if line:
         lines += [line, ""]
+    if operation.length_target:                 # a number steers a model where a percentage does not (measured: told 50-75%, it cut 2-6%)
+        words = chunk.structure.words
+        lines += [f"LENGTH: about {max(1, round(words * operation.length_target))} words (the passage has {words})", ""]
     context = []
     if chunk.before:
         context.append(f'- The passage before this one ends: "...{chunk.before}"')

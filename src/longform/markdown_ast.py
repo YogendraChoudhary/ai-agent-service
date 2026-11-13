@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import dataclass
+from bisect import bisect_right
+from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple
 
 from markdown_it import MarkdownIt
@@ -44,6 +45,14 @@ def _parser() -> MarkdownIt:
     return md
 
 
+def _block_parser() -> MarkdownIt:
+    # _parser() without the inline pass (see heading_lines).
+    md = getattr(_local, "block_md", None)
+    if md is None:
+        md = _local.block_md = MarkdownIt("commonmark").enable("table").disable("inline")
+    return md
+
+
 @dataclass(frozen=True)
 class Block:
     kind: str
@@ -56,6 +65,177 @@ class Block:
     items: int = 0                  # list: top-level items
     ordered: bool = False           # list: numbered
     depths: Tuple[int, ...] = ()    # list: nesting depth of every item, in order
+    flavor: str = ""                # kind "other" only: what a dialect block is ("front_matter", "math", "footnote"), see _dialect_regions
+
+
+# ---------------------------------------------------------------------------
+# Dialects beyond CommonMark + tables
+#
+# YAML front matter, display math and footnote definitions are not CommonMark: markdown-it reads front matter as a thematic break
+# plus a setext heading, and math and footnote text as ordinary paragraphs. Left alone, a model could "fix" the grammar of a
+# YAML title or an equation, and the upload would list "title: My Post" as a heading. So they are found here, in code, before
+# markdown-it runs, and come back as kind "other": the kind freeze already makes opaque (link reference definitions use it) and
+# Edit never touches. Their lines are blanked for markdown-it so every line number stays the same.
+#
+# The inline constructs (math, wikilinks, footnote references, ~~strikethrough~~, :emoji: codes, task-list boxes) are matched by
+# the patterns below; freeze.py swaps each for an opaque token. Every repetition is bounded so a crafted line cannot make a
+# scan quadratic.
+# ---------------------------------------------------------------------------
+
+FRONT_MATTER_MAX_LINES = 300
+MATH_BLOCK_MAX_LINES = 200
+
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_FM_YAML_KEY = re.compile(r"""^(?:["'][^"'\n]{1,80}["']|[\w][^:\n]{0,80}?)\s*:(?:\s|$)""")
+_FM_TOML_LINE = re.compile(r"""^(?:[\w."'\-]{1,80}\s*=|\[{1,2}[^\]\n]{1,80}\]{1,2}\s*$)""")
+_FOOTNOTE_DEF = re.compile(r"^ {0,3}\[\^[^\]\s]{1,60}\]:")
+
+INLINE_DIALECT_PATTERNS = {
+    "math": r"\$\$[^$\n]{1,200}?\$\$|(?<![\\$\w])\$(?![\s$])[^$\n]{1,200}?(?<![\s\\])\$(?![\w$])",
+    "wikilink": r"!?\[\[(?!(?:TABLE|QUOTE|IMAGE|CODE|HTML|URL)_\d+\]\])[^\[\]\n]{1,200}\]\]",
+    "footnote_ref": r"\[\^[^\]\s]{1,60}\](?!:)",
+    "strikethrough": r"(?<![~\\])~~(?![\s~])[^~\n]{1,300}?(?<![\s~])~~(?!~)",
+    "emoji_code": r"(?<![\w:]):[a-z][a-z0-9_+\-]{1,40}:(?![\w:])",
+    "attributes": r"\{(?:#[\w][\w\-:.]{0,59}|\.[A-Za-z_][\w\-:.]{0,59})(?:[ \t]+(?:#|\.)?[A-Za-z_][\w\-:.]{0,59}(?:=[^\s}]{1,60})?){0,8}\}",      # {#id .class key=value}
+}
+# "> [!NOTE]" (a GitHub alert): the keyword is a code word, not wording, so it must not be translated or reworded.
+ALERT_MARKER = re.compile(r"^((?:>[ \t]*)+)(\[![A-Za-z]{2,20}\])", re.M)
+# "[^1]:" at the start of a footnote definition: the label is a code word, the text after it is prose (a translation translates it).
+FOOTNOTE_LABEL = re.compile(r"^(\[\^[^\]\s]{1,60}\]:)", re.M)
+TASK_MARKER = re.compile(r"^([ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+)(\[[ xX]\])(?=[ \t]|$)", re.M)
+_TASK_CONTENT = re.compile(r"^\[[ xX]\](?=[ \t]|$)")
+_INLINE_FEATURE = {"math": "math", "wikilink": "wikilinks", "footnote_ref": "footnotes", "strikethrough": "strikethrough",
+                   "emoji_code": "emoji_codes", "attributes": "attributes"}
+_INLINE_RE = {name: re.compile(p) for name, p in INLINE_DIALECT_PATTERNS.items()}
+FEATURE_ORDER = ("front_matter", "math", "footnotes", "task_list", "wikilinks", "strikethrough", "attributes", "emoji_codes")
+_FLAVOR_FEATURE = {"front_matter": "front_matter", "math": "math", "footnote": "footnotes"}
+
+
+def _front_matter_end(lines: Sequence[str]) -> Optional[int]:
+    """One past the closing delimiter when the document opens with YAML (---) or TOML (+++) front matter, else None."""
+    if not lines:
+        return None
+    opener = lines[0].rstrip()
+    if opener == "---":
+        closers, content = ("---", "..."), _FM_YAML_KEY
+    elif opener == "+++":
+        closers, content = ("+++",), _FM_TOML_LINE
+    else:
+        return None
+    seen_entry = False
+    for i in range(1, min(len(lines), FRONT_MATTER_MAX_LINES)):
+        line = lines[i].rstrip("\r\n")
+        if line.rstrip() in closers:
+            return i + 1 if seen_entry else None            # "---" twice with nothing between is two rules, not front matter
+        if not line.strip() or line[0] in " \t" or line.lstrip().startswith("#"):
+            continue                                        # blank, nested/continued, or a comment
+        if opener == "---" and line.startswith("- "):
+            continue                                        # a top-level list
+        if content.match(line):
+            seen_entry = True
+            continue
+        return None                                         # prose, not metadata: the opening "---" was a thematic break
+    return None
+
+
+def is_front_matter(block_text: str) -> bool:
+    """True when `block_text` is exactly a front matter block (what parse() returns as kind "other", flavor "front_matter")."""
+    lines = _lines(block_text or "")
+    return bool(lines) and _front_matter_end(lines) == len(lines)
+
+
+def _math_block_end(lines: Sequence[str], i: int) -> Optional[int]:
+    """One past the last line of the display-math block that opens on lines[i] (`$$ ... $$` or `\\[ ... \\]`), else None."""
+    first = lines[i].strip()
+    if first.startswith("$$"):
+        rest = first[2:]
+        if rest.endswith("$$"):
+            return i + 1 if rest.count("$$") == 1 else None  # one line: $$ E = mc^2 $$
+        if "$$" in rest:
+            return None
+        for j in range(i + 1, min(len(lines), i + 1 + MATH_BLOCK_MAX_LINES)):
+            if lines[j].rstrip().endswith("$$"):
+                return j + 1
+        return None
+    if first == "\\[":
+        for j in range(i + 1, min(len(lines), i + 1 + MATH_BLOCK_MAX_LINES)):
+            if lines[j].strip() == "\\]":
+                return j + 1
+    return None
+
+
+def _footnote_end(lines: Sequence[str], i: int) -> int:
+    """One past the last line of the footnote definition on lines[i]: its indented continuation lines, blank ones included."""
+    end, j = i + 1, i + 1
+    while j < len(lines):
+        line = lines[j]
+        if line.strip() and (line.startswith("  ") or line.startswith("\t")):
+            end = j = j + 1
+        elif not line.strip():
+            j += 1                                          # a blank line belongs to the footnote only if an indented line follows
+        else:
+            break
+    return end
+
+
+def _dialect_regions(lines: Sequence[str]) -> List[Tuple[int, int, str]]:
+    """(first line, one past the last, flavor) of each top-level front matter, display math block and footnote definition."""
+    regions: List[Tuple[int, int, str]] = []
+    i, n = 0, len(lines)
+    fm_end = _front_matter_end(lines)
+    if fm_end:
+        regions.append((0, fm_end, "front_matter"))
+        i = fm_end
+    fence: Optional[Tuple[str, int]] = None
+    while i < n:
+        line = lines[i]
+        if fence is not None:
+            m = _FENCE_OPEN.match(line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not line.strip(" \t\r\n`~"):
+                fence = None
+            i += 1
+            continue
+        m = _FENCE_OPEN.match(line)
+        if m:
+            fence = (m.group(1)[0], len(m.group(1)))
+            i += 1
+            continue
+        if line.strip() and not line.startswith("\t") and len(line) - len(line.lstrip(" ")) < 4:
+            end = _math_block_end(lines, i) if line.lstrip().startswith(("$$", "\\[")) else None
+            flavor = "math"
+            if end is None and _FOOTNOTE_DEF.match(line):
+                end, flavor = _footnote_end(lines, i), "footnote"
+            if end is not None:
+                regions.append((i, end, flavor))
+                i = end
+                continue
+        i += 1
+    return regions
+
+
+def _clip(span: Block, regions: Sequence[Tuple[int, int, str]], starts: Sequence[int], lines: Sequence[str],
+          masked: "set[int]") -> Block:
+    """
+    markdown-it ends a list (or any block that runs to the end of the document) after the last blank line, and a masked dialect
+    block looks blank to it, so the span can swallow a region that follows it. Cut such a span back to where its real content ends.
+    A region with real content after it inside the same span (display math between two list items) is left to the overlap rule.
+    """
+    i = bisect_right(starts, span.start)
+    while i < len(regions) and regions[i][0] < span.end:
+        first = regions[i][0]
+        if all(k in masked or not lines[k].strip() for k in range(first, span.end)):
+            return replace(span, end=first, text="".join(lines[span.start:first]))
+        i += 1
+    return span
+
+
+def _masked(lines: Sequence[str], regions: Sequence[Tuple[int, int, str]]) -> str:
+    """The document with every dialect line blank, for markdown-it: line numbers do not move."""
+    out = list(lines)
+    for first, end, _ in regions:
+        for k in range(first, end):
+            out[k] = "\n" if lines[k].endswith(("\n", "\r")) else ""
+    return "".join(out)
 
 
 @dataclass(frozen=True)
@@ -69,9 +249,36 @@ class TableShape:
         return all(n == self.header for n in (self.delimiter, *self.rows))
 
 
+_CJK_CHAR = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]")       # Hiragana, Katakana, Han
+_THAI_CHAR = re.compile("[\u0e00-\u0e7f]")
+
+
+def script_share(text: Optional[str]) -> float:
+    """The share of letters written in Han, Kana or Thai (0.0 for most text): a translation that crosses it changes length a lot."""
+    text = text or ""
+    cjk_or_thai = len(_CJK_CHAR.findall(text)) + len(_THAI_CHAR.findall(text))
+    return cjk_or_thai / max(1, len(re.findall(r"[^\W\d_]", text))) if cjk_or_thai else 0.0
+
+
 def word_count(text: Optional[str]) -> int:
-    """Words in plain text; a hyphenated or apostrophised word counts once."""
-    return len(_WORD_RE.findall(text or ""))
+    """
+    Words in plain text; a hyphenated or apostrophised word counts once. Chinese, Japanese and Thai are written without spaces, so a
+    whole sentence would be one "word": there a Han, Kana or Thai character counts as about 0.55 (Chinese, Japanese) or a quarter
+    (Thai) of a word. That keeps chunk sizes and length windows meaningful when a document is translated into or out of those
+    languages. Text with none of those characters is counted exactly as before.
+    """
+    text = text or ""
+    found = _WORD_RE.findall(text)
+    if not (_CJK_CHAR.search(text) or _THAI_CHAR.search(text)):
+        return len(found)
+    total = 0
+    for word in found:
+        cjk, thai = len(_CJK_CHAR.findall(word)), len(_THAI_CHAR.findall(word))
+        if not cjk and not thai:
+            total += 1
+        else:
+            total += max(1, (cjk * 5 + 8) // 9 + (thai + 3) // 4 + (1 if len(word) > cjk + thai else 0))
+    return total
 
 
 def _lines(text: str) -> List[str]:
@@ -115,7 +322,8 @@ def parse(text: str) -> List[Block]:
     lines = _lines(text or "")
     if not lines:
         return []
-    tokens = _parser().parse(text)
+    regions = _dialect_regions(lines)
+    tokens = _parser().parse(_masked(lines, regions) if regions else text)
     spans: list[Block] = []
     i = 0
     while i < len(tokens):
@@ -129,6 +337,12 @@ def parse(text: str) -> List[Block]:
             group, i = [first], i + 1
         if first.map is not None and first.type in _KIND_OF_TOKEN:
             spans.append(_make_block(first, group, lines, first.map[0], min(first.map[1], len(lines))))
+    if regions:
+        starts = [r[0] for r in regions]
+        masked = {k for a, b, _ in regions for k in range(a, b)}
+        spans = [_clip(s, regions, starts, lines, masked) for s in spans]
+        spans.extend(Block("other", a, b, "".join(lines[a:b]), flavor=flavor) for a, b, flavor in regions)
+        spans.sort(key=lambda s: s.start)                 # a dialect block inside a list is dropped by the overlap rule below
 
     blocks: list[Block] = []
     cursor = 0
@@ -148,6 +362,54 @@ def parse(text: str) -> List[Block]:
     if join(blocks) != text:                          # never hand back something that is not the input
         return [Block("other", 0, len(lines), text)]
     return blocks
+
+
+def heading_lines(text: str) -> List[Tuple[int, str]]:
+    """
+    (level, first source line) of every top-level heading: the same as
+    [(b.level, b.text.splitlines()[0]) for b in parse(text) if b.kind == "heading"], found from block structure alone.
+
+    parse() also runs markdown-it's inline pass, which only feeds word and image counts and is most of its cost
+    (about 0.8 s for a crafted 100,000-character document of link brackets, against a few ms without it).
+    """
+    return scan(text).headings
+
+
+@dataclass(frozen=True)
+class Scan:
+    headings: List[Tuple[int, str]]         # (level, first source line) of every top-level heading
+    features: List[str]                     # the dialect features the document uses, in FEATURE_ORDER
+
+
+def scan(text: str) -> Scan:
+    """
+    Headings and dialect features in one block-structure pass (no inline pass, see heading_lines). The features are what
+    CommonMark alone does not know: front matter, math, footnotes, task lists, wikilinks, strikethrough and :emoji: codes. Code
+    fences are never searched, so `$x$` in a code sample is not math.
+    """
+    lines = _lines(text or "")
+    headings: List[Tuple[int, str]] = []
+    if not lines:
+        return Scan(headings, [])
+    regions = _dialect_regions(lines)
+    found = {_FLAVOR_FEATURE[flavor] for _, _, flavor in regions}
+    list_depth = 0
+    for tok in _block_parser().parse(_masked(lines, regions) if regions else text):
+        if tok.type == "heading_open" and tok.level == 0 and tok.map is not None:
+            start, end = tok.map[0], min(tok.map[1], len(lines))
+            if end > start:
+                headings.append((int(tok.tag[1]), "".join(lines[start:end]).splitlines()[0]))
+        elif tok.type in ("bullet_list_open", "ordered_list_open"):
+            list_depth += 1
+        elif tok.type in ("bullet_list_close", "ordered_list_close"):
+            list_depth -= 1
+        elif tok.type == "inline" and tok.content:
+            for name, rx in _INLINE_RE.items():
+                if _INLINE_FEATURE[name] not in found and rx.search(tok.content):
+                    found.add(_INLINE_FEATURE[name])
+            if list_depth and "task_list" not in found and _TASK_CONTENT.match(tok.content):
+                found.add("task_list")
+    return Scan(headings, [f for f in FEATURE_ORDER if f in found])
 
 
 def join(blocks: Sequence[Block]) -> str:

@@ -10,6 +10,8 @@ from typing import Callable, Iterator, Optional, Sequence, Union
 
 from config import settings
 
+from src.task_router import Candidate
+
 from .llm import AgnoLLM
 from .prompts import OPERATIONS
 from .refine import RefineConfig, refine_stream
@@ -42,10 +44,13 @@ def stream_refine(
     The refinement pipeline for one request. `candidates` are the providers the single call would have tried (the operation's
     tier already applied); a chunk's call moves to the next one on the same retryable errors, exactly as the main loop does.
     """
+    operation = OPERATIONS[agent_type]
+    if operation.advanced is not None and settings.longform_tier_overrides:
+        candidates = [Candidate(c.provider, operation.advanced) for c in candidates]      # a failing provider still falls over to the next
     llm = AgnoLLM(candidates, key_for, request_id=request_id, user_id=user_id, is_byok=is_byok, agent_type="longform_refiner",
                   timeout=float(settings.longform_call_timeout_seconds) or None)
     reported = False
-    for chunk in refine_stream(text, instruction, OPERATIONS[agent_type], llm, refine_config(), request_id=request_id):
+    for chunk in refine_stream(text, instruction, operation, llm, refine_config(), request_id=request_id):
         if report_model and not reported and isinstance(chunk, str):
             reported = True
             model = llm.used or llm.drafting_model()               # the model that served the first chunk

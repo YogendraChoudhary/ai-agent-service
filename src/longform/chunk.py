@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from .freeze import BLOCK_TOKEN_LINE, FrozenBlock, own_line_tokens, strip_tokens, token_list, words_of
-from .markdown_ast import heading_levels, list_shape, parse
+from .markdown_ast import heading_levels, list_shape, parse, table_shape
 
 LOW, HIGH = 0.6, 1.4                # the chunk window around the target size, as a share of it
 TINY = 0.15                         # a last chunk under this share of the target joins the one before it if it fits
@@ -36,6 +36,7 @@ class Structure:
     kinds: Tuple[Tuple[str, int], ...]
     words: int
     sequence: Tuple[str, ...] = ()          # the block kinds in order (a locked block by its token), a run of paragraphs counting once
+    tables: Tuple[object, ...] = ()         # the shape of every table the model can see (an operation that works on tables in place)
 
 
 def collapse(kinds: Sequence[str]) -> Tuple[str, ...]:
@@ -62,7 +63,8 @@ def analyse(text: str) -> Structure:
     return Structure(headings=heading_levels(blocks), lists=list_shape(blocks),
                      paragraphs=sum(b.kind == "paragraph" for b in blocks),
                      kinds=tuple((k, n) for k, n in counts.items() if n), words=words_of(text),
-                     sequence=collapse([_kind(b) for b in blocks if b.kind != "blank"]))
+                     sequence=collapse([_kind(b) for b in blocks if b.kind != "blank"]),
+                     tables=tuple(shape for shape in (table_shape(b) for b in blocks if b.kind == "table") if shape is not None))
 
 
 @dataclass(frozen=True)

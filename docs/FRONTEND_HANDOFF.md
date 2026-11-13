@@ -674,7 +674,7 @@ Small, but not zero:
 
 ---
 
-## 6. Long-document refinement (`fix_grammar`, `simplify`, `change_tone`, `enhance_with_ai`)
+## 6. Long-document refinement (`fix_grammar`, `simplify`, `change_tone`, `enhance_with_ai`, `translate`, `make_shorter`, `make_longer`)
 
 On by default (`LONGFORM_REFINE_ENABLED`). Frontend work is small but easy to miss:
 
@@ -685,8 +685,23 @@ On by default (`LONGFORM_REFINE_ENABLED`). Frontend work is small but easy to mi
   Append each `content` chunk; nothing is ever retracted. Show progress from `refine_progress {chunk, of}`.
 * `done.warnings` may contain `{kind: "chunk_restored", chunk, detail}`: that passage was **kept exactly as the user wrote it**
   because the AI broke its structure. Show a non-blocking notice ("Passage 3 of 6 left unchanged").
-* Tables, quotes, images and code blocks are guaranteed untouched byte-for-byte.
-* Documents ≥ 600 words or containing a table/quote/image/code block qualify; short plain text still uses the fast single call.
+* Grammar, simplification, tone and enhancement preserve tables, images and code blocks. Quotes stay unchanged by default.
+* Documents qualify at 600 words by default or when they contain protected structure such as a table, quote, image, code block, or footnote. Short plain text uses a single call.
+* **`translate`, `make_shorter` and `make_longer` use the same pipeline** (same request, same stream events, same `warnings`; nothing to change in the client).
+  A short plain text still uses the single call. What each one does to the structure:
+
+  | | `translate` (`secondary_prompt` = target language, default English) | `make_shorter` | `make_longer` |
+  |---|---|---|---|
+  | Prose, headings, list items, link text | translated | shortened (every heading, list item and distinct point kept) | elaborated (no new facts) |
+  | Table cells, quote text, image captions and alt text | **translated in place** (columns, rows and the `|:--|--:|` separator row are checked and kept). Quotes containing code fences or tables stay unchanged. | untouched | untouched |
+  | Footnotes | Text is translated. Labels and references such as `[^1]` stay unchanged. | untouched | untouched |
+  | Code, URLs, emails, front matter, formulas, `[[wikilinks]]`, the `[!NOTE]` keyword, image and link addresses | untouched | untouched | untouched |
+  | Length accepted | 70-180% of the words (40-260% when the answer crosses between Chinese, Japanese or Thai and another script) | 30-92% (each passage is asked for about 40%; models deliver 65-85%) | 112-240% (each passage is asked for about 145%; models deliver 115-140%) |
+  | Figures | not checked | no figure the text does not already have | no figure the text does not already have |
+
+  `make_shorter` runs on the advanced-tier model (`LONGFORM_TIER_OVERRIDES`, on by default): measured on a real document, the basic tier shortened a passage by only 2-9% however it was asked, so every passage was refused. Credits are priced per character, so the user's price is unchanged; the platform's model cost per shorten request is higher. Set `LONGFORM_TIER_OVERRIDES=false` to use each operation's single-call tier.
+
+  A passage the AI gets wrong (a table that lost a column, a summary instead of a translation, an invented number, a passage returned in the source language: more than 15% of its lines word for word the same) is retried once and then **kept exactly as written**, with the same `chunk_restored` warning: for a translation that means a passage left in the source language, so show the notice. A passage that is already in the target language cannot be told apart from one the AI skipped, so it gets the same notice (and comes back unchanged). Each passage is translated separately and in parallel, so terms can differ slightly between passages. Front matter is kept as written (translate its title by hand), and code blocks and their comments are never translated.
 
 ---
 

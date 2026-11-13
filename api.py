@@ -35,8 +35,10 @@ from src.blog.plan import BRIEF_MAX_CHARS
 from src.charts.router import router as chart_router
 from src.charts.schema import GraphSuggestion
 from src.document_edit.router import router as document_router
+from src.document_upload.router import router as document_upload_router
+from src.document_import.router import router as document_import_router
 from src.document_edit.schema import DocumentEditResult
-from src.document_context import AnalysisMode, DocumentAction, DocumentActionRequest, DocumentScope, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context, source_index
+from src.document_context import AnalysisMode, DocumentAction, DocumentActionRequest, DocumentScopeRequest, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context, source_index
 from src.document_analysis import AnalysisResult
 from src.document_intent import IntentSuggestion, suggest_document_intent
 from src.key_points import HighlightResult, KeyPointValidationError, MAX_TEXT_CHARS
@@ -263,6 +265,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Text Processing Agent API", lifespan=lifespan)
 app.include_router(chart_router)
 app.include_router(document_router)
+app.include_router(document_upload_router)
+app.include_router(document_import_router)
 
 if settings.voice_flow_enabled:       # /v1/voice/*: local Whisper dictation with licence validation and text billing
     from src.voice_flow.access import LicenceGate
@@ -490,7 +494,7 @@ class ProcessRequest(BaseModel):
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
     document_context: Optional[DocumentContext] = None
     document_action: Optional[DocumentActionRequest] = None
-    document_scope: Optional[DocumentScope] = None
+    document_scope: Optional[DocumentScopeRequest] = None
     document_analysis: Optional[AnalysisMode] = None
     suggest_document_intent: bool = Field(False, strict=True)
 
@@ -562,7 +566,7 @@ class StreamRequest(BaseModel):
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
     document_context: Optional[DocumentContext] = None
     document_action: Optional[DocumentActionRequest] = None
-    document_scope: Optional[DocumentScope] = None
+    document_scope: Optional[DocumentScopeRequest] = None
     document_analysis: Optional[AnalysisMode] = None
     suggest_document_intent: bool = Field(False, strict=True)
 

@@ -7,7 +7,8 @@ import json
 import re
 import sqlite3
 
-from .document_context import (CONTEXT_TOKEN_BUDGET, ContextMetadata, ContextRange, PreparedContext,
+from config import settings
+from .document_context import (ContextMetadata, ContextRange, PreparedContext,
                                reference, source_index, unavailable_context)
 from .document_edit.blocks import fingerprint
 from .longform.markdown_ast import parse
@@ -74,7 +75,13 @@ def search_terms(text):
     return list(dict.fromkeys(terms))
 
 
-def retrieve_context(context, query, scope):
+def retrieve_context(context, query, scope, *, prefer_cursor=True):
+    """
+    Scoped Ask: the passages of the document that best match the question, as exact quoted excerpts with references.
+
+    Request-local FTS5 index, BM25 ranking, Porter stemming ("selling" finds "sell", "layers" finds "layer"). `prefer_cursor` False (document_scope "auto")
+    puts a passage first only for an explicit selection, not for a bare cursor, which says nothing about what the question is about.
+    """
     text = context.text
     selection = context.selection
     has_selection = selection is not None and selection.end_utf16 > selection.start_utf16
@@ -91,7 +98,7 @@ def retrieve_context(context, query, scope):
         terms = search_terms(query)[:32]
         try:
             with closing(sqlite3.connect(':memory:')) as connection:
-                connection.execute('CREATE VIRTUAL TABLE passages USING fts5(heading, body)')
+                connection.execute("CREATE VIRTUAL TABLE passages USING fts5(heading, body, tokenize='porter unicode61')")
                 connection.executemany('INSERT INTO passages(rowid, heading, body) VALUES (?, ?, ?)',
                     [(i + 1, ' '.join(search_terms(' '.join(c.section))), ' '.join(search_terms(c.text))) for i, c in enumerate(chunks)])
                 if terms:
@@ -100,7 +107,7 @@ def retrieve_context(context, query, scope):
                         'SELECT rowid FROM passages WHERE passages MATCH ? ORDER BY bm25(passages, 4.0, 1.0), rowid', (expression,))]
         except sqlite3.OperationalError:
             return unavailable_context(context, 'ask', scope, 'Document retrieval is unavailable on this server. Send a smaller source or selection.')
-        if has_selection or context.cursor_utf16 is not None:
+        if has_selection or (prefer_cursor and context.cursor_utf16 is not None):
             focus = source_index(text, selection.start_utf16) if has_selection else source_index(text, context.cursor_utf16)
             focused = next((i for i, c in enumerate(chunks) if c.start <= focus < c.end or focus == c.end == len(text)), None)
             if focused is not None:
@@ -116,9 +123,10 @@ def retrieve_context(context, query, scope):
             'source_sha256': fingerprint(text), 'excerpts': [r.model_dump(mode='json') for r in refs]}, ensure_ascii=False, separators=(',', ':'))
         return data, refs
 
+    budget = settings.document_retrieval_budget_bytes
     for i in ranked:
         data, _ = envelope([*picked, i])
-        if len(data.encode('utf-8')) <= CONTEXT_TOKEN_BUDGET:
+        if len(data.encode('utf-8')) <= budget:
             picked.append(i)
     if not picked:
         return unavailable_context(context, 'ask', scope, 'The matching source could not fit. Select a smaller passage.')

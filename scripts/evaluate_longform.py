@@ -41,7 +41,10 @@ sys.path.insert(0, str(ROOT))
 
 from config import settings                                                                  # noqa: E402
 from src.longform.markdown_ast import heading_levels, list_shape, parse, prose_words, shape, word_count   # noqa: E402
-from src.longform.prompts import OPERATIONS                                                  # noqa: E402
+from src.longform.prompts import OPERATIONS as ALL_OPERATIONS                                # noqa: E402
+# This harness judges the four original operations (typo fixing, target ratios). Translate, shorten and lengthen have their own
+# tests (tests/longform/test_translate_shorten.py) and are not scripted here.
+OPERATIONS = {name: ALL_OPERATIONS[name] for name in ("grammar", "simplify", "tone", "enhance")}
 from src.longform.refine import RefineConfig, qualifies, refine_stream                       # noqa: E402
 from src.models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS                                   # noqa: E402
 from src.observability import finish_trace, start_trace                                      # noqa: E402

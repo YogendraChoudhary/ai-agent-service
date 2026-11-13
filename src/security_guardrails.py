@@ -155,10 +155,15 @@ def defang_control_tokens(text: str) -> Tuple[str, int]:
 
 # Fast keyword pre-filter set to bypass expensive regex passes on clean text
 _DIRECTIVE_TRIGGER_WORDS = (
-    "ignore", "disregard", "forget", "override", "dan", "jailbreak",
+    "ignore", "disregard", "forget", "override", "neglect", "dismiss", "dan", "jailbreak",
     "unrestricted", "system prompt", "system instruction", "say only",
-    "output only", "exfiltrate", "bypass", "filters", "leak", "pwned",
-    "hacked", "compromised"
+    "output only", "print only", "respond with only", "exfiltrate", "bypass", "filters", "leak", "pwned",
+    "hacked", "compromised",
+    # every other lead word of _INJECTION_DIRECTIVES: without them "send the api_key to https://..." and "disable all safety
+    # guardrails" skipped the scan entirely
+    "send", "forward", "transmit", "upload", "disable", "turn off", "remove", "guardrails", "policies", "protections",
+    "you are now", "act as", "pretend", "switch to", "enter", "new system", "updated system", "current system", "real system",
+    "true system",
 )
 
 
@@ -186,6 +191,84 @@ def defang_injection_directives(text: str) -> Tuple[str, List[str]]:
                 detected_rules.append(pattern.pattern[:40])
 
     return sanitized, detected_rules
+
+
+# ==============================================================================
+# DOCUMENT SCAN (detect only)
+#
+# A user's own document is not rewritten the way web content is: the editor's offsets and the hash depend on the exact text. The
+# model is told on every path that the document is untrusted data (text_processing_agent.py, document_edit/service.py,
+# document_analysis.py, key_points.py, charts/extract.py). This is the deterministic half: it finds text that reads like an
+# instruction to an AI, so the upload can warn before anyone runs an AI action on the file.
+# ==============================================================================
+
+# Fake chat-template delimiters only. The role-prefix patterns of _SPECIAL_TOKENS_PATTERN ("Human:", "System:" at a line start)
+# are left out on purpose: a chat transcript or interview note is an ordinary document.
+_DOC_CONTROL_TOKENS = re.compile(
+    r"<\|(?:im_start|im_end|endoftext|fim_prefix|fim_suffix|fim_middle|system|user|assistant)[^>\n]{0,40}\|>|"
+    r"\[/?(?:INST|SYS)\]|<</?SYS>>|-{3}(?:BEGIN|END)\s+SYSTEM\s+PROMPT-{3}|={3}(?:BEGIN|END)\s+SYSTEM\s+PROMPT={3}",
+    re.IGNORECASE,
+)
+# Unicode "tag" characters render as nothing and can carry a whole hidden instruction. Flag emoji use up to seven of them, so only a
+# longer run is reported. U+202D / U+202E force text direction and are almost never in prose.
+_HIDDEN_TAG_RUN = re.compile("[\U000E0000-\U000E007F]{8,}")
+_BIDI_OVERRIDE = re.compile("[‭‮]")
+
+
+_AI_NAME = r"(?:ai(?:\s+(?:assistant|agent|model|system))?|a\.i\.|llm|language\s+model|chatbot)s?"
+# Phrasings that address the reader as an AI, ask for its prompt, or smuggle data out through an image URL. Document scan only: tuned
+# against real documents (an "AI models, such as GPT" sentence, a human "assistant manager" or an image with ?w=600 must not match).
+_DOCUMENT_DIRECTIVES: list[Tuple[re.Pattern, str, str]] = [
+    (re.compile(rf"\b(?:note|message|notice|instruction|attention|important|reminder)s?\s+(?:to|for)\s+(?:the\s+|any\s+|all\s+|an?\s+)?{_AI_NAME}\b"
+                rf"|\bif\s+you\s+(?:are|'re|’re)\s+(?:an?\s+|the\s+)?{_AI_NAME}\b"
+                rf"|(?:^|[.!?]\s+)(?:ai|llm)\s+(?:assistants?|agents?)\s*:\s*(?:when|if|you|do|always|never|please|before|after|must|ignore|append|include)\b",
+                re.IGNORECASE | re.MULTILINE),
+     "addressed_to_ai", "Text addressed to an AI assistant"),
+    (re.compile(r"\b(?:print|reveal|show|repeat|output|display|disclose|leak)\s+(?:me\s+)?"
+                r"(?:your\s+(?:(?:full|entire|complete|exact|hidden|initial)\s+)?(?:system\s+)?(?:prompt|instructions)"
+                r"|the\s+(?:(?:full|entire|complete|exact|hidden|initial)\s+)?system\s+(?:prompt|instructions|message))\b", re.IGNORECASE),
+     "reveal_prompt", "Request to reveal the system prompt"),
+    (re.compile(r"!\[[^\]\n]{0,100}\]\(\s*https?://[^)\s]{1,200}[?&][^)\s]{0,200}"
+                r"(?:summary|summari[sz]e|history|chat|conversation|secret|token|password|prompt|api[_-]?key)[^)\s]{0,100}\)", re.IGNORECASE),
+     "data_exfiltration", "Image link that carries data out in its URL"),
+]
+
+
+def _kind_of(label: str) -> str:
+    """'[DEFANGED: Instruction override attempt]' -> 'instruction_override'."""
+    words = re.sub(r"^\[DEFANGED:\s*|\]$", "", label).lower().replace(" attempt", "")
+    return re.sub(r"[^a-z0-9]+", "_", words).strip("_")
+
+
+def detect_document_threats(text: str, max_matches: int = 10) -> List[dict]:
+    """
+    Read-only scan of a user's document for prompt-injection signals. Returns at most `max_matches` dicts, each
+    {"kind", "label", "line" (1-based), "excerpt"}; hidden characters have no excerpt (there is nothing to show). The text is never
+    changed.
+    """
+    if not text:
+        return []
+    found: List[dict] = []
+
+    def add(kind: str, label: str, match: "re.Match[str]", show: bool = True) -> None:
+        if len(found) < max_matches:
+            found.append({"kind": kind, "label": label, "line": text.count("\n", 0, match.start()) + 1,
+                          "excerpt": re.sub(r"\s+", " ", match.group(0))[:80] if show else ""})
+
+    for pattern, label in _INJECTION_DIRECTIVES:                      # no keyword pre-filter here: a missed phrase costs more than a millisecond
+        for match in pattern.finditer(text):
+            add(_kind_of(label), re.sub(r"^\[DEFANGED:\s*|\]$", "", label), match)
+    for pattern, kind, label in _DOCUMENT_DIRECTIVES:
+        for match in pattern.finditer(text):
+            add(kind, label, match)
+    for match in _DOC_CONTROL_TOKENS.finditer(text):
+        add("control_tokens", "Fake chat-template delimiter", match)
+    for match in _HIDDEN_TAG_RUN.finditer(text):
+        add("hidden_characters", f"{len(match.group(0))} invisible Unicode tag characters", match, show=False)
+    for match in _BIDI_OVERRIDE.finditer(text):
+        add("hidden_characters", "Text-direction override character", match, show=False)
+    found.sort(key=lambda f: f["line"])
+    return found
 
 
 def sanitize_web_content(

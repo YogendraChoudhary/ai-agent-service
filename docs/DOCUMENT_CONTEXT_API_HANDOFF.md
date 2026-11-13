@@ -36,7 +36,7 @@ Both endpoints accept these additional fields:
 - `document_context.selection`: optional `start_utf16` and `end_utf16`, inclusive start and exclusive end, in the exact text serialization. A nonempty selection wins over the cursor. A collapsed selection is ignored.
 - `document_context.cursor_utf16`: optional insertion position; defaults to the end of the source. Integer coordinates must be within the source and must not split a Unicode surrogate pair. Booleans and string coordinates are rejected.
 - `query`: nonblank, at most 8,000 characters for ordinary Ask/Draft or 2,000 for Edit. Analysis additionally limits the JSON-serialized instruction to 2,000 UTF-8 bytes.
-- `document_scope`: optional `document` (default), `selection` or `focused`. Non-document scopes are Ask-only. Selection requires a nonempty captured selection and cannot retrieve outside it. Focused scope searches the supplied document, preferring captured focus when present.
+- `document_scope`: optional `document` (default), `selection`, `focused` or `auto`. Non-document scopes are Ask-only. Selection requires a nonempty captured selection and cannot retrieve outside it. Focused scope searches the supplied document, preferring captured focus when present.
 - `document_analysis`: optional `summary` or `contradictions`, only for Ask with document scope. This explicitly requests bounded, multi-call full-source analysis.
 - `suggest_document_intent`: optional strict boolean, default `false`. Returns advisory action metadata; it never switches the requested action. All these options require `document_context`.
 
@@ -46,15 +46,52 @@ Explicit Edit runs the existing edit validation against the complete exact sourc
 
 ## Context limits and scope
 
-Default Ask provides the complete source or returns `needs_context` without running a model. It never silently substitutes partial retrieval for a whole-document task. To answer a local question against a larger source, explicitly set `document_scope="focused"` or `"selection"`. For global analysis, explicitly set `document_analysis="summary"` or `"contradictions"`.
+Default Ask provides the complete source or returns `needs_context` without running a model. It never silently substitutes partial retrieval for a whole-document task. To answer a local question against a larger source, explicitly set `document_scope="auto"` (recommended: [Long-document Ask](#long-document-ask)), `"focused"` or `"selection"`. For global analysis, explicitly set `document_analysis="summary"` or `"contradictions"`. A deployment can make `auto` the behaviour of the default scope with `DOCUMENT_LARGE_ASK=auto`; it is then still reported as partial, never silent.
 
 Scoped Ask uses exact source chunks and a request-local in-memory SQLite FTS5 index with BM25 ranking. It supports Unicode terms and CJK bigrams; it is lexical retrieval, not embedding similarity. Deployed Python must include FTS5. Unavailable search, no matching passages or an unpackable selection returns `needs_context` without a model call. Captured focus may supply a passage even without a lexical match. Retrieved references have server-assigned `r0`, `r1`, … identifiers, exact quotes, heading paths and UTF-16 ranges. Partial answers must remain scoped to those passages; retrieved evidence does not establish whole-document coverage.
 
 Draft uses complete context when it fits. Otherwise it includes a bounded heading outline plus the active section or a window around the captured focus. With no focus, it continues from the end. Its metadata reports `coverage="partial"`, and warnings explain that limitation.
 
-The context envelope has a 24,000 UTF-8-byte ceiling and a 6,000 estimated-token allocation. The current dependency-free estimator deliberately counts each UTF-8 byte as one estimated token, including serialization and metadata. This is conservative and usually binds before the byte ceiling: it is **not** 6,000 measured provider tokens or 24,000 characters of prose. Non-English/emoji-heavy text can fit fewer characters. The task is bounded separately; output defaults use the existing rounding/reasoning-budget helper, starting from 2,000 visible tokens for Ask and 1,000 for Draft.
+The context envelope has a 24,000 UTF-8-byte ceiling and a 6,000 estimated-token allocation for a whole document (scoped Ask has its own allowance, `DOCUMENT_RETRIEVAL_BUDGET_BYTES`). The current dependency-free estimator deliberately counts each UTF-8 byte as one estimated token, including serialization and metadata. This is conservative and usually binds before the byte ceiling: it is **not** 6,000 measured provider tokens or 24,000 characters of prose. Non-English/emoji-heavy text can fit fewer characters. The task is bounded separately; output defaults use the existing rounding/reasoning-budget helper, starting from 2,000 visible tokens for Ask and 1,000 for Draft.
 
 No provider token-count request is added to the hot path. Before production enablement, validate the configured model IDs/capacities and synthetic grounding/latency behavior. Increase the packing allowance only after a provider-calibrated counter/estimate is tested for every eligible fallback. When reported output usage reaches the configured model output cap, the response includes `output_limit_reached` with a warning that the text may be incomplete. The installed agent SDK does not reliably expose every provider finish reason, so missing usage cannot establish that an answer was complete.
+
+## Long-document Ask
+
+Ask used to stop at about 6,000 bytes of document (the whole-document allowance), so a 10 KB Word file with tables, an imported PDF or any real report got "too large to review in full" and the client had to know to retry with `document_scope="focused"`. These changes make a long document answerable without that:
+
+| What you send | Document fits | Document does not fit, question is about a part | Document does not fit, question needs the whole document |
+|---|---|---|---|
+| default scope (`DOCUMENT_LARGE_ASK=refuse`, default) | read whole | `needs_context`, no model call (as before) | `needs_context`, no model call (as before) |
+| `document_scope: "auto"` | read whole (`strategy: "full"`) | answered from the matching passages (`strategy: "retrieval"`, `coverage: "partial"`, `scope: "focused"`, `references` r0, r1, ...) | `needs_context`, no model call, advice below |
+| default scope with `DOCUMENT_LARGE_ASK=auto` | same as `auto` | same as `auto` | same as `auto` |
+
+`auto` is Ask-only: with `draft`, `edit` or `document_analysis` the request is `400`; with `document_action: "auto"` it runs as Ask (`source: "request"`). The resolved choice is in the metadata (`strategy`, `scope`, `coverage`), and a partial answer always carries the `partial_document_context` warning.
+
+**Which questions need the whole document** (`src/document_question.py`, rules only, no model, English wording): summaries, overviews, "main points / key takeaways / central arguments", "what is this paper about", enumerations of everything ("list all", "extract every", "how many times", "count"), contradictions and inconsistencies, reviews and feedback ("proofread", "critique", "is this too long"), comparing sections. Those cannot be answered from the passages that happen to match some words, and an answer built from a sample reads like a review of the whole, so they are refused at once with *"This question needs the whole document, which is too large to read in one request. Ask about a specific part (name a section or select the text), or use the document summary or contradiction analysis, which reads every part; no document analysis was run."* (nothing billed). Suggested UI: when `status="needs_context"` for an `auto` request, offer the Summarize / Find contradictions actions (`document_analysis`). Anything else is treated as a question about a part, so wording in another language gets a partial answer with the warning rather than a refusal. Checked against 39 whole-document and 27 part phrasings written for the rules (all classified as intended; optimistic, since the author wrote both) and the 39 benchmark questions below (none flagged).
+
+**Retrieval changes** (`src/document_retrieval.py`; they apply to `focused` and `selection` too):
+- Porter stemming ("selling" finds "sell", "layers" finds "layer").
+- The context sent is bounded by `DOCUMENT_RETRIEVAL_BUDGET_BYTES` (default `10000`) instead of a fixed 6,000, still under the 24,000-byte ceiling. **This is also the most a scoped Ask costs in input**: `billable_input_chars` (read it, as for any Ask) is about 10,000 for a long-document answer against about 6,000 before.
+- With `auto`, a bare cursor no longer puts its passage first (a cursor says where the user is typing, not what the question is about); an explicit selection still does.
+
+**Measured.** 39 questions over 7 real documents imported with the import endpoint (the ResNet and Transformer papers as PDFs, the GNU "free software" essay, Python's `venv`, class tutorial, `argparse` and `asyncio` task docs; 26-88 KB, i.e. 4-15 times the old limit): 24 about one fact, 10 worded differently from the text, 5 needing two passages. Share of questions whose answer-bearing passage was in the context sent:
+
+| Configuration | Passage found |
+|---|---|
+| before (6,000 bytes, no stemming) | 72% (28/39) |
+| stemming only, 6,000 | 79% |
+| 8,000 | 90% |
+| **10,000 (default)** | **95% (37/39); facts 23/24, two-passage 5/5, reworded 9/10** |
+| 11,000 / 12,000 / 24,000 | 97% / 97% / 97% (no further gain) |
+
+End to end with a real model (the same 39 questions through `/agent/process`, key facts in the documents changed so a model cannot answer from memory; answer checked by pattern): OpenAI 36/39 before, 37/39 after; Claude 37/39 before, 38/39 after. **That is one question each, within the noise of 39 questions**: most facts are stated in more than one place, so the old 3-passage context often still contained one of them. Read the table above as "the context contains the evidence more often", not as "answers are 20 points better". What the change reliably buys is that a long document can be asked about at all, at the cost shown. The remaining miss in both providers' runs is a question whose wording shares no word with its answer passage ("why did the extremely deep CIFAR network perform worse" against "We argue that this is because of overfitting"): retrieval is lexical (BM25 on stemmed words), not semantic, and a model-assisted query rewrite or embeddings would be the next step for that kind of gap.
+
+**Live behaviour** (58 KB paper, OpenAI): a part question gave a correct answer in 1.7-1.9 s with 7-8 references and `billable_input_chars` about 9,900; "Summarize this paper" was refused in 0.0 s with nothing billed; a 3 KB document was read whole; a question matching nothing was explained without a model call.
+
+**Whole-document questions: the analysis route, and a fix.** `document_analysis: "summary" | "contradictions"` reads every chunk, and was the only route for those questions. On every real document tried it failed with `500` ("The document request could not be completed"), with the old code as well: the extraction stage allows a 120-byte quote and models cannot count bytes, and one over-long quote anywhere aborted the whole analysis. `src/document_analysis.py` now repairs *length* overflows only (a quote or statement cut at a word boundary, at most two claims per chunk, at most eight findings, four distinct evidence ids): a prefix of an exact quote is still an exact quote, and the exact-membership check still runs. Wrong content still fails closed (an invented quote, an unknown evidence id, missing verification decisions), as the existing tests require. Live, summary analysis went from `500` to `200` on the three documents tried: 58 KB paper 28 s, 18 calls, 73,700 input chars; 39 KB paper 19 s, 13 calls, 50,500; 88 KB reference page 35 s, 26 calls, 110,700 (billing as documented under *Billing and privacy*: it is a very different cost from a 10,000-character scoped Ask, which is why `auto` does not start it by itself).
+
+**Limits.** Retrieval is lexical; a question whose words are not in the passage can miss it, and a partial answer is only as good as the passages (the model is told to say when the excerpts do not contain the answer, and to cite `[r0]`...). A question needing two distant facts worked 5/5 in the benchmark but depends on both ranking in the top passages. `needs_context` for a whole-document question is deliberate, not a failure. The whole-document wording rules are English only. Documents over 100,000 characters are still refused at upload/request validation.
 
 ## Full-source analysis
 
@@ -131,6 +168,8 @@ Handle named events and ordinary `data.type` events. Process and stream metadata
 For empty or oversized default Ask, or unavailable scoped/analysis context, metadata has `status="needs_context"`, `coverage="none"`, zero billable input and no model prompt. The content is a deterministic explanation. Both endpoints return a normal completion with that explanation. Do not present it as a model analysis or offer Insert.
 
 ### Draft placement
+
+When the document starts with YAML or TOML front matter, "at the top", "at the beginning" and "at the start" place the draft just below the front matter (front matter has to stay the first thing in the file); if the front matter is the only block, the draft goes after it.
 
 When a Draft task names a place, `document_context_ready` carries `placement`, resolved in code (no model call) against
 the same top-level blocks Edit uses; the draft is written for that place, and the context is centred there:
@@ -256,6 +295,14 @@ the range, stops the service at start-up with a clear error.
 | `DOCUMENT_LITERAL_MAX_REQUEST_CHARS` | `400` | 50-2000 | a Draft request longer than this is never treated as exact text |
 | `DOCUMENT_EDIT_SMALL_INSERTION_CHARS` | `80` | 1-500 | `/agent/documents/apply` accepts new numbers only in a pure insertion up to this long |
 | `DOCUMENT_EDIT_SMALL_ADDITION_MAX_WORDS` | `12` | 1-100 | most words an in-line Edit addition may add to a block |
+
+### Configuration (long-document Ask)
+
+| Variable | Default | Range | What it does |
+|---|---|---|---|
+| `DOCUMENT_RETRIEVAL_BUDGET_BYTES` | `10000` | 4000-24000 | Most UTF-8 bytes of context a scoped Ask (`focused` or `auto`) sends to the model. Credits are priced by characters sent, so this is also the most a scoped Ask can cost in input. |
+| `DOCUMENT_LARGE_ASK` | `refuse` | `refuse` / `auto` | What an Ask with the default scope does with a document too large to send whole. `refuse` (the documented contract): `needs_context`, no model call. `auto`: act as `document_scope="auto"`. |
+
 
 Not configurable on purpose: the 2,000-character Edit instruction limit (the existing Edit contract) and Gemini's 10-second minimum request
 deadline (a provider fact).

@@ -49,23 +49,32 @@ class TestTheSystemPrompt(unittest.TestCase):
         for name, op in OPERATIONS.items():
             with self.subTest(operation=name):
                 lines = tpa.AGENT_CONFIGS[name]["instructions"]
-                self.assertEqual(tuple(lines[:lines.index(tpa.REFINE_STRUCTURE_RULE)]), op.rules)
+                if name in tpa.REFINEMENT_AGENTS:
+                    self.assertEqual(tuple(lines[:lines.index(tpa.REFINE_STRUCTURE_RULE)]), op.rules)
+                else:
+                    # translate, shorten, lengthen: every shared rule is a line of the single-call agent, in its order; the rest of
+                    # what the pipeline needs is in pipeline_rules
+                    positions = [lines.index(rule) for rule in op.rules]
+                    self.assertEqual(positions, sorted(positions))
 
     def test_the_temperature_is_the_single_calls(self):
         for name, op in OPERATIONS.items():
             with self.subTest(operation=name):
                 self.assertEqual(op.temperature, tpa.AGENT_CONFIGS[name]["temperature"])
 
-    def test_every_refinement_agent_has_an_operation_and_nothing_else_does(self):
-        self.assertEqual(set(OPERATIONS), set(tpa.REFINEMENT_AGENTS))
+    def test_every_pipeline_agent_has_an_operation_and_nothing_else_does(self):
+        self.assertEqual(set(OPERATIONS), set(tpa.PIPELINE_AGENTS))
+        self.assertEqual(set(tpa.PIPELINE_AGENTS) - set(tpa.REFINEMENT_AGENTS), {"translation", "make_shorter", "make_longer"})
 
     def test_the_locked_structure_contract_is_in_every_prompt(self):
         for name in OPERATIONS:
             with self.subTest(operation=name):
                 prompt = system_prompt(name)
                 for needle in ("[[TABLE_3]]", "[[URL_6]]", "(link://12)", "exactly once, in the same order",
-                               "alone on its line", "Never summarise", "Return ONLY the refined passage", "no code fence"):
+                               "alone on its line", "Return ONLY the refined passage", "no code fence"):
                     self.assertIn(needle, prompt)
+                if name in tpa.REFINEMENT_AGENTS:
+                    self.assertIn("Never summarise", prompt)
 
     def test_the_prompt_says_what_a_token_stands_for_and_what_to_do_when_a_sentence_holding_one_is_reworded(self):
         """Measured on Grok (24 first answers): without these sentences 9 dropped a URL or tag token; with them none did (1 was too long)."""

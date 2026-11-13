@@ -7,7 +7,7 @@ import random
 import unittest
 
 from src.longform.markdown_ast import (
-    heading_levels, join, list_shape, parse, prose_words, shape, table_shape, word_count,
+    heading_levels, heading_lines, join, list_shape, parse, prose_words, shape, table_shape, word_count,
 )
 
 DOC = """# Title
@@ -159,6 +159,51 @@ class TestTables(unittest.TestCase):
     def test_non_tables_have_no_shape(self):
         (para,) = parse("just text\n")
         self.assertIsNone(table_shape(para))
+
+
+class HeadingLinesMatchParse(unittest.TestCase):
+    """heading_lines() skips the inline pass for speed; it must still find exactly the headings parse() finds."""
+
+    FRAGMENTS = [
+        "# H1\n", "## Two ##\n", "### t\n", "Setext\n=====\n", "Sub\n---\n", "```\n# in code\n```\n", "    # indented code\n",
+        "> # quoted\n", "- # in list\n", "- item\n", "1. one\n", "text line\n", "\n", "#nohash\n", "####### seven\n",
+        "<div>\n# in html?\n</div>\n", "| a | b |\n|---|---|\n| # | x |\n", "[ref]: http://x\n", "\r\n", "# crlf head\r\n",
+        " # sep\n", "head ing\n---\n", "***\n", "~~~\n## tilde\n~~~\n", "# ![[~ [a](b\n", "  ## indented head\n",
+        "#\t tab head\n", "# \n", "##\n", "\x0b# vt\n", "# émoji 🚀 ☕\n",
+    ]
+
+    @staticmethod
+    def via_parse(text):
+        return [(b.level, b.text.splitlines()[0]) for b in parse(text) if b.kind == "heading"]
+
+    def test_the_sample_document(self):
+        self.assertEqual(heading_lines(DOC), self.via_parse(DOC))
+        self.assertTrue(heading_lines(DOC))
+
+    def test_edge_inputs(self):
+        for text in ["", "\n", "   ", "# only", "﻿# bom", "a\rb\r# cr only\r", "Title\n=====", "# a\n# b\n"]:
+            self.assertEqual(heading_lines(text), self.via_parse(text), repr(text))
+
+    def test_random_documents_from_tricky_fragments(self):
+        rng = random.Random(11)
+        for _ in range(600):
+            text = "".join(rng.choice(self.FRAGMENTS) for _ in range(rng.randint(1, 25)))
+            self.assertEqual(heading_lines(text), self.via_parse(text), repr(text))
+
+    def test_headings_in_quotes_lists_and_code_are_not_top_level_headings(self):
+        self.assertEqual(heading_lines("> # q\n\n- # l\n\n```\n# c\n```\n\n# real\n"), [(1, "# real")])
+
+    def test_it_does_not_run_the_inline_pass(self):
+        from src.longform.markdown_ast import _block_parser, _parser
+
+        def parse_tokens(text):
+            return _parser().parse(text)
+
+        tokens = _block_parser().parse("# Title with [a link](x) and *emphasis*\n")
+        inline = [t for t in tokens if t.type == "inline"]
+        self.assertTrue(inline and all(not t.children for t in inline))              # raw content kept, no child tokens
+        normal = [t for t in parse_tokens("# Title with [a link](x) and *emphasis*\n") if t.type == "inline"]
+        self.assertTrue(normal and all(t.children for t in normal))                  # while the normal parser does build them
 
 
 if __name__ == "__main__":

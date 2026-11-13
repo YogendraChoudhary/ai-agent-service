@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence, Tuple
 
-from .markdown_ast import Block, parse, word_count
+from .markdown_ast import ALERT_MARKER, FOOTNOTE_LABEL, INLINE_DIALECT_PATTERNS, TASK_MARKER, Block, parse, word_count
 
 # What each kind of block becomes. A horizontal rule and anything markdown-it leaves unclassified (link reference
 # definitions) are opaque to the model like raw HTML: not its to touch.
@@ -33,13 +33,16 @@ _ANY_TOKEN_RE = re.compile(TOKEN_RE.pattern + "|" + LINK_REF_RE.pattern)
 BLOCK_TOKEN_LINE = re.compile(r"^\[\[(?:TABLE|QUOTE|IMAGE|CODE|HTML)_\d+\]\]$")        # a line that is only a block token
 
 # Inline Markdown, scanned left to right in one pass. Atomic groups and possessive quantifiers keep the scan linear.
-_LABEL = r"(?>[^\[\]\\]|\\.|\[[^\[\]]*\])*+"
+_LABEL = r"(?>[^\[\]\\]|\\.|\[[^\[\]]*\]){0,1000}+"      # bounded: unbounded, "\\[\nx\n" repeated made every "[" scan to the end of the text (23 s per 100k chars)
 _DEST = r"(?>(?><[^<>\n]*>)|(?>(?>[^()\s\\]|\\.|\([^()\s]*\))+))"
 _TITLE = r"""(?>\s+(?>"(?>[^"\\]|\\.)*"|'(?>[^'\\]|\\.)*'|\((?>[^()\\]|\\.)*\)))?"""
 _EMAIL = r"[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
 _TAG_ATTR = r"""\s+[A-Za-z_:][\w.:-]*+(?:\s*+=\s*+(?:[^\s"'=<>`]++|'[^']*+'|"[^"]*+"))?+"""
+_DIALECT_GROUPS = tuple(INLINE_DIALECT_PATTERNS)            # math, wikilinks, footnote references, ~~strikethrough~~, :emoji: codes
+_DIALECT = "|".join(f"(?P<{name}>{pattern})" for name, pattern in INLINE_DIALECT_PATTERNS.items())
 _INLINE = re.compile(
-    rf"(?P<image>!\[{_LABEL}\]\(\s*{_DEST}{_TITLE}\s*\))"
+    _DIALECT + "|"                                           # first: at one position a wikilink beats an image, $x$ beats nothing
+    rf"(?P<image>!\[(?P<ilabel>{_LABEL})\](?P<itail>\(\s*{_DEST}{_TITLE}\s*\)))"
     rf"|(?P<imageref>!\[{_LABEL}\]\[[^\[\]]*\])"
     rf"|(?P<link>\[(?P<label>{_LABEL})\](?P<tail>\(\s*{_DEST}{_TITLE}\s*\)|\[[^\[\]]*\]))"
     rf"|(?P<auto><(?:(?:https?://|mailto:)[^<>\s]+|{_EMAIL})>)"
@@ -117,19 +120,31 @@ def collides(text: str) -> bool:
 # Freeze
 # ---------------------------------------------------------------------------
 
-def _inline(text: str, vault: Vault) -> str:
-    """Images, links and URLs inside prose. A link's anchor is recursed into, so a linked image is frozen too."""
+def _inline(text: str, vault: Vault, alt_images: bool = False) -> str:
+    """
+    Images, links and URLs inside prose. A link's anchor is recursed into, so a linked image is frozen too. With `alt_images` an image
+    is written like a link, ![alt text](link://n): the alt text stays in the passage (a translation must translate it) and the
+    address is locked, exactly as a link's.
+    """
     def swap(m: "re.Match[str]") -> str:
+        if any(m.group(name) is not None for name in _DIALECT_GROUPS):
+            return vault.block("HTML", m.group(0))                # opaque, like an inline tag: the model never sees or edits it
+        if m.group("image") and alt_images:
+            tail = m.group("itail")
+            return f"![{_inline(m.group('ilabel'), vault, True)}]{vault.link(tail[0], tail[1:-1])}"
         if m.group("image") or m.group("imageref"):
             return vault.block("IMAGE", m.group(0))
         if m.group("link") is not None:
             tail = m.group("tail")
             opener, inside = tail[0], tail[1:-1]
-            return f"[{_inline(m.group('label'), vault)}]{vault.link(opener, inside)}"
+            return f"[{_inline(m.group('label'), vault, alt_images)}]{vault.link(opener, inside)}"
         if m.group("tag") is not None:
             return vault.block("HTML", m.group(0))
         return vault.block("URL", m.group(0))
-    return _INLINE.sub(swap, text)
+    # A task-list box ("- [ ] item") or a quote's alert keyword ("> [!NOTE]") is markup, not wording: swapped first, on the line it opens.
+    text = FOOTNOTE_LABEL.sub(lambda m: vault.block("HTML", m.group(1)), text)               # "[^1]:" of a footnote that is exposed
+    text = ALERT_MARKER.sub(lambda m: m.group(1) + vault.block("HTML", m.group(2)), text)
+    return _INLINE.sub(swap, TASK_MARKER.sub(lambda m: m.group(1) + vault.block("HTML", m.group(2)), text))
 
 
 def _fenced_regions(lines: Sequence[str]) -> List[Tuple[int, int]]:
@@ -148,43 +163,66 @@ def _fenced_regions(lines: Sequence[str]) -> List[Tuple[int, int]]:
     return regions
 
 
-def _prose_block(text: str, vault: Vault, allow_code: bool) -> str:
+def _prose_block(text: str, vault: Vault, allow_code: bool, alt_images: bool = False) -> str:
     """A heading, paragraph or list: code fenced inside a list item is frozen like any code, the rest by _inline."""
     lines = text.splitlines(keepends=True)
     regions = _fenced_regions(lines) if allow_code else []
     if not regions:
-        return _inline(text, vault)
+        return _inline(text, vault, alt_images)
     out, cursor = [], 0
     for first, last in regions:
-        out.append(_inline("".join(lines[cursor:first]), vault))
+        out.append(_inline("".join(lines[cursor:first]), vault, alt_images))
         body = "".join(lines[first:last + 1])
         eol = "\n" if body.endswith("\n") else ""
         indent = lines[first][:len(lines[first]) - len(lines[first].lstrip(" \t"))]
         original = body[len(indent):-1] if eol else body[len(indent):]
         out.append(indent + vault.block("CODE", original) + eol)
         cursor = last + 1
-    out.append(_inline("".join(lines[cursor:]), vault))
+    out.append(_inline("".join(lines[cursor:]), vault, alt_images))
     return "".join(out)
 
 
-def freeze_blocks(blocks: Sequence[Block], *, freeze_quotes: bool = True) -> Tuple[List[FrozenBlock], Vault]:
-    """Freeze document-ordered blocks. Token numbers run through the whole document, so a chunk's tokens are a subsequence."""
+_QUOTED_FENCE = re.compile(r"^[ \t]*(?:>[ \t]*)*(?:`{3,}|~{3,})")
+_QUOTED_TABLE = re.compile(r"^[ \t]*(?:>[ \t]*)+\|")
+
+
+def _exposable(block: Block) -> bool:
+    """
+    A table or a figure can always be worked on in place. A quote can too, unless it holds code or a table of its own: those are
+    not verified inside a quote, so such a quote stays frozen.
+    """
+    if block.kind != "blockquote":
+        return True
+    return not any(_QUOTED_FENCE.match(line) or _QUOTED_TABLE.match(line) for line in block.text.splitlines())
+
+
+def freeze_blocks(blocks: Sequence[Block], *, freeze_quotes: bool = True,
+                  expose: Sequence[str] = ()) -> Tuple[List[FrozenBlock], Vault]:
+    """
+    Freeze document-ordered blocks. Token numbers run through the whole document, so a chunk's tokens are a subsequence.
+    `expose` names block kinds ("table", "blockquote", "image", "footnote") the model works on in place instead of receiving a token: a
+    translation must translate a table's cells, a quote, a figure's caption and alt text and a footnote's text. Their structure is then
+    checked in code (verify.py).
+    """
     vault, frozen = Vault(), []
+    exposed = set(expose) | (set() if freeze_quotes else {"blockquote"})
+    alt_images = "image" in exposed
     for b in blocks:
-        if b.kind in BLOCK_TOKEN and (b.kind != "blockquote" or freeze_quotes):
+        kind = "footnote" if b.kind == "other" and b.flavor == "footnote" else b.kind
+        if b.kind in BLOCK_TOKEN and not (kind in exposed and _exposable(b)):
             eol = "\n" if b.text.endswith("\n") else ""
             text = vault.block(BLOCK_TOKEN[b.kind], b.text[:-1] if eol else b.text) + eol
         elif b.kind == "blank":
             text = b.text
         else:
-            text = _prose_block(b.text, vault, allow_code=b.kind == "list")
+            text = _prose_block(b.text, vault, allow_code=b.kind == "list", alt_images=alt_images)
         frozen.append(FrozenBlock(b, text, words_of(text)))
     return frozen, vault
 
 
-def freeze(text: str, *, freeze_quotes: bool = True) -> Tuple[str, Vault]:
+def freeze(text: str, *, freeze_quotes: bool = True, expose: Sequence[str] = ()) -> Tuple[str, Vault]:
     """(the text the model may see, the vault that restores it). `text` is the pipeline's LF-normalised document."""
-    frozen, vault = freeze_blocks(parse(text), freeze_quotes=freeze_quotes)
+    frozen, vault = freeze_blocks(parse(text), freeze_quotes=freeze_quotes, expose=expose)
     return "".join(f.text for f in frozen), vault
 
 

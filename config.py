@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import find_dotenv, load_dotenv
 from pydantic import Field, field_validator
@@ -262,6 +262,54 @@ class Settings(BaseSettings):
     document_edit_small_addition_max_words: int = Field(12, ge=1, le=100, alias="DOCUMENT_EDIT_SMALL_ADDITION_MAX_WORDS")
 
     # ------------------------------------------------------------------
+    # Document upload: POST /agent/documents/upload (src/document_upload/router.py). Blank values are not accepted.
+    # ------------------------------------------------------------------
+    # Extractions (decode, validate, headings, hash) that may run at once, each on one of this many dedicated threads (read once at
+    # start-up). The work is pure-Python CPU, so extra threads add no speed: they only take the GIL from the event loop that serves
+    # every other request and stream.
+    document_upload_max_concurrent: int = Field(2, ge=1, le=16, alias="DOCUMENT_UPLOAD_MAX_CONCURRENT")
+    # Files up to this many bytes are extracted on one extra thread of their own, so a small upload never waits behind large ones
+    # (a 100 KB file can cost ~0.4 s of CPU, a 16 KB one at most ~60 ms). Read at request time; bytes, so 4-byte characters count in full.
+    document_upload_small_file_bytes: int = Field(16_000, ge=1_000, le=400_000, alias="DOCUMENT_UPLOAD_SMALL_FILE_BYTES")
+    # A request that has waited this long for a free extraction thread is answered 503 + Retry-After instead of queueing behind a burst.
+    document_upload_queue_wait_seconds: float = Field(10.0, gt=0, le=60, alias="DOCUMENT_UPLOAD_QUEUE_WAIT_SECONDS")
+
+    # ------------------------------------------------------------------
+    # Long-document Ask (src/document_retrieval.py, src/document_context.py). Blank values are not accepted.
+    # ------------------------------------------------------------------
+    # The most UTF-8 bytes of context (the JSON envelope: excerpts, references, framing) a scoped Ask (document_scope "focused" or "auto") sends
+    # to the model. It replaced a fixed 6,000, which fits about three passages. Measured on 39 questions over real 26-88 KB documents (share of questions
+    # whose answer-bearing passage was in the context): 72% before (6,000, no stemming), 79% at 6,000 with stemming, 90% at 8,000, 95% at 10,000, 97% at
+    # 11,000 and again at 12,000 or 24,000, so 10,000 is the knee. Credits are priced by the characters sent: this is also the most a scoped Ask can cost
+    # in input. Never above the 24,000-byte context ceiling.
+    document_retrieval_budget_bytes: int = Field(10_000, ge=4_000, le=24_000, alias="DOCUMENT_RETRIEVAL_BUDGET_BYTES")
+    # What an Ask with the default scope does when the document is too large to send whole. "refuse" (the documented contract): answer needs_context
+    # without a model call. "auto": behave as document_scope "auto" (retrieval for a question about a part, still refusing one that needs the whole
+    # document), reporting partial coverage. Lets every existing client get long-document Q&A without sending a new field.
+    document_large_ask: Literal["refuse", "auto"] = Field("refuse", alias="DOCUMENT_LARGE_ASK")
+
+    # ------------------------------------------------------------------
+    # Document import: POST /agent/documents/import (src/document_import/router.py): DOCX, PDF and HTML files, and web addresses, to Markdown.
+    # Every conversion runs in its own locked-down child process. Blank values are not accepted. Pool sizes and the size cap are read once at start-up.
+    # ------------------------------------------------------------------
+    # false = the endpoint answers 503 (switches the whole feature off without a deploy).
+    document_import_enabled: bool = Field(True, alias="DOCUMENT_IMPORT_ENABLED")
+    # false = files can still be imported but a "url" is refused (the part of the feature that makes outgoing requests).
+    document_import_urls_enabled: bool = Field(True, alias="DOCUMENT_IMPORT_URLS_ENABLED")
+    # Conversions that may run at once. Each is a child process (a PDF can take ~150 MB and several seconds of one CPU), so this is also the cap on memory.
+    document_import_max_concurrent: int = Field(2, ge=1, le=8, alias="DOCUMENT_IMPORT_MAX_CONCURRENT")
+    # Web addresses fetched at once. Fetching waits on the network and holds no conversion slot, so it has its own, larger, pool.
+    document_import_fetch_concurrent: int = Field(4, ge=1, le=16, alias="DOCUMENT_IMPORT_FETCH_CONCURRENT")
+    # Largest DOCX or PDF (and largest body of the request), in bytes. A web page itself is capped at 5 MB.
+    document_import_max_file_bytes: int = Field(15_000_000, ge=100_000, le=50_000_000, alias="DOCUMENT_IMPORT_MAX_FILE_BYTES")
+    # A conversion that runs longer than this is killed and the request answered 422.
+    document_import_timeout_seconds: float = Field(30.0, ge=3, le=120, alias="DOCUMENT_IMPORT_TIMEOUT_SECONDS")
+    # Pages read from a PDF; a longer one is imported up to this page and says so.
+    document_import_max_pdf_pages: int = Field(200, ge=1, le=1000, alias="DOCUMENT_IMPORT_MAX_PDF_PAGES")
+    # Memory limit of a conversion's child process (enforced where the OS supports RLIMIT_AS, i.e. Linux; not macOS).
+    document_import_memory_mb: int = Field(1536, ge=256, le=8192, alias="DOCUMENT_IMPORT_MEMORY_MB")
+
+    # ------------------------------------------------------------------
     # AI email templates (src/email_template). The model writes JSON blocks; code validates them.
     # ------------------------------------------------------------------
     email_ai_enabled: bool = Field(True, alias="EMAIL_AI_ENABLED")                # False = /agent/email/* return 503
@@ -313,6 +361,10 @@ class Settings(BaseSettings):
     longform_freeze_quotes: bool = Field(True, alias="LONGFORM_FREEZE_QUOTES")             # False = quotes are polished, still verified
     longform_repair_enabled: bool = Field(True, alias="LONGFORM_REPAIR_ENABLED")           # one repair call per failing chunk
     longform_word_ratio: str = Field("", alias="LONGFORM_WORD_RATIO")                      # JSON override of the ratio windows
+    # Shorten (make_shorter) runs on the advanced-tier model: measured on a real document, the basic tier shortened a passage by 2-9% whatever it
+    # was told, the advanced tier by 15-30% with every structure check passing. Credits are priced per character, not per tier, so this costs the
+    # platform more per request on managed plans (not the user). False = every operation uses the tier its single call uses.
+    longform_tier_overrides: bool = Field(True, alias="LONGFORM_TIER_OVERRIDES")
     longform_call_timeout_seconds: float = Field(150.0, ge=0, le=900, alias="LONGFORM_CALL_TIMEOUT_SECONDS")   # one model call; 0 = no limit
 
     # ------------------------------------------------------------------
