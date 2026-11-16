@@ -62,6 +62,8 @@ hold for manual reconciliation instead of risking a double charge.
 ## Deployment and operations
 
 - Run the normal FastAPI lifespan. It starts and stops the delivery worker around the Redis connection lifecycle. Upgrade every application worker so all reservation checks include pending billing.
+- The worker gets the next due time from its claim script and sleeps for up to 60 seconds between checks when nothing is due. An enqueue in the same process wakes it immediately. After a Redis error the retry delay starts at 2–4 seconds and grows to 58–60 seconds. Each worker logs the first failure, changes in the failure reason, and recovery.
+- For staging's 500,000-command Upstash plan, use the [Upstash database stats API](https://upstash.com/docs/devops/developer-api/redis/get_database_stats) from the monitoring service. Check `total_monthly_requests` against the staging quota dashboard and alert at 350,000 and 400,000 commands. Send each alert once per billing month.
 - Keep `CREDIT_PRECHECK_ENABLED=true` for managed accounts. Disabling it intentionally disables admission checks against available credits.
 - Use Redis persistence appropriate for financial delivery records, with eviction disabled for the billing data. Surviving an application restart relies on the queued data surviving in Redis; this is not a backup against Redis data loss or a crash before usage can be enqueued.
 - Configure `BACKEND_WEBHOOK_URL`, `WEBHOOK_SECRET` and the existing settlement delay. HTTP redirects are not followed, so webhook credentials are not forwarded to a redirected host.

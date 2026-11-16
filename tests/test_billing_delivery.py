@@ -1,12 +1,15 @@
 """Run the real billing Lua scripts against an isolated Redis emulator, never the account store."""
 import json
+import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-import threading
+from unittest.mock import Mock, call
 
 import fakeredis
 import pytest
 import requests
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 import src.billing_delivery as delivery
 import src.webhook as webhook
@@ -18,7 +21,11 @@ def world(monkeypatch):
     redis = fakeredis.FakeRedis(decode_responses=True)
     redis.hset('subscription:u1', mapping={'remaining_credits': 10, 'purchased_credits': 0})
     now = [1000.0]
-    monkeypatch.setattr(delivery, 'time', SimpleNamespace(time=lambda: now[0]))
+
+    def clock():
+        return now[0]
+
+    monkeypatch.setattr(delivery, 'time', SimpleNamespace(time=clock, monotonic=clock))
     box = delivery.BillingDelivery(redis, 'https://billing.invalid', 'test-secret')
     credits = CreditManager(redis)
     monkeypatch.setattr(webhook, '_billing_delivery', box)
@@ -194,18 +201,124 @@ def test_missing_configuration_retains_the_pending_charge_without_a_network_call
     assert world.redis.get(delivery.pending_credits_key('u1')) == '10'
 
 
-def test_background_worker_drains_acknowledged_messages_and_stops_cleanly(world, monkeypatch):
+def test_idle_worker_claims_once_per_minute_without_an_extra_schedule_lookup(world, monkeypatch):
+    assert world.box.process_once() is False  # Load the Lua script before counting steady-state checks.
+    execute = Mock(wraps=world.redis.execute_command)
+    monkeypatch.setattr(world.redis, 'execute_command', execute)
+    waits = []
+
+    def advance(seconds):
+        waits.append(seconds)
+        world.now[0] += seconds
+        if len(waits) == 3:
+            world.box._stop.set()
+
+    monkeypatch.setattr(world.box._wake, 'wait', advance)
+    world.box.start()
+    world.box._thread.join(timeout=3)
+    world.box.stop()
+    assert waits == [60, 60, 60]
+    assert [args[0] for args, _ in execute.call_args_list] == ['EVALSHA'] * 3
+
+
+def test_background_worker_waits_for_retry_and_settlement_with_credits_held(world, monkeypatch):
+    world.box.allow_retries = True
+    assert world.credits.reserve('u1', 10)[0]
+    bill(world, delay=63.25)
+    world.redis.zadd(delivery.DUE, {'stale-event': world.now[0] - 1})
+    calls, waits = [], []
+
+    def post(*args, **kwargs):
+        calls.append((world.now[0], kwargs['headers']['Idempotency-Key']))
+        return SimpleNamespace(status_code=500 if len(calls) == 1 else 200)
+
+    def advance(seconds):
+        hold = world.redis.get(delivery.pending_credits_key('u1'))
+        waits.append((seconds, hold))
+        world.now[0] += seconds
+        if hold is None or len(waits) == 5:
+            world.box._stop.set()
+
+    monkeypatch.setattr(delivery.requests, 'post', post)
+    monkeypatch.setattr(world.box._wake, 'wait', advance)
+    world.box.start()
+    world.box._thread.join(timeout=3)
+    world.box.stop()
+    assert waits == [(0, '10'), (2, '10'), (60, '10'), (3.25, '10'), (60, None)]
+    assert calls == [(1000, 'event-1'), (1002, 'event-1')]
+    assert world.redis.hlen(delivery.JOBS) == world.redis.zcard(delivery.DUE) == 0
+
+
+@pytest.mark.parametrize('jitter', [0, 2])
+def test_background_worker_jitters_backoff_and_logs_redis_state_changes(world, monkeypatch, caplog, jitter):
+    caplog.set_level(logging.INFO, logger=delivery.__name__)
     bill(world)
-    released = threading.Event()
+    quota_error = delivery.ResponseError('max requests limit exceeded. Limit: 500000, Usage: 500001')
+    connection_error = RedisConnectionError('private connection details')
+    claim = world.box._claim
+    post = Mock(return_value=SimpleNamespace(status_code=200))
+    sample_jitter = Mock(return_value=jitter)
+    retries, holds, idle = [], [], Mock()
+
+    def claim_when_available(**kwargs):
+        if len(retries) < 3 or idle.called:
+            raise quota_error
+        if len(retries) < 7:
+            raise connection_error
+        return claim(**kwargs)
+
+    def wait_before_retry(seconds):
+        retries.append(seconds)
+        world.now[0] += seconds
+        holds.append(world.redis.get(delivery.pending_credits_key('u1')))
+        world.box._wake.set()
+        if len(retries) == 8:
+            world.box._stop.set()
+
+    monkeypatch.setattr(delivery.requests, 'post', post)
+    monkeypatch.setattr(delivery, 'random', SimpleNamespace(uniform=sample_jitter))
+    monkeypatch.setattr(world.box, '_claim', claim_when_available)
+    monkeypatch.setattr(world.box._stop, 'wait', wait_before_retry)
+    monkeypatch.setattr(world.box._wake, 'wait', idle)
+    world.box.start()
+    world.box._thread.join(timeout=3)
+    world.box.stop()
+    assert retries == [delay + jitter for delay in [2, 4, 8, 16, 32, 58, 58, 2]]
+    assert sample_jitter.call_args_list == [call(0, 2)] * 8
+    assert holds == ['10'] * 7 + [None]
+    assert post.call_count == 1
+    assert idle.call_args_list == [call(60)]
+    messages = [record.getMessage() for record in caplog.records if record.name == delivery.__name__]
+    assert len(messages) == 4
+    assert messages[0].startswith('Billing delivery paused (quota_exhausted).')
+    assert messages[0].endswith('Upstash max requests limit exceeded. Limit 500000, usage 500001.')
+    assert messages[1].startswith('Billing delivery paused (ConnectionError).')
+    assert messages[2] == f'Billing delivery recovered after {sum(retries[:7]):.1f}s and 7 failed checks.'
+    assert messages[3] == messages[0]
+    assert 'private connection details' not in caplog.text
+
+
+def test_enqueue_wakes_idle_worker_for_delivery_and_settlement(world, monkeypatch):
+    parked, released = threading.Event(), threading.Event()
+    wake_wait = world.box._wake.wait
     complete = world.box._complete
+
+    def observe_wait(seconds):
+        parked.set()
+        return wake_wait(seconds)
+
     def observed_complete(**kwargs):
         result = complete(**kwargs)
         released.set()
         return result
+
+    monkeypatch.setattr(world.box._wake, 'wait', observe_wait)
     monkeypatch.setattr(world.box, '_complete', observed_complete)
     monkeypatch.setattr(delivery.requests, 'post', lambda *a, **kw: SimpleNamespace(status_code=200))
     world.box.start()
     try:
+        assert parked.wait(3)
+        bill(world)
         assert released.wait(3)
     finally:
         world.box.stop()

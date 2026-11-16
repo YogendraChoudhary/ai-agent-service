@@ -4,17 +4,22 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
+import re
 import threading
 import time
 import uuid
 
 import requests
+from redis.exceptions import ResponseError
 
 logger = logging.getLogger(__name__)
 JOBS = 'agent:billing:jobs'
 DUE = 'agent:billing:due'
 LEASES = 'agent:billing:leases'
 LEASE_SECONDS = 30
+MAX_POLL_SECONDS = 60
+INITIAL_REDIS_BACKOFF_SECONDS = 2
 
 
 def pending_credits_key(user_id):
@@ -46,11 +51,15 @@ return 1
 """
 
 _CLAIM = """
-local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, 1)
-if #ids == 0 then return {} end
-local id = ids[1]
+local next_job = redis.call('ZRANGE', KEYS[2], 0, 0, 'WITHSCORES')
+if #next_job == 0 then return {} end
+if tonumber(next_job[2]) > tonumber(ARGV[1]) then return {next_job[2]} end
+local id = next_job[1]
 local job = redis.call('HGET', KEYS[1], id)
-if not job then redis.call('ZREM', KEYS[2], id); return {} end
+if not job then
+  redis.call('ZREM', KEYS[2], id)
+  return {ARGV[1]} -- another job could already be due
+end
 redis.call('ZADD', KEYS[2], ARGV[2], id)
 redis.call('HSET', KEYS[3], id, ARGV[3])
 return {id, job}
@@ -117,11 +126,18 @@ class BillingDelivery:
         return bool(self._update(keys=[JOBS, DUE, LEASES],
             args=[event_id, token, _json(job), due, int(release)]))
 
-    def process_once(self):
+    def process_once(self) -> bool:
+        processed, _ = self._process_due_job()
+        return processed
+
+    def _process_due_job(self) -> tuple[bool, float | None]:
+        """Process one job or return the earliest time to check again."""
         now, token = time.time(), uuid.uuid4().hex
         claimed = self._claim(keys=[JOBS, DUE, LEASES], args=[now, now + LEASE_SECONDS, token])
         if not claimed:
-            return False
+            return False, None
+        if len(claimed) == 1:
+            return False, float(claimed[0])
         event_id, raw = claimed
         if isinstance(event_id, bytes):
             event_id = event_id.decode()
@@ -129,15 +145,15 @@ class BillingDelivery:
         if job['state'] == 'acknowledged':
             self._complete(keys=[JOBS, DUE, LEASES, pending_credits_key(job['payload']['user_id']),
                 f'agent:billing:done:{event_id}'], args=[event_id, token])
-            return True
+            return True, None
         # A failed response or timeout may follow a committed charge; retries need receiver-side deduplication.
         if not self.url or not self.secret or (job['attempts'] and not self.allow_retries):
             self._save(event_id, token, job, now + 300)
             logger.error('Billing event %s held pending configuration or reconciliation', event_id)
-            return True
+            return True, None
         job['attempts'] += 1
         if not self._save(event_id, token, job, now + LEASE_SECONDS, release=False):
-            return True
+            return True, None
         try:
             response = requests.post(self.url, json=job['payload'], headers={
                 'Content-Type': 'application/json', 'X-Webhook-Secret': self.secret,
@@ -154,18 +170,53 @@ class BillingDelivery:
             due = time.time() + min(300, 2 ** min(job['attempts'], 9)) if self.allow_retries else time.time() + 300
             logger.error('Billing event %s unacknowledged (%s); credits remain held', event_id, job['last_error'])
         self._save(event_id, token, job, due)
-        return True
+        return True, None
 
     def start(self):
         def work():
-            while not self._stop.is_set():
+            error_delay = INITIAL_REDIS_BACKOFF_SECONDS
+            last_error = None
+            failed_checks = 0
+            outage_started = 0.0
+            while True:
                 self._wake.clear()
+                if self._stop.is_set():
+                    return
                 try:
-                    if self.process_once():
-                        continue
+                    processed, next_due = self._process_due_job()
                 except Exception as error:
-                    logger.error('Billing delivery paused (%s); pending charges retained', type(error).__name__)
-                self._wake.wait(1)
+                    retry_in = error_delay + random.uniform(0, INITIAL_REDIS_BACKOFF_SECONDS)
+                    reason = type(error).__name__
+                    message = str(error) if isinstance(error, ResponseError) else ''
+                    if 'max requests limit exceeded' in message.lower():
+                        reason = 'quota_exhausted'
+                    if last_error is None:
+                        outage_started = time.monotonic()
+                    if reason != last_error:
+                        detail = ''
+                        if reason == 'quota_exhausted':
+                            detail = ' Upstash max requests limit exceeded.'
+                            quota = re.search(r'Limit:\s*(\d+),\s*Usage:\s*(\d+)', message, re.IGNORECASE)
+                            if quota:
+                                detail += f' Limit {quota[1]}, usage {quota[2]}.'
+                        logger.error('Billing delivery paused (%s). Retrying in %.1fs with pending charges retained.%s',
+                                     reason, retry_in, detail)
+                        last_error = reason
+                    failed_checks += 1
+                    self._stop.wait(retry_in)
+                    error_delay = min(MAX_POLL_SECONDS - INITIAL_REDIS_BACKOFF_SECONDS, error_delay * 2)
+                    continue
+                if last_error is not None:
+                    logger.info('Billing delivery recovered after %.1fs and %d failed checks.',
+                                time.monotonic() - outage_started, failed_checks)
+                    last_error = None
+                    failed_checks = 0
+                error_delay = INITIAL_REDIS_BACKOFF_SECONDS
+                if not processed:
+                    wait = MAX_POLL_SECONDS
+                    if next_due is not None:
+                        wait = min(wait, max(0, next_due - time.time()))
+                    self._wake.wait(wait)
         self._thread = threading.Thread(target=work, name='billing-delivery', daemon=True)
         self._thread.start()
 
