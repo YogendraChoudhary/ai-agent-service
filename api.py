@@ -1798,6 +1798,7 @@ async def autocomplete_text(
     is_byok: bool = False
     model_provider: str = request_data.model  # already validated by Pydantic
     autocomplete_reserved: bool = False
+    start_trace(request_id, '/agent/autocomplete', chat_model=model_provider)
 
     try:
         text_before = request_data.text_before
@@ -1819,6 +1820,7 @@ async def autocomplete_text(
                     f"[{request_id}] Autocomplete blocked: insufficient credits "
                     f"(available={available})"
                 )
+                finish_trace(request_id, 'rejected', error='insufficient credits', http_status=402)
                 return JSONResponse(
                     status_code=402,
                     content={
@@ -1888,13 +1890,18 @@ async def autocomplete_text(
                 )
                 logger.info(f"[{request_id}] Autocomplete credit deduction fired for user={user_id}")
 
+        finish_trace(request_id, 'ok', http_status=200)
         return JSONResponse(
             status_code=200,
             content={'success': True, 'suggestion': suggestion},
             headers={"X-Request-ID": request_id},
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        finish_trace(request_id, 'rejected', http_status=exc.status_code)
+        raise
+    except asyncio.CancelledError:
+        finish_trace(request_id, 'aborted')
         raise
     except Exception as e:
         total_duration = time.time() - start_time
@@ -1921,6 +1928,7 @@ async def autocomplete_text(
         except Exception:
             pass
 
+        finish_trace(request_id, 'error', error=type(e).__name__, http_status=500)
         return JSONResponse(
             status_code=500,
             content={'error': str(e)},

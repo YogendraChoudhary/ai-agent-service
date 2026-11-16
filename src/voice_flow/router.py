@@ -31,10 +31,11 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from config import settings
+from src.observability import finish_trace, start_trace
 from src.voice_flow.asr.audio import WHISPER_RATE, decode_audio_bytes
 from src.voice_flow.asr.whisper_client import get_transcriber
 from src.voice_flow.access import Caller, Gate
-from src.voice_flow.formatter.engine import CompileResult, LlmError, VoiceFormattingService, build_backend_for
+from src.voice_flow.formatter.engine import CompileResult, LlmError, VoiceFormattingService, build_backend_for, voice_request_id
 from src.voice_flow.formatter.post_processor import PostProcessor, Stitched
 from src.voice_flow.schemas import AppContext, CursorContext, DictateContext, DictateResponse, Timings
 
@@ -214,10 +215,26 @@ async def dictate(request: Request, background: BackgroundTasks, audio: Optional
     if _in_flight >= MAX_DICTATIONS_IN_FLIGHT:                        # a client that cannot keep up must not pile work on the speech model
         raise HTTPException(status_code=429, detail="too many dictations are being processed; try again in a moment",
                             headers={"Retry-After": "2"})
+    request_id = uuid.uuid4().hex[:8]
+    start_trace(request_id, "/v1/voice/dictate")
+    usage_context = voice_request_id.set(request_id)
     _in_flight += 1
     try:
-        return await _dictate(data, ctx, caller)
+        response = await _dictate(data, ctx, caller)
+    except HTTPException as exc:
+        finish_trace(request_id, "rejected", http_status=exc.status_code)
+        raise
+    except asyncio.CancelledError:
+        finish_trace(request_id, "aborted")
+        raise
+    except Exception as exc:
+        finish_trace(request_id, "error", error=type(exc).__name__, http_status=500)
+        raise
+    else:
+        finish_trace(request_id, "ok", http_status=200)
+        return response
     finally:
+        voice_request_id.reset(usage_context)
         _in_flight -= 1
 
 

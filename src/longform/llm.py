@@ -214,7 +214,7 @@ class AgnoLLM:
         else:
             content, metrics = self._stream(tpa, agent, candidate, history, spec.on_text)
         model_id = model_id_for(candidate, spec.use_web, self.agent_type)
-        record_text_usage(self.request_id, model_id, metrics)
+        record_text_usage(self.request_id, model_id, metrics, feature=spec.stage)
         served = (candidate.provider, model_id)
         with self._lock:
             if spec.stage == "outline":

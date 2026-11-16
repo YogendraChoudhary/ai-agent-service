@@ -57,6 +57,12 @@ Other models follow the same pattern: `MODEL_<ADVANCED|BASIC|AUTOCOMPLETE|DESIGN
 
 A user's own (BYOK) key failing is counted but never alerts.
 
+### Prompt-cache usage
+
+`REQUEST_SUMMARY` includes a `cache_usage` list for observed text-model responses. Each row identifies the feature, provider and model. For the share of calls with a hit, divide the sum of `hit_calls` by the sum of `read_reported_calls`. For the share of input tokens served from cache, divide the sum of `cache_read_tokens` by the sum of `input_tokens_with_read_data`. Aggregate both across workers using the structured logs.
+
+A zero token count is a reported zero. A null token count means the provider did not report it. `write_reported_calls` shows how many responses contributed write counts. These counters are separate from the existing cost estimate and billing.
+
 ## 5. Expected numbers (from the measurements; alarm if a p50 doubles)
 
 Claude: autocomplete median ~1.0-1.2 s; classifier ~1.1 s; quick edits ~1.8 s; long-document grammar ~11 s per document; code generation ~14 s median (was 61 s); design canvas ~11 s (was 25 s). OpenAI: enhance ~1.6 s; design canvas on Sol ~11 s; blog (gpt-5.2, pinned) ~41 s; code (gpt-5.2, pinned) ~13 s.

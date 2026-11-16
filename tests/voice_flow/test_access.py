@@ -347,6 +347,27 @@ class TestPersonalBackends:
 
 
 class TestWiring:
+    def test_voice_formatter_reports_cache_usage_without_changing_request(self, world, monkeypatch):
+        from anthropic.types import Usage
+
+        from src.observability import recent_summaries
+
+        backend = build_backend_for("claude", "unused")
+        create = AsyncMock(return_value=SimpleNamespace(
+            stop_reason="end_turn", content=[SimpleNamespace(type="text", text=TASKS)],
+            usage=Usage(input_tokens=30, output_tokens=10, cache_read_input_tokens=600, cache_creation_input_tokens=0),
+        ))
+        backend._client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        monkeypatch.setattr(router_module, "_service", VoiceFormattingService(backend=backend, mode="always"))
+        response = dictate(world.client, headers=AUTH)
+        assert response.status_code == 200 and response.json()["formatted_text"] == TASKS
+        summary = recent_summaries(1)[0]
+        assert summary["endpoint"] == "/v1/voice/dictate"
+        (usage,) = summary["cache_usage"]
+        assert (usage["feature"], usage["provider"]) == ("voice_formatting", "claude")
+        assert (usage["cache_read_tokens"], usage["cache_write_tokens"]) == (600, 0)
+        assert isinstance(create.call_args.kwargs["system"], str) and "cache_control" not in create.call_args.kwargs
+
     def test_the_production_app_installs_the_gate(self):
         import api
         if not settings.voice_flow_enabled:

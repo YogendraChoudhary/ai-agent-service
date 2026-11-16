@@ -15,12 +15,14 @@ import asyncio
 import logging
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple
 
 from config import settings
 from src.models import AUTOCOMPLETE_MODEL_IDS, claude_accepts_temperature, claude_light_request_params, ensure_allowed_model
+from src.observability import record_provider_usage
 from src.voice_flow.formatter.claims import CLEAN_KINDS, POLISHED_KINDS, missing_claims
 from src.voice_flow.formatter.gate import needs_model
 from src.voice_flow.formatter.patterns import GREETING_DETECT_RE
@@ -51,6 +53,9 @@ class LlmBackend(Protocol):
     name: str
 
     async def generate(self, system: str, turns: Turns, *, max_output_tokens: int, timeout: float) -> str: ...
+
+
+voice_request_id: ContextVar[Optional[str]] = ContextVar("voice_request_id", default=None)
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,7 @@ class GeminiBackend:
             type(self)._model_thinking_variants[self.model] = current_variant
             break
 
+        record_provider_usage(voice_request_id.get(), "voice_formatting", self.name, self.model, response)
         if not response.candidates:
             block = getattr(response.prompt_feedback, "block_reason", None) or "no candidates"
             raise LlmError(f"blocked ({block})", is_content_block=True)
@@ -219,6 +225,7 @@ class OpenAIBackend:
                 raise LlmError(f"{self.name} connection error") from None
             break
 
+        record_provider_usage(voice_request_id.get(), "voice_formatting", self.name, self.model, response)
         choice = response.choices[0]
         if choice.finish_reason == "content_filter":
             raise LlmError("content filter", is_content_block=True)
@@ -257,6 +264,7 @@ class ClaudeBackend:
             raise LlmError(f"claude {exc.status_code}", permanent=exc.status_code in PERMANENT_CODES) from None
         except anthropic.APIConnectionError:
             raise LlmError("claude connection error") from None
+        record_provider_usage(voice_request_id.get(), "voice_formatting", self.name, self.model, response)
         if response.stop_reason == "max_tokens":
             raise LlmError("truncated at max_output_tokens")
         text = "".join(block.text for block in response.content if block.type == "text").strip()

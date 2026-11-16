@@ -55,12 +55,12 @@ def _call(text, provider, key, timeout, request_id=None, system=_SYSTEM, max_tok
                     timeout=int(max(timeout, sdk_deadline_floor) * 1000), retry_options=types.HttpRetryOptions(attempts=1))) as gemini_client:
                 model.client = gemini_client
                 response = Agent(model=model, instructions=system, telemetry=False).run(text)
-                record_text_usage(request_id, model.id, getattr(response, 'metrics', None))
+                record_text_usage(request_id, model.id, getattr(response, 'metrics', None), feature='intent_classifier')
                 return _answer(response, provider, model.id, RunStatus)
         else:
             model.client_params = {'http_client': client, 'max_retries': 0}
         response = Agent(model=model, instructions=system, telemetry=False).run(text)
-        record_text_usage(request_id, model.id, getattr(response, 'metrics', None))
+        record_text_usage(request_id, model.id, getattr(response, 'metrics', None), feature='intent_classifier')
         return _answer(response, provider, model.id, RunStatus)
 
 

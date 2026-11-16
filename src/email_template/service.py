@@ -122,6 +122,7 @@ def make_agno_llm(model_provider: str, api_key: str, request_id: Optional[str] =
     from agno.agent import Agent
     from agno.models.message import Message
 
+    from src.observability import record_text_usage
     from src.text_processing_agent import _agent_error_message, get_model
 
     def call(system: str, messages: list[dict]) -> str:
@@ -131,6 +132,7 @@ def make_agno_llm(model_provider: str, api_key: str, request_id: Optional[str] =
                       telemetry=False)
         history = [Message(role=m["role"], content=m["content"]) for m in messages]
         response = agent.run(history, stream=False)
+        record_text_usage(request_id, model.id, getattr(response, "metrics", None), feature="email_generation")
         # agno does not raise on provider failures (bad key, outage): the run comes back with status ERROR and
         # the error text as content. Never mistake that for the model's reply.
         if is_failed_run(response):

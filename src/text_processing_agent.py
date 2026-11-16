@@ -6,11 +6,7 @@ Supports dynamic model selection: OpenAI, Claude, Grok, DeepSeek, Gemini
 
 from agno.agent import Agent, RunEvent
 from agno.media import Image as AgnoImage
-from agno.models.openai import OpenAIChat
-from agno.models.anthropic import Claude
-from agno.models.xai import xAI
-from agno.models.deepseek import DeepSeek
-from agno.models.google import Gemini
+from .prompt_cache_usage import Claude, DeepSeek, Gemini, Grok, OpenAIChat
 from agno.tools.duckduckgo import DuckDuckGoTools
 from .models import (
     ADVANCED_MODEL_IDS,
@@ -31,7 +27,7 @@ from .models import (
 from .autocomplete_join import apply_join_tag, fix_join, is_commentary
 from .net_safety import is_public_ip
 from .security_guardrails import sanitize_web_content
-from .observability import trace_mark, trace_set
+from .observability import record_provider_usage, trace_mark, trace_set
 from .document_context import ContextRange, PreparedContext, OUTPUT_TOKENS
 from .blog.prompts import section_system_prompt
 from typing import Optional, Dict, Any, Union
@@ -501,7 +497,7 @@ def get_model(
             **limits,
         )
     elif model_provider == 'grok':
-        model = xAI(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params, **limits)
+        model = Grok(id=model_id, api_key=api_key, temperature=temperature, client_params=client_params, **limits)
     elif model_provider == 'deepseek':
         if model_id == 'deepseek-reasoner':
             # deepseek-reasoner rejects custom temperature
@@ -2949,7 +2945,7 @@ def process_user_query_stream(
             repaired = agent.run(query + '\n\n' + repair_prompt(reply, errors), stream=False, images=images)
             if getattr(repaired, 'status', None) == RunStatus.error or getattr(repaired, 'event', None) == RunEvent.run_error:
                 raise RuntimeError(_agent_error_message(provider, getattr(repaired, 'content', None)))
-            record_text_usage(request_id, model_id, getattr(repaired, 'metrics', None))
+            record_text_usage(request_id, model_id, getattr(repaired, 'metrics', None), feature='code_repair')
             corrected = getattr(repaired, 'content', '') or ''
             errors = validate_code(corrected)
             validation = {'status': 'failed' if errors else 'repaired', 'errors': errors}
@@ -3386,13 +3382,6 @@ def _design_reference_image(image_bytes: bytes) -> bytes:
     return converted
 
 
-def _record_design_usage(request_id: str, model_id: str, tokens_in, tokens_out) -> None:
-    """Tokens and estimated cost of one design call, on the request trace (requests.jsonl, /agent/metrics)."""
-    if tokens_in is not None and tokens_out is not None:
-        from .observability import record_text_usage
-        record_text_usage(request_id, model_id, {"input_tokens": tokens_in, "output_tokens": tokens_out})
-
-
 def _run_design_json_completion(
     messages: list[dict],
     image_bytes: Optional[bytes],
@@ -3458,16 +3447,13 @@ def _run_design_json_completion(
             max_tokens=claude_cap,
             **claude_kwargs,
         )
+        record_provider_usage(request_id, 'design_canvas', provider, model_id, resp)
         if getattr(resp, "stop_reason", None) == "refusal":
             details = getattr(resp, "stop_details", None)
             raise ValueError(f"Claude declined the design request ({getattr(details, 'category', None) or 'no category given'})")
         if getattr(resp, "stop_reason", None) == "max_tokens":
             logger.warning(f"{log_prefix}Claude design output truncated at max_tokens ({claude_cap})")
             raise ValueError(f"Design output truncated by model at max_tokens limit ({claude_cap})")
-        usage = getattr(resp, "usage", None)
-        _record_design_usage(request_id, model_id, usage and (
-            (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
-            + (getattr(usage, "cache_creation_input_tokens", 0) or 0)), usage and usage.output_tokens)
         # By block type: Opus 5.5 can put a thinking block (no .text) before the answer
         return "".join(b.text for b in (resp.content or []) if getattr(b, "type", "text") == "text")
 
@@ -3502,14 +3488,13 @@ def _run_design_json_completion(
         if provider == "openai":
             kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
+        record_provider_usage(request_id, 'design_canvas', provider, model_id, resp)
         choices = getattr(resp, "choices", None)
         if choices:
             choice = choices[0]
             if getattr(choice, "finish_reason", None) == "length":
                 logger.warning(f"{log_prefix}{provider} design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
                 raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
-            usage = getattr(resp, "usage", None)
-            _record_design_usage(request_id, model_id, usage and usage.prompt_tokens, usage and usage.completion_tokens)
             return choice.message.content or ""
         return ""
 
@@ -3542,15 +3527,13 @@ def _run_design_json_completion(
                 response_mime_type="application/json",
             ),
         )
+        record_provider_usage(request_id, 'design_canvas', provider, model_id, resp)
         candidates = getattr(resp, "candidates", None)
         if candidates:
             finish = str(getattr(candidates[0], "finish_reason", ""))
             if "MAX_TOKENS" in finish.upper():
                 logger.warning(f"{log_prefix}Gemini design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
                 raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
-        usage = getattr(resp, "usage_metadata", None)
-        _record_design_usage(request_id, model_id, usage and usage.prompt_token_count,
-                             usage and usage.candidates_token_count)
         return getattr(resp, "text", "") or ""
 
     raise ValueError(f"Unsupported provider for design canvas: {provider}")
@@ -3639,6 +3622,7 @@ def get_autocomplete_suggestion(
                 max_tokens=100,
                 temperature=0.3,
             )
+            record_provider_usage(request_id, 'autocomplete', model_provider, model_id, response)
             suggestion = response.choices[0].message.content or ""
 
         elif model_provider == 'claude':
@@ -3660,6 +3644,7 @@ def get_autocomplete_suggestion(
                 max_tokens=100,
                 **claude_kwargs,
             )
+            record_provider_usage(request_id, 'autocomplete', model_provider, model_id, response)
             # By block type: a reply can start with a thinking block, and a refusal has no text at all (-> no suggestion)
             suggestion = "".join(b.text for b in (response.content or []) if getattr(b, "type", None) == "text")
 
@@ -3676,6 +3661,7 @@ def get_autocomplete_suggestion(
                     temperature=0.3,
                 ),
             )
+            record_provider_usage(request_id, 'autocomplete', model_provider, model_id, response)
             suggestion = response.text if response.text else ""
 
         # Minimal deterministic cleanup (whitespace, simple echo, spacing and

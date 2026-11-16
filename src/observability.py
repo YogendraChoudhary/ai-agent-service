@@ -194,7 +194,7 @@ def log_response_body(request_id: str, endpoint: str, body: Any) -> None:
         logger.info(f"📤 [{request_id}] {endpoint} RESPONSE {_clip(redact(body))}")
 
 
-def record_text_usage(request_id, model_id, metrics):
+def record_text_usage(request_id, model_id, metrics, *, feature=None):
     """Accumulate model/repair usage. A missing price or token count remains unknown."""
     from .models import TEXT_PRICES_PER_MTOK
     trace = get_trace(request_id)
@@ -203,6 +203,31 @@ def record_text_usage(request_id, model_id, metrics):
     data = metrics.to_dict() if hasattr(metrics, 'to_dict') else metrics
     if not isinstance(data, dict):
         return
+    feature = feature or trace.attrs.get('agent_type') or trace.attrs.get('type') or trace.endpoint
+    models = [(model_id, data.get('provider_metrics') or {})]
+    for entries in (data.get('details') or {}).values():
+        models.extend((entry.get('id') or model_id, entry.get('provider_metrics') or {}) for entry in entries)
+    cache_usage = [
+        {
+            'provider': counters['cache_provider'],
+            'model': model,
+            'feature': feature,
+            'calls': counters['cache_calls'],
+            'read_reported_calls': counters['cache_read_reported_calls'],
+            'hit_calls': counters['cache_hit_calls'],
+            'write_reported_calls': counters['cache_write_reported_calls'],
+            'input_tokens': counters.get('cache_input_tokens'),
+            'input_tokens_with_read_data': counters.get('cache_input_tokens_with_read_data'),
+            'cache_read_tokens': counters.get('cache_read_tokens'),
+            'cache_write_tokens': counters.get('cache_write_tokens'),
+            'cache_miss_tokens': counters.get('cache_miss_tokens'),
+        }
+        for model, counters in models if 'cache_provider' in counters
+    ]
+    if cache_usage:
+        with trace._lock:
+            trace.attrs['cache_usage'] = trace.attrs.get('cache_usage', []) + cache_usage
+
     tokens_in, tokens_out = data.get('input_tokens'), data.get('output_tokens')
     if tokens_in is None or tokens_out is None:
         return
@@ -214,6 +239,21 @@ def record_text_usage(request_id, model_id, metrics):
         trace.attrs.update(usage=usage, tokens_in=sum(u['tokens_in'] for u in usage),
                            tokens_out=sum(u['tokens_out'] for u in usage),
                            est_cost_usd=sum(u['est_cost_usd'] for u in usage) if all(u['est_cost_usd'] is not None for u in usage) else None)
+
+
+def record_provider_usage(request_id, feature, provider, model_id, response):
+    """Record usage from calls that bypass Agno."""
+    from .prompt_cache_usage import provider_usage
+
+    if get_trace(request_id) is None:
+        return
+    usage = getattr(response, 'usage_metadata' if provider == 'gemini' else 'usage', None)
+    tokens_in, tokens_out, counters = provider_usage(provider, usage)
+    record_text_usage(request_id, model_id, {
+        'input_tokens': tokens_in,
+        'output_tokens': tokens_out,
+        'provider_metrics': counters,
+    }, feature=feature)
 
 
 # ---------------------------------------------------------------------------
