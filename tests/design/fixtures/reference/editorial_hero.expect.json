@@ -1,0 +1,73 @@
+{
+  "source": "Synthetic design fixture",
+  "accents": [
+    "#872943"
+  ],
+  "spec": {
+    "canvas_background_hex": "#F6F0E5",
+    "regions": [
+      {
+        "id": "hero",
+        "parent_id": null,
+        "arrangement": "stack",
+        "text_ids": [
+          "t1",
+          "t2",
+          "t3",
+          "t4"
+        ]
+      }
+    ],
+    "texts": [
+      {
+        "id": "t1",
+        "text": "THE WEEKLY EDITION",
+        "approx_size_px": 19,
+        "color_hex": "#872943",
+        "role": "eyebrow",
+        "font_class": "mono",
+        "weight": "normal",
+        "uppercase": true,
+        "letter_spacing": "wide"
+      },
+      {
+        "id": "t2",
+        "text": "Notes from the field",
+        "approx_size_px": 72,
+        "color_hex": "#2B2021",
+        "role": "display",
+        "font_class": "serif",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t3",
+        "text": "Stories about getting to know a place.",
+        "approx_size_px": 27,
+        "color_hex": "#2B2021",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t4",
+        "text": "Read this week",
+        "approx_size_px": 26,
+        "color_hex": "#F6F0E5",
+        "role": "button",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      }
+    ],
+    "font_guess": {
+      "heading": "Instrument Serif",
+      "body": "Inter",
+      "mono": "IBM Plex Mono"
+    }
+  }
+}

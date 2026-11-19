@@ -81,12 +81,16 @@ def test_unacknowledged_delivery_keeps_credit_held_and_never_blindly_reposts(wor
     monkeypatch.setattr(delivery.requests, 'post', post)
     assert world.box.process_once()
     world.now[0] += 1000
-    assert world.box.process_once()
+    assert world.box.process_once() is False
     assert len(calls) == 1 and calls[0]['allow_redirects'] is False
     assert calls[0]['headers']['Idempotency-Key'] == 'event-1'
     assert world.redis.get(delivery.pending_credits_key('u1')) == '100'
     assert world.credits.reserve('u1', 10) == (False, 0)
-    assert job(world)['state'] == 'queued'
+    assert job(world)['state'] == 'reconciliation'
+    assert world.redis.zcard(delivery.DUE) == world.redis.hlen(delivery.LEASES) == 0
+    world.box.allow_retries = True
+    with pytest.raises(ValueError, match='no active receiver deduplication window'):
+        world.box.requeue('event-1')
 
 
 def test_confirmed_idempotent_receiver_retries_with_same_key_and_releases_only_after_ack_delay(world, monkeypatch):
@@ -192,13 +196,79 @@ def test_expired_lease_cannot_let_an_old_worker_overwrite_new_acknowledgement(wo
     assert world.redis.get(delivery.pending_credits_key('u1')) is None
 
 
-def test_missing_configuration_retains_the_pending_charge_without_a_network_call(world, monkeypatch):
+def test_never_attempted_charge_can_be_requeued_once_after_configuration_recovers(world, monkeypatch):
     world.box.url = ''
-    bill(world)
-    monkeypatch.setattr(delivery.requests, 'post', lambda *a, **kw: pytest.fail('No configured billing receiver'))
-    world.box.process_once()
+    bill(world, delay=3)
+    post = Mock(return_value=SimpleNamespace(status_code=200))
+    monkeypatch.setattr(delivery.requests, 'post', post)
+    assert world.box.process_once()
     assert job(world)['attempts'] == 0
+    assert job(world)['state'] == 'reconciliation'
     assert world.redis.get(delivery.pending_credits_key('u1')) == '10'
+    assert world.box.process_once() is False and post.call_count == 0
+    with pytest.raises(ValueError, match='configuration'):
+        world.box.requeue('event-1')
+    world.box.url = 'https://billing.invalid'
+    world.box._wake.clear()
+    second = delivery.BillingDelivery(world.redis, world.box.url, world.box.secret)
+    barrier = threading.Barrier(2)
+    read = world.redis.hget
+
+    def read_before_either_write(*args):
+        raw = read(*args)
+        barrier.wait(timeout=3)
+        return raw
+
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=2) as pool:
+        patch.setattr(world.redis, 'hget', read_before_either_write)
+        results = list(pool.map(lambda box: box.requeue('event-1'), [world.box, second]))
+    assert sorted(results) == [False, True]
+    assert world.box._wake.is_set() or second._wake.is_set()
+    assert world.redis.get(delivery.pending_credits_key('u1')) == '10'
+    assert world.box.process_once() and world.box.process_once() is False
+    assert post.call_count == 1 and post.call_args.kwargs['headers']['Idempotency-Key'] == 'event-1'
+    assert world.redis.get(delivery.pending_credits_key('u1')) == '10'
+    world.now[0] += 3
+    assert second.process_once() and world.box.requeue('event-1') is False
+    assert world.redis.get(delivery.pending_credits_key('u1')) is None
+
+
+def test_manual_replay_uses_the_original_payload_and_key_with_receiver_deduplication(world, monkeypatch):
+    world.box.allow_retries = True
+    bill(world, images=[])
+    post = Mock(side_effect=[SimpleNamespace(status_code=500), SimpleNamespace(status_code=200)])
+    monkeypatch.setattr(delivery.requests, 'post', post)
+    assert world.box.process_once()
+    world.box.allow_retries = False
+    world.now[0] += 2
+    assert world.box.process_once() and job(world)['state'] == 'reconciliation'
+    world.box.allow_retries = True
+    assert world.box.requeue('event-1')
+    assert world.redis.get(delivery.pending_credits_key('u1')) == '10'
+    assert world.box.process_once() and world.box.process_once()
+    assert post.call_count == 2 and post.call_args_list[0] == post.call_args_list[1]
+    assert world.redis.get(delivery.pending_credits_key('u1')) is None
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_old_attempts_are_parked_on_the_next_claim_without_unsafe_replay(world, monkeypatch, legacy):
+    world.box.allow_retries = True
+    bill(world)
+    post = Mock(return_value=SimpleNamespace(status_code=500))
+    monkeypatch.setattr(delivery.requests, 'post', post)
+    if legacy:
+        existing = job(world)
+        existing['attempts'] = 1
+        world.redis.hset(delivery.JOBS, 'event-1', json.dumps(existing))
+    else:
+        assert world.box.process_once()
+        world.now[0] += delivery.RETRY_WINDOW_SECONDS
+    assert world.box.process_once() and world.box.process_once() is False
+    assert post.call_count == (0 if legacy else 1)
+    assert job(world)['state'] == 'reconciliation'
+    assert world.redis.get(delivery.pending_credits_key('u1')) == '10'
+    with pytest.raises(ValueError, match='no active receiver deduplication window'):
+        world.box.requeue('event-1')
 
 
 def test_idle_worker_claims_once_per_minute_without_an_extra_schedule_lookup(world, monkeypatch):
@@ -362,7 +432,7 @@ def test_unreserved_billing_holds_cover_each_existing_price_type(world, options,
     assert world.redis.get(delivery.pending_credits_key('u1')) == str(expected_hold)
 
 
-def test_real_api_keeps_failed_billing_held_and_refuses_further_paid_work(monkeypatch):
+def test_real_api_keeps_uncertain_billing_held_until_confirmed_without_a_second_post(monkeypatch):
     from unittest.mock import AsyncMock
     from fastapi.testclient import TestClient
     import api
@@ -387,10 +457,7 @@ def test_real_api_keeps_failed_billing_held_and_refuses_further_paid_work(monkey
     posted = []
     def receiver(*args, **kwargs):
         posted.append(kwargs)
-        if len(posted) == 1:
-            return SimpleNamespace(status_code=500)
-        store.hset('subscription:u1', 'remaining_credits', 0)
-        return SimpleNamespace(status_code=200)
+        raise requests.Timeout('receiver charged the customer but the reply was lost')
     monkeypatch.setattr(delivery.requests, 'post', receiver)
     with TestClient(api.app) as client:
         response = client.post('/agent/stream', json=body())
@@ -400,12 +467,13 @@ def test_real_api_keeps_failed_billing_held_and_refuses_further_paid_work(monkey
         assert store.get(delivery.pending_credits_key('u1')) == '10'
         blocked = client.post('/agent/stream', json=body())
         assert blocked.status_code == 402 and len(state['calls']) == 1
-        box.allow_retries = True
         event_id, = store.hkeys(delivery.JOBS)
-        store.zadd(delivery.DUE, {event_id: 0})
-        assert box.process_once() and box.process_once()
-        assert len(posted) == 2
-        assert posted[0]['headers']['Idempotency-Key'] == posted[1]['headers']['Idempotency-Key']
+        store.hset('subscription:u1', 'remaining_credits', 0)
+        assert box.requeue(event_id, confirm_charged=True)
+        assert box.requeue(event_id, confirm_charged=True) is False
+        assert store.get(delivery.pending_credits_key('u1')) == '10'
+        assert box.process_once() and box.process_once() is False
+        assert len(posted) == 1
         assert store.get(delivery.pending_credits_key('u1')) is None
         assert client.post('/agent/stream', json=body()).status_code == 402
     assert webhook._billing_delivery is None

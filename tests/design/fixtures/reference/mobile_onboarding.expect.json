@@ -1,0 +1,72 @@
+{
+  "source": "Synthetic design fixture",
+  "accents": [
+    "#035F4C",
+    "#D5F4DD"
+  ],
+  "spec": {
+    "canvas_background_hex": "#F7FEF8",
+    "regions": [
+      {
+        "id": "screen",
+        "parent_id": null,
+        "arrangement": "stack",
+        "text_ids": [
+          "t1",
+          "t2",
+          "t3",
+          "t4"
+        ]
+      }
+    ],
+    "texts": [
+      {
+        "id": "t1",
+        "text": "Your daily reset",
+        "approx_size_px": 35,
+        "color_hex": "#035F4C",
+        "role": "heading",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t2",
+        "text": "Take a quiet minute.",
+        "approx_size_px": 24,
+        "color_hex": "#295847",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t3",
+        "text": "Set a reminder",
+        "approx_size_px": 25,
+        "color_hex": "#035F4C",
+        "role": "label",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t4",
+        "text": "Get started",
+        "approx_size_px": 24,
+        "color_hex": "#FFFFFF",
+        "role": "button",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      }
+    ],
+    "font_guess": {
+      "body": "Inter"
+    }
+  }
+}

@@ -39,6 +39,7 @@ def stream_refine(
     user_id: Optional[str],
     request_id: Optional[str],
     report_model: bool = False,
+    cancel_event=None,
 ) -> Iterator[Union[str, dict]]:
     """
     The refinement pipeline for one request. `candidates` are the providers the single call would have tried (the operation's
@@ -48,9 +49,9 @@ def stream_refine(
     if operation.advanced is not None and settings.longform_tier_overrides:
         candidates = [Candidate(c.provider, operation.advanced) for c in candidates]      # a failing provider still falls over to the next
     llm = AgnoLLM(candidates, key_for, request_id=request_id, user_id=user_id, is_byok=is_byok, agent_type="longform_refiner",
-                  timeout=float(settings.longform_call_timeout_seconds) or None)
+                  timeout=float(settings.longform_call_timeout_seconds) or None, cancel_event=cancel_event)
     reported = False
-    for chunk in refine_stream(text, instruction, operation, llm, refine_config(), request_id=request_id):
+    for chunk in refine_stream(text, instruction, operation, llm, refine_config(), request_id=request_id, cancel_event=cancel_event):
         if report_model and not reported and isinstance(chunk, str):
             reported = True
             model = llm.used or llm.drafting_model()               # the model that served the first chunk

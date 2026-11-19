@@ -97,12 +97,61 @@ _STYLE_CHANGE_RE = re.compile(
 _QUESTION_RE = re.compile(r"^\s*(?:what|why|how|which|who|when|where|is|are|does|do|did|was|were)\b", re.IGNORECASE)
 
 
+# ---------------------------------------------------------------------------
+# 5b. A screenshot as a template: "Design a page like this for pizzas", "based on this", "in this style". Needs a
+#     design verb at the start and a page-type noun, so "make a picture like this" stays an image request.
+# ---------------------------------------------------------------------------
+_TEMPLATE_CUE_RE = re.compile(
+    r"\b(?:like\s+this|like\s+that|similar\s+to\s+this|based\s+on\s+this|in\s+this\s+style|inspired\s+by\s+this|"
+    r"same\s+(?:layout|style|design|structure|look)|this\s+(?:layout|style|template|screenshot|design))\b",
+    re.IGNORECASE,
+)
+_PAGE_NOUN_RE = re.compile(
+    r"\b(?:page|pages|screen|screens|website|site|homepage|landing|layout|section|listing|menu|ui|interface|"
+    r"card|cards|banner|design|template|dashboard|app)\b",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# 5c. Same layout, new content: the screenshot is a template, not the copy. Its words are then not required in the
+#     design (live 2026-11-19: "...but for a page of pizzas ... instead of burgers" was checked for every burger
+#     name, which cost a 48 s repair asking to put them back and returned 24 false warnings).
+# ---------------------------------------------------------------------------
+_NEW_CONTENT_RE = re.compile(
+    r"\b(?:instead\s+of|rather\s+than|but\s+(?:for|with|about|showing|featuring)|inspired\s+by|"
+    r"(?:in|with)\s+(?:the\s+)?(?:same|this|that)\s+(?:style|layout|look|structure|format|design)|"
+    r"same\s+(?:style|layout|look|structure|format|design)\s+(?:but|for|with)|"
+    r"(?:like|similar\s+to|based\s+on)\s+this\b[^.?!]{0,40}?\b(?:for|about|featuring|showing|with)\b|"
+    r"(?:this|the)\s+(?:design|layout|page|screenshot|template)\s+for\s+(?:my|our|a|an)\b|"
+    r"(?:change|replace|swap)\s+(?:the\s+|all\s+the\s+)?(?:content|text|copy|items|products|dishes|names))",
+    re.IGNORECASE,
+)
+
+
+def wants_new_content(query: str) -> bool:
+    """A screenshot request that keeps the layout and style but asks for different content."""
+    return bool(_NEW_CONTENT_RE.search(query or ""))
+
+
+# ---------------------------------------------------------------------------
+# 6. Photo fill: with a design selected, a request for real photos/images/pictures goes to the image generation
+#    flow (fill the design's ImageNode placeholders), not to a layout edit, which cannot make photos.
+# ---------------------------------------------------------------------------
+_PHOTO_FILL_RE = re.compile(
+    r"\b(?:add|use|put|insert|fill|generate|create|make|replace|swap|show|give|get|place|load|regenerate|redo)\b"
+    r"[^.?!]{0,60}?\b(?:real\s+|actual\s+|proper\s+|stock\s+|realistic\s+|new\s+|different\s+)?"
+    r"(?:photos?|images?|pictures?|pics|photographs?|imagery)\b",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class DesignIntentDecision:
     """Immutable result of the deterministic design intent classifier."""
 
     is_design_request: bool
-    sub_mode: Optional[Literal["create_from_prompt", "create_from_vision", "edit_existing_ast"]] = None
+    sub_mode: Optional[Literal["create_from_prompt", "create_from_vision", "edit_existing_ast",
+                               "fill_design_images"]] = None
     reason: str = ""
 
 
@@ -135,6 +184,13 @@ def detect_design_intent(
         DesignIntentDecision (frozen dataclass).
     """
     clean_q = (query or "").strip()
+
+    # ------------------------------------------------------------------
+    # Rule F: a selected design + a request for photos. Checked before every edit rule: "add real photos" would
+    # otherwise be a layout edit. Questions ("can you add photos?") are answered as chat like other questions.
+    # ------------------------------------------------------------------
+    if has_existing_design_ast and _PHOTO_FILL_RE.search(clean_q) and not _QUESTION_RE.search(clean_q):
+        return DesignIntentDecision(True, "fill_design_images", "design_photo_fill_wording")
 
     # ------------------------------------------------------------------
     # Rule 0: Explicit operation override or active AST selection in the editor
@@ -176,6 +232,11 @@ def detect_design_intent(
         _VISION_RECREATE_RE.search(clean_q) or _DESIGN_ARTIFACT_RE.search(clean_q)
     ):
         return DesignIntentDecision(True, "create_from_vision", "vision_attachment_plus_ui_cue")
+
+    # Rule 2b: a screenshot used as a template ("Design a page like this for pizzas").
+    if (has_image_attachment and _DESIGN_ACTION_RE.search(clean_q) and _TEMPLATE_CUE_RE.search(clean_q)
+            and _PAGE_NOUN_RE.search(clean_q)):
+        return DesignIntentDecision(True, "create_from_vision", "vision_attachment_as_template")
 
     # ------------------------------------------------------------------
     # Rule 3: Start-anchored design verb + UI artifact keyword

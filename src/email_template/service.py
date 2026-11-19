@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -127,7 +128,7 @@ def make_agno_llm(model_provider: str, api_key: str, request_id: Optional[str] =
 
     def call(system: str, messages: list[dict]) -> str:
         model = get_model(model_provider, api_key, use_advanced=True, request_id=request_id,
-                          needs_tools=False, temperature=temperature, cache_model=not is_byok)
+                          needs_tools=False, temperature=temperature, cache_model=not is_byok, managed_retries=True)
         agent = Agent(name="Email Template Writer", model=model, instructions=system, markdown=False,
                       telemetry=False)
         history = [Message(role=m["role"], content=m["content"]) for m in messages]
@@ -143,7 +144,7 @@ def make_agno_llm(model_provider: str, api_key: str, request_id: Optional[str] =
 
 
 def make_routed_llm(candidates, key_for, request_id: Optional[str] = None, is_byok: bool = True,
-                    temperature: float = 0.3) -> LLM:
+                    temperature: float = 0.3, cancel_event=None) -> LLM:
     """
     make_agno_llm over the routed providers (task "writing", the request's model_source), in order: a provider that
     fails moves the call to the next one, as /agent/stream does. `call.used` holds the provider that last answered.
@@ -151,8 +152,11 @@ def make_routed_llm(candidates, key_for, request_id: Optional[str] = None, is_by
     used: dict = {}
 
     def call(system: str, messages: list[dict]) -> str:
+        from src.provider_work import check_cancelled
+
         last: Optional[EmailProviderError] = None
         for index, candidate in enumerate(candidates):
+            check_cancelled(cancel_event)
             key = key_for(candidate.provider)
             if not key:
                 continue
@@ -228,7 +232,8 @@ def generate(req: GenerateRequest, llm: LLM, request_id: Optional[str] = None) -
         outcomes = [one(0)]
     else:
         with ThreadPoolExecutor(max_workers=n, thread_name_prefix="email_variant") as pool:
-            outcomes = list(pool.map(one, range(n)))
+            futures = [pool.submit(copy_context().run, one, i) for i in range(n)]
+            outcomes = [future.result() for future in futures]
     results = [o for o in outcomes if isinstance(o, Result)]
     provider_errors = [o for o in outcomes if isinstance(o, EmailProviderError)]
     if not results:  # every variant failed at the provider: report that, not a validation failure

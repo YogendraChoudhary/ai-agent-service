@@ -112,7 +112,7 @@ def test_autocomplete_records_cache_usage_in_request_summary(monkeypatch):
         usage=Usage(input_tokens=30, output_tokens=10, cache_read_input_tokens=600, cache_creation_input_tokens=0),
     )
     client = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: mock_reply))
-    monkeypatch.setattr(tpa, "_get_cached_anthropic_client", lambda key: client)
+    monkeypatch.setattr(tpa, "_get_cached_anthropic_client", lambda key, **options: client)
     response = TestClient(api.app).post("/agent/autocomplete", json={"text_before": "I need", "api_key": "lic", "model": "claude"})
     assert response.status_code == 200
     summary = recent_summaries(1)[0]

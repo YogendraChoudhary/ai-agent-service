@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from contextvars import copy_context
 import time
 from collections import Counter
 from functools import partial
@@ -26,6 +27,7 @@ from typing import Iterator, Optional, Union
 from config import settings
 from src.longform.markdown_ast import parse
 from src.longform.ordered_stream import run_ordered
+from src.provider_work import check_cancelled
 from src.observability import trace_mark, trace_set
 
 from . import schema as s
@@ -70,7 +72,7 @@ def _outline_events(llm: LLM, request: BlogRequest, plan: BlogPlan, request_id: 
         except BaseException as error:                  # whatever it was, the consumer must wake up and raise it
             events.put(("error", error))
 
-    threading.Thread(target=work, name="blog_outline", daemon=True).start()
+    threading.Thread(target=copy_context().run, args=(work,), name="blog_outline", daemon=True).start()
     while True:
         kind, payload = events.get()
         if kind == "error":
@@ -95,6 +97,7 @@ def generate_blog_stream(
     sources: Optional[WebSources] = None,
     request_id: Optional[str] = None,
     parallel: Optional[int] = None,
+    cancel_event=None,
 ) -> Iterator[Union[str, dict]]:
     started = time.perf_counter()
     trace_set(request_id, mode="blog", blog_plan={
@@ -115,6 +118,7 @@ def generate_blog_stream(
     yield {"__event__": outline_event(outline)}
 
     # Pictures start now, in the background, so they are usually ready before the text that carries them.
+    check_cancelled(cancel_event)
     placed = start_images(media, outline)
     for sec_id, picture in placed.items():
         if picture.placeholder_id is None:
@@ -135,7 +139,8 @@ def generate_blog_stream(
     tasks = [partial(write_unit, llm, request, plan, outline, unit, units[i - 1].angle if i else None, sources, request_id)
              for i, unit in enumerate(units)]
     drafted, texts = [], [opening]
-    for i, part in enumerate(run_ordered(tasks, parallel or settings.blog_section_parallel, thread_name_prefix="blog_unit")):
+    for i, part in enumerate(run_ordered(tasks, parallel or settings.blog_section_parallel,
+                                         thread_name_prefix="blog_unit", cancel_event=cancel_event)):
         drafted.append(part)
         warnings.extend(part.warnings)
         if i == 0:

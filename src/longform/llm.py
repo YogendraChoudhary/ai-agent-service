@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
+from src.provider_work import MODEL_CALL_TIMEOUT_SECONDS, call_with_timeout, check_cancelled, check_provider_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,32 +34,6 @@ class CallSpec:
 
 # (system prompt, messages, spec) -> reply text. messages alternate user/assistant and end with a user turn.
 LLM = Callable[[str, List[dict], CallSpec], str]
-
-
-def call_with_timeout(fn: Callable[[], object], seconds: Optional[float], what: str = "The model call"):
-    """
-    `fn()`, but a call that has not answered after `seconds` raises TimeoutError("... timed out ...") instead of holding the request
-    for ever (seen live: a Gemini call that stayed open and silent for minutes). That error is one the fallback rules retry on the next
-    provider. The stuck call cannot be interrupted: its daemon thread ends when the socket does. None or 0 waits as long as it takes.
-    """
-    if not seconds:
-        return fn()
-    outcome: dict = {}
-
-    def run() -> None:
-        try:
-            outcome["value"] = fn()
-        except BaseException as error:               # handed to the caller below, with its traceback
-            outcome["error"] = error
-
-    worker = threading.Thread(target=run, name="llm-call", daemon=True)
-    worker.start()
-    worker.join(seconds)
-    if worker.is_alive():
-        raise TimeoutError(f"{what} timed out after {seconds:g}s")
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome["value"]
 
 
 def model_id_for(candidate, use_web: bool = False, agent_type: Optional[str] = None) -> str:
@@ -91,10 +67,11 @@ class AgnoLLM:
     def __init__(self, candidates: Sequence, key_for: Callable[[str], Optional[str]], *,
                  outline_candidates: Optional[Sequence] = None, request_id: Optional[str] = None,
                  user_id: Optional[str] = None, is_byok: bool = False, image_ctx: Optional[dict] = None,
-                 agent_type: str = "blog_writer", timeout: Optional[float] = None, cancel_event=None):
+                 agent_type: str = "blog_writer", timeout: Optional[float] = None, cancel_event=None, deadline=None):
         self.agent_type = agent_type                         # the AGENT_CONFIGS entry every call is made with
         self.timeout = timeout                               # seconds one call may take before it counts as a retryable failure
         self.cancel_event = cancel_event
+        self.deadline = deadline
         self.candidates = list(candidates)
         self.outline_candidates = list(outline_candidates) if outline_candidates else None
         self.key_for = key_for
@@ -138,11 +115,21 @@ class AgnoLLM:
                 raise ValueError(f"No API key configured for {candidate.provider}")
             retry = 0
             while True:
+                check_cancelled(self.cancel_event)
+                check_provider_call()
+                timeout = self.timeout
+                if self.deadline is not None:
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('Document analysis deadline exceeded')
+                    timeout = min(remaining, timeout or remaining)
                 started = time.perf_counter()
                 try:
-                    reply = call_with_timeout(lambda: self._run(candidate, key, system, messages, spec), self.timeout,
+                    reply = call_with_timeout(lambda: self._run(candidate, key, system, messages, spec), timeout,
                                               f"The {candidate.provider} call")
                 except Exception as error:
+                    check_cancelled(self.cancel_event)
+                    check_provider_call()
                     self._record(spec, candidate, started, error)
                     if not settings.provider_fallback_enabled or not can_fall_back(error):
                         raise
@@ -153,7 +140,10 @@ class AgnoLLM:
                         retry += 1
                         delay = retry_delay(error)
                         logger.warning("%sRate limit: retrying %s once after %.2fs", log, candidate.provider, delay)
-                        time.sleep(delay)
+                        if self.cancel_event is None:
+                            time.sleep(delay)
+                        else:
+                            self.cancel_event.wait(delay)
                         continue
                     if last:
                         raise
@@ -198,12 +188,12 @@ class AgnoLLM:
             self.agent_type, candidate.provider, key, self.request_id, user_id=self.user_id, is_byok=self.is_byok,
             image_ctx=self.image_ctx, plan=RequestPlan(use_web=spec.use_web, advanced_model=candidate.advanced),
             instructions=system, temperature=spec.temperature, max_tokens=spec.max_tokens,
+            timeout=self.timeout or MODEL_CALL_TIMEOUT_SECONDS,
         )
         history = [Message(role=m["role"], content=m["content"]) for m in messages]
+        check_cancelled(self.cancel_event)
+        check_provider_call()
         if self.agent_type == 'document_editor':
-            from src.document_edit.service import EditCancelled
-            if self.cancel_event is not None and self.cancel_event.is_set():
-                raise EditCancelled()
             trace_set(self.request_id, document_model_started=True)
         if spec.on_text is None:
             response = agent.run(history, stream=False)

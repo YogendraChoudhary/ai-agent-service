@@ -28,14 +28,11 @@ from src.text_processing_agent import (
 )
 from api import (
     AbortRequest,
-    _active_cancellations,
-    _cancel_registry_lock,
     abort_request,
     async_validate_and_get_api_key,
     register_cancellation_event,
     cancel_request_by_id,
     unregister_cancellation_event,
-    cleanup_stale_cancellations,
 )
 
 
@@ -302,32 +299,16 @@ class TestLatencyOptimizations(unittest.TestCase):
     def test_point_6_lock_free_cancellation(self):
         """Verify per-request threading.Event cancellation."""
         req_id = "test_cancel_req_001"
-        event = register_cancellation_event(req_id)
-        self.assertFalse(event.is_set())
-
-        # Test pre-cancel idempotency
-        cancel_request_by_id(req_id)
-        self.assertTrue(event.is_set())
-
-        # Abort called before register
-        pre_req_id = "test_cancel_pre_002"
-        cancel_request_by_id(pre_req_id)
-        event2 = register_cancellation_event(pre_req_id)
-        self.assertTrue(event2.is_set(), "Event must remain set if aborted before registration")
-
-        # Cleanup
-        unregister_cancellation_event(req_id)
-        unregister_cancellation_event(pre_req_id)
-
-    def test_point_6_active_stream_is_not_expired(self):
-        req_id = "test_long_stream"
-        event = register_cancellation_event(req_id)
-        with _cancel_registry_lock:
-            _active_cancellations[req_id] = (event, None)
-        cleanup_stale_cancellations()
-        cancel_request_by_id(req_id)
-        self.assertTrue(event.is_set())
-        unregister_cancellation_event(req_id)
+        self.assertFalse(cancel_request_by_id(req_id, "owner"))
+        event = register_cancellation_event(req_id, "owner")
+        try:
+            self.assertFalse(cancel_request_by_id(req_id, "other-user"))
+            self.assertFalse(event.is_set())
+            self.assertTrue(cancel_request_by_id(req_id, "owner"))
+            self.assertTrue(event.is_set())
+        finally:
+            unregister_cancellation_event(req_id, "owner")
+        self.assertFalse(cancel_request_by_id(req_id, "owner"))
 
     # -----------------------------------------------------------------------
     # Point 7: Immediate Image Completion Notification

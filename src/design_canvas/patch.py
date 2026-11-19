@@ -72,7 +72,7 @@ def splice_subtree(
     found = _splice_in_dict(raw.get("root", {}), target_id, replacement_node)
     if not found:
         return None
-    return DesignDocumentAST.model_validate(raw)
+    return type(ast).model_validate(raw)
 
 
 def _splice_in_dict(node: Any, target_id: str, replacement: dict) -> bool:

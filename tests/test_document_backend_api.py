@@ -155,7 +155,7 @@ def test_analysis_abort_before_calls_releases_reservation_without_charge(analysi
     state = paid(analysis_runtime, monkeypatch)
     cancel = threading.Event()
     cancel.set()
-    monkeypatch.setattr(api, 'register_cancellation_event', lambda request_id: cancel)
+    monkeypatch.setattr(api, 'register_cancellation_event', lambda request_id, user_id: cancel)
     events = parse_sse_events(client.post('/agent/stream', json=request()).text)
     assert events[-1]['data']['aborted'] is True
     assert not state['calls'] and not state['charges']
@@ -166,7 +166,7 @@ def test_analysis_abort_during_extraction_refunds_unfinished_work(analysis_runti
     client, _ = analysis_runtime
     state = paid(analysis_runtime, monkeypatch)
     cancel = threading.Event()
-    monkeypatch.setattr(api, 'register_cancellation_event', lambda request_id: cancel)
+    monkeypatch.setattr(api, 'register_cancellation_event', lambda request_id, user_id: cancel)
     original = ScriptedAnalysis.__call__
     def abort(self, *args):
         reply = original(self, *args)

@@ -385,22 +385,45 @@ class TestMediaTypeSentToEachProvider:
         monkeypatch.setattr(tpa, "_get_cached_anthropic_client", lambda *a, **k: rec.anthropic())
         monkeypatch.setattr(tpa, "_get_cached_openai_client", lambda *a, **k: rec.openai())
         monkeypatch.setattr(tpa, "_get_cached_gemini_client", lambda *a, **k: rec.gemini())
-        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "recreate"}]
+        messages = [
+            {"role": "system", "content": "sys"}, {"role": "user", "content": "recreate"},
+            {"role": "assistant", "content": "{}"}, {"role": "user", "content": "repair"},
+        ]
         tpa._run_design_json_completion(messages, _image_bytes(fmt), 0.2, provider, "k")
         return rec.sent
 
     def test_claude(self, fmt, mime, monkeypatch):
         sent = self._call("claude", fmt, monkeypatch)
         assert sent["messages"][0]["content"][0]["source"]["media_type"] == mime
+        assert sent["messages"][-1]["content"] == "repair"
         assert sent["system"][0]["cache_control"] == {"type": "ephemeral"}
 
     def test_openai(self, fmt, mime, monkeypatch):
         sent = self._call("openai", fmt, monkeypatch)
         assert sent["messages"][1]["content"][1]["image_url"]["url"].startswith(f"data:{mime};base64,")
+        assert sent["messages"][-1]["content"] == "repair"
 
     def test_gemini(self, fmt, mime, monkeypatch):
         sent = self._call("gemini", fmt, monkeypatch)
         assert sent["contents"][0].parts[0].inline_data.mime_type == mime
+        assert [part.text for part in sent["contents"][-1].parts] == ["repair"]
+
+
+def test_openai_vision_budget_applies_only_to_calls_with_the_reference(monkeypatch):
+    from config import settings
+    from src.models import output_token_budget
+
+    rec = _Recorder()
+    monkeypatch.setattr(tpa, "_get_cached_openai_client", lambda *a, **k: rec.openai())
+    monkeypatch.setattr(settings, "design_vision_openai_effort", "medium")
+    monkeypatch.setattr(settings, "design_vision_max_output_tokens", 12000)
+    messages = [{"role": "user", "content": "recreate"}]
+    tpa._run_design_json_completion(messages, _image_bytes("PNG"), 0.2, "openai", "k")
+    assert rec.sent["reasoning_effort"] == "medium"
+    assert rec.sent["max_completion_tokens"] == output_token_budget(rec.sent["model"], 12000)
+    tpa._run_design_json_completion(messages, None, 0.2, "openai", "k")
+    assert rec.sent["reasoning_effort"] == "low"
+    assert rec.sent["max_completion_tokens"] == output_token_budget(rec.sent["model"], 8192)
 
 
 # ===========================================================================

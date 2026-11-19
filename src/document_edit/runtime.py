@@ -6,6 +6,7 @@ import logging
 from config import settings
 from src.longform.llm import AgnoLLM
 from src.observability import trace_set
+from src.provider_work import ProviderCancelled
 from .blocks import fingerprint
 from .schema import DocumentEditResult
 from .service import EditCancelled, edit_document
@@ -21,7 +22,7 @@ def stream_document_edit(source, instruction, *, candidates, key_for, is_byok, u
     trace_set(request_id, mode="document_edit", agent_type="document_editor")
     try:
         text, result = edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style, selection=selection)
-    except EditCancelled:
+    except (EditCancelled, ProviderCancelled):
         return
     except Exception as error:
         logger.warning("[%s] Document proposal failed (%s)", request_id, type(error).__name__)

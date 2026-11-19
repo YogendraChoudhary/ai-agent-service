@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+from math import dist, hypot
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Set, Tuple
 
 from pydantic import ValidationError
@@ -31,9 +32,11 @@ from src.design_canvas.schema import (
     ContainerNode,
     DesignDocumentAST,
     DesignNode,
+    NodeStyle,
     TextNode,
     VectorIllustrationNode,
 )
+from src.design_canvas.colors import hex_rgb, lab, linearize
 
 if TYPE_CHECKING:
     from src.design_canvas.vision_extractor import VisionMetadata
@@ -60,25 +63,15 @@ _SVG_BLOCKED_PATTERN = re.compile(
 # WCAG 2.1 luminance helpers
 # ---------------------------------------------------------------------------
 
-def _linearize(c: int) -> float:
-    s = c / 255.0
-    return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
-
-
 def _relative_luminance(hex_color: str) -> Optional[float]:
-    """Return WCAG 2.1 relative luminance [0,1] for a #RRGGBB hex string, or None on parse error."""
-    h = hex_color.lstrip("#")
-    if len(h) in (3, 4):
-        h = "".join(c * 2 for c in h[:3])
-    elif len(h) not in (6, 8):
+    """Return WCAG 2.1 relative luminance [0,1], or None on parse error."""
+    if len(hex_color.removeprefix("#")) not in (3, 4, 6, 8):
         return None
     try:
-        r = int(h[0:2], 16)
-        g = int(h[2:4], 16)
-        b = int(h[4:6], 16)
+        r, g, b = map(linearize, hex_rgb(hex_color))
     except ValueError:
         return None
-    return 0.2126 * _linearize(r) + 0.7152 * _linearize(g) + 0.0722 * _linearize(b)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
 def _contrast_ratio(lum_text: float, lum_bg: float) -> float:
@@ -87,19 +80,27 @@ def _contrast_ratio(lum_text: float, lum_bg: float) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
-def _low_contrast_spans(node: TextNode, ancestor_bg: Optional[str]) -> Iterator[Tuple[int, float, str]]:
-    """(span index, ratio, background) for each span below MIN_TEXT_CONTRAST. No known background: none."""
-    bg_hex = node.style.background_color if node.style and node.style.background_color else ancestor_bg
-    lum_bg = _relative_luminance(bg_hex) if bg_hex else None
-    if lum_bg is None:
+def _background_colors(style: NodeStyle) -> tuple[str, ...]:
+    gradient = getattr(style, "background_gradient", None)
+    solid = (style.background_color,) if style.background_color else ()
+    return (*solid, *gradient.stops) if gradient else solid
+
+
+def _low_contrast_spans(node: TextNode, backgrounds: tuple[str, ...]) -> Iterator[tuple[int, int | None, float, str]]:
+    """Yield span/stop indices, worst ratio and background for each colour that fails."""
+    if not backgrounds:
         return
+    luminances = [(bg, _relative_luminance(bg)) for bg in backgrounds]
     for i, span in enumerate(node.spans):
-        lum_text = _relative_luminance(span.color)
-        if lum_text is None:
-            continue
-        ratio = _contrast_ratio(lum_text, lum_bg)
-        if ratio < MIN_TEXT_CONTRAST:
-            yield i, ratio, bg_hex
+        gradient = getattr(span, "gradient", None)
+        colors = [(None, span.color)]
+        if gradient:
+            colors.extend(enumerate(gradient.stops))
+        for stop, color in colors:
+            lum_text = _relative_luminance(color)
+            ratio, bg_hex = min((_contrast_ratio(lum_text, lum_bg), bg) for bg, lum_bg in luminances)
+            if ratio < MIN_TEXT_CONTRAST:
+                yield i, stop, ratio, bg_hex
 
 
 # ---------------------------------------------------------------------------
@@ -109,29 +110,15 @@ def _low_contrast_spans(node: TextNode, ancestor_bg: Optional[str]) -> Iterator[
 def _collect_all_nodes(
     node: DesignNode,
     depth: int = 0,
-    bg_stack: Optional[List[Optional[str]]] = None,
-) -> List[tuple[DesignNode, int, Optional[str]]]:
-    """
-    DFS walk over the AST tree.
-
-    Returns a flat list of (node, depth, nearest_ancestor_bg_color) tuples.
-    ``nearest_ancestor_bg_color`` is the most recent non-None background_color
-    found in any ancestor ContainerNode.
-    """
-    if bg_stack is None:
-        bg_stack = [None]
-
-    results: List[tuple[DesignNode, int, Optional[str]]] = [(node, depth, bg_stack[-1])]
-
+    backgrounds: tuple[str, ...] = (),
+) -> Iterator[tuple[DesignNode, int, tuple[str, ...]]]:
+    """Walk nodes with the nearest painted background colours."""
+    if isinstance(node, (TextNode, ContainerNode)):
+        backgrounds = _background_colors(node.style) or backgrounds
+    yield node, depth, backgrounds
     if isinstance(node, ContainerNode):
-        own_bg = (node.style.background_color if node.style else None)
-        next_bg = own_bg if own_bg else bg_stack[-1]
-        bg_stack.append(next_bg)
         for child in node.children:
-            results.extend(_collect_all_nodes(child, depth + 1, bg_stack))
-        bg_stack.pop()
-
-    return results
+            yield from _collect_all_nodes(child, depth + 1, backgrounds)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +144,7 @@ def validate_design_ast(
     """
     errors: List[str] = []
 
-    all_nodes = _collect_all_nodes(ast.root)
+    all_nodes = list(_collect_all_nodes(ast.root))
 
     # ------------------------------------------------------------------
     # Check 1: Unique node IDs
@@ -203,9 +190,10 @@ def validate_design_ast(
     for node, _, ancestor_bg in all_nodes:
         if not isinstance(node, TextNode):
             continue
-        for i, ratio, bg_hex in _low_contrast_spans(node, ancestor_bg):
+        for i, stop, ratio, bg_hex in _low_contrast_spans(node, ancestor_bg):
+            target = f" gradient stop {stop + 1}" if stop is not None else ""
             errors.append(
-                f"WCAG_LOW_CONTRAST: node `{node.id}` span \"{node.spans[i].text[:20]}\" "
+                f"WCAG_LOW_CONTRAST: node `{node.id}` span \"{node.spans[i].text[:20]}\"{target} "
                 f"has contrast ratio {ratio:.2f}:1 against background {bg_hex} "
                 f"(minimum {MIN_TEXT_CONTRAST}:1)"
             )
@@ -244,7 +232,7 @@ def _renamed_nodes(ast: DesignDocumentAST, existing_ast_json: str) -> List[Tuple
     not parse cannot be compared, so it yields nothing.
     """
     try:
-        original = DesignDocumentAST.model_validate_json(existing_ast_json)
+        original = type(ast).model_validate_json(existing_ast_json)
     except (ValidationError, ValueError, TypeError):
         return []
     original_nodes = [n for n, _, _ in _collect_all_nodes(original.root)]
@@ -289,8 +277,8 @@ def auto_heal_design_ast(
     * Deduplicate node IDs and SVG layer IDs with a ``_2``, ``_3``, … suffix,
       shortened to stay within the 40-character id limit.
     * Strip forbidden SVG attributes.
-    * Recolour each text span below MIN_TEXT_CONTRAST to black or white,
-      whichever reads better on its background (always ≥ 4.5:1).
+    * Recolour low-contrast text and gradient stops using the closest legible
+      reference shade of the same hue, or the better of black and white.
 
     Never changes text content or layout properties.
 
@@ -303,9 +291,9 @@ def auto_heal_design_ast(
             node.id = original_id
     _dedupe_ids(healed)
     _strip_svg_attrs(healed)
-    _fix_contrast(healed)
+    _fix_contrast(healed, vision_meta)
     # Re-parse so Pydantic re-validates every mutation.
-    return DesignDocumentAST.model_validate(healed.model_dump())
+    return type(ast).model_validate(healed.model_dump())
 
 
 def _leaves(node: DesignNode) -> List[DesignNode]:
@@ -320,11 +308,13 @@ def _flatten_too_deep(container: ContainerNode, depth: int) -> None:
     for child in container.children:
         if isinstance(child, ContainerNode):
             if depth + 1 >= MAX_TREE_DEPTH:
-                children.extend(_leaves(child))
+                children.extend(leaf for leaf in _leaves(child) if getattr(leaf, "orientation", None) != "vertical")
                 continue
             _flatten_too_deep(child, depth + 1)
         children.append(child)
     container.children = children[:MAX_CHILDREN]
+    if getattr(container.children[-1], "orientation", None) == "vertical":
+        container.children.pop()
 
 
 def _unique_id(base: str, taken: Set[str]) -> str:
@@ -368,11 +358,33 @@ def _strip_svg_attrs(ast: DesignDocumentAST) -> None:
             }
 
 
-def _fix_contrast(ast: DesignDocumentAST) -> None:
-    """Black or white, whichever contrasts more with the background: never below 4.5:1 for any background."""
-    for node, _, ancestor_bg in _collect_all_nodes(ast.root):
+def _fix_contrast(ast: DesignDocumentAST, vision_meta: Optional[VisionMetadata] = None) -> None:
+    roles = vision_meta.roles if vision_meta else None
+    palette = {color: lab(hex_rgb(color)) for color in (*roles.text, *roles.accents)} if roles else {}
+    for node, _, backgrounds in _collect_all_nodes(ast.root):
         if not isinstance(node, TextNode):
             continue
-        for i, _, bg_hex in list(_low_contrast_spans(node, ancestor_bg)):
-            lum_bg = _relative_luminance(bg_hex) or 0.0
-            node.spans[i].color = "#000000" if _contrast_ratio(0.0, lum_bg) >= _contrast_ratio(1.0, lum_bg) else "#FFFFFF"
+        for i, stop, _, _ in list(_low_contrast_spans(node, backgrounds)):
+            span = node.spans[i]
+            original = span.color if stop is None else span.gradient.stops[stop]
+            backdrop = [_relative_luminance(bg) for bg in backgrounds]
+
+            def contrast(color):
+                return min(_contrast_ratio(_relative_luminance(color), lum) for lum in backdrop)
+
+            original_lab = lab(hex_rgb(original))
+            _, a, b = original_lab
+            chroma = hypot(a, b)
+            candidates = []
+            for color, (_, ca, cb) in palette.items():
+                other_chroma = hypot(ca, cb)
+                similar = (other_chroma < 8 if chroma < 5 else
+                           other_chroma >= 5 and a * ca + b * cb >= 0.85 * chroma * other_chroma)
+                if similar and contrast(color) >= MIN_TEXT_CONTRAST:
+                    candidates.append(color)
+            replacement = (min(candidates, key=lambda color: dist(original_lab, palette[color])) if candidates
+                           else max(("#000000", "#FFFFFF"), key=contrast))
+            if stop is None:
+                span.color = replacement
+            else:
+                span.gradient.stops[stop] = replacement

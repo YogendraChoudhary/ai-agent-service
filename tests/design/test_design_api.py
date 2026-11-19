@@ -92,7 +92,15 @@ class TestDesignApi(unittest.TestCase):
             "query": "design an onboarding card for users",
             "model": "claude",
             "api_key": "lic_test_123",
+            "schema_version": "1.0",
         }
+        finding = "FIDELITY_LAYOUT_STACKED: offer needs two panels on one row."
+
+        async def design_with_finding(*args, **kwargs):
+            kwargs["report"]["fidelity"] = {"findings": [finding]}
+            return self.mock_ast
+
+        self.mock_harness.side_effect = design_with_finding
         res = self.client.post("/agent/stream", json=payload)
         self.assertEqual(res.status_code, 200, res.text)
 
@@ -113,6 +121,8 @@ class TestDesignApi(unittest.TestCase):
         # 3. Event 'complete' carries metadata
         self.assertIn("complete", named_events)
         self.assertEqual(named_events["complete"]["mode"], "design_canvas")
+        self.assertIn({"kind": "reference_fidelity", "detail": finding}, named_events["complete"]["warnings"])
+        self.assertEqual(self.mock_harness.await_args.kwargs["schema_version"], "1.0")
 
     def test_process_design_canvas_synchronous_parity(self):
         """POST /agent/process must return serialized AST in markdown_response and design payload."""

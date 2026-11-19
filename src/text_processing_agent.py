@@ -30,7 +30,9 @@ from .security_guardrails import sanitize_web_content
 from .observability import record_provider_usage, trace_mark, trace_set
 from .document_context import ContextRange, PreparedContext, OUTPUT_TOKENS
 from .blog.prompts import section_system_prompt
-from typing import Optional, Dict, Any, Union
+from .provider_work import (AUTOCOMPLETE_TIMEOUT_SECONDS, MODEL_CALL_TIMEOUT_SECONDS, ProviderCancelled,
+                            check_cancelled, check_provider_call, run_provider_call)
+from typing import Optional, Dict, Any, Literal, Union
 from dotenv import load_dotenv
 import os
 import logging
@@ -42,6 +44,7 @@ import ipaddress
 import socket
 import http.cookiejar
 from collections import OrderedDict
+from contextvars import copy_context
 from functools import lru_cache
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -398,6 +401,7 @@ def get_model(
     managed_retries: bool = False,
     max_tokens: Optional[int] = None,
     agent_type: Optional[str] = None,
+    timeout: float = MODEL_CALL_TIMEOUT_SECONDS,
 ):
     """
     Factory function to get or create the appropriate model instance based on provider.
@@ -418,7 +422,7 @@ def get_model(
     """
     log_prefix = f"[{request_id}] " if request_id else ""
     model_provider = model_provider.lower()
-    client_params = ({'http_options': {'retry_options': {'attempts': 1}}} if model_provider == 'gemini'
+    client_params = ({'http_options': {'timeout': max(1, int(timeout * 1000)), 'retry_options': {'attempts': 1}}} if model_provider == 'gemini'
                      else {'max_retries': 0}) if managed_retries else None
 
     model_id = advanced_model_id(model_provider, agent_type) if use_advanced else BASIC_MODEL_IDS.get(model_provider)
@@ -447,7 +451,7 @@ def get_model(
         # gpt-6.x only (gpt-5.2, which the blog and code agents stay on, is sent nothing: its default is already "none").
         # advanced tier: the configured dial; a basic-tier gpt-6 model (not used today) runs at "none"
         openai_effort = openai_effort_params(model_id, settings.openai_advanced_effort if use_advanced else 'none', needs_tools)
-    cache_key = (model_provider, api_key, use_advanced, model_id, cache_tools, cache_temperature, managed_retries, max_tokens,
+    cache_key = (model_provider, api_key, use_advanced, model_id, cache_tools, cache_temperature, managed_retries, max_tokens, timeout,
                  tuple(sorted(claude_output_config.items())), tuple(sorted(openai_effort.items())),
                  needs_tools if openai_effort else False)
     if cache_model:
@@ -464,7 +468,7 @@ def get_model(
             f"{log_prefix}Creating DeepSeek model: {DEEPSEEK_TOOL_MODEL_ID} "
             f"(downgraded from {model_id} - no tool support)"
         )
-        model = DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature, client_params=client_params,
+        model = DeepSeek(id=DEEPSEEK_TOOL_MODEL_ID, api_key=api_key, temperature=temperature, client_params=client_params, timeout=timeout,
                          **_output_limit_kwargs(model_provider, DEEPSEEK_TOOL_MODEL_ID, max_tokens))
         if cache_model:
             with _MODEL_CACHE_LOCK:
@@ -476,6 +480,7 @@ def get_model(
         f"(advanced={use_advanced}, temp={temperature}, max_tokens={max_tokens})"
     )
     limits = _output_limit_kwargs(model_provider, model_id, max_tokens)
+    limits['timeout'] = timeout
 
     if model_provider == 'openai':
         if openai_reasoning_family(model_id):
@@ -532,7 +537,6 @@ def prewarm_models(default_keys: Optional[dict[str, str]] = None) -> int:
     """
     if not default_keys:
         return 0
-    from config import settings
 
     with _MODEL_CACHE_LOCK:
         initial_count = len(_MODEL_CACHE)
@@ -565,7 +569,7 @@ def prewarm_models(default_keys: Optional[dict[str, str]] = None) -> int:
                     request_id="startup-prewarm",
                     needs_tools=needs_tools,
                     temperature=temp,
-                    managed_retries=settings.provider_fallback_enabled,
+                    managed_retries=True,
                 )
             except Exception as e:
                 logger.debug(f"Pre-warm skipped for {provider} (adv={use_adv}, tools={needs_tools}): {e}")
@@ -769,6 +773,7 @@ def create_web_read_tool(request_id: str = None, budget=None, on_read=None):
         Returns:
             The page's text content, or an error string beginning with "ERROR:".
         """
+        check_provider_call()
         if budget is not None and not budget.take():
             return f"ERROR: page-read limit reached ({budget.limit} per request). Answer with what you have read."
         try:
@@ -896,6 +901,7 @@ def create_parallel_search_tool(search_instance: DuckDuckGoWithRetry, request_id
         results_map = {}
 
         def _run_single(q: str):
+            check_provider_call()
             try:
                 res_str = search_instance.web_search(q, max_results=max_results)
                 try:
@@ -903,11 +909,12 @@ def create_parallel_search_tool(search_instance: DuckDuckGoWithRetry, request_id
                 except Exception:
                     return q, res_str
             except Exception as e:
+                check_provider_call()
                 logger.warning(f"{log_prefix}Parallel search worker failed for '{q}': {e}")
                 fallback = search_instance.fallback_search(q, max_results=max_results)
                 return q, fallback
 
-        futures = [_TOOL_EXECUTOR.submit(_run_single, q) for q in capped_queries]
+        futures = [_TOOL_EXECUTOR.submit(copy_context().run, _run_single, q) for q in capped_queries]
         for future in as_completed(futures):
             try:
                 q, res = future.result()
@@ -967,7 +974,7 @@ def create_parallel_read_tool(reader_tool_fn, request_id: str = None):
                 logger.warning(f"{log_prefix}Parallel read worker failed for '{url}': {e}")
                 return url, f"ERROR: failed to read page ({type(e).__name__})"
 
-        futures = [_TOOL_EXECUTOR.submit(_read_single, u) for u in capped_urls]
+        futures = [_TOOL_EXECUTOR.submit(copy_context().run, _read_single, u) for u in capped_urls]
         for future in as_completed(futures):
             try:
                 url, content = future.result()
@@ -993,21 +1000,19 @@ def _legacy_generate_image(provider: str, api_key: str, prompt: str, user_id, re
     Pre-adapter generation, used only when IMAGE_ADAPTER_ENABLED=false (the rollback switch).
     Returns {"cdn_url": ...}. One provider-keyed body instead of three copies.
     """
-    log_prefix = f"[{request_id}] " if request_id else ""
+    check_provider_call()
     if provider == "grok":
-        from openai import OpenAI
         from src.s3_service import upload_image_from_url
 
-        client = OpenAI(base_url="https://api.x.ai/v1", api_key=api_key)
+        client = _get_cached_openai_client(api_key, "https://api.x.ai/v1")
         response = client.images.generate(model=IMAGE_MODEL_IDS["grok"], prompt=prompt, n=1)
         return {"cdn_url": upload_image_from_url(response.data[0].url, user_id=user_id, request_id=request_id)}
 
     if provider == "gemini":
-        from google import genai
         from google.genai import types
         from src.s3_service import upload_image_from_bytes
 
-        client = genai.Client(api_key=api_key)
+        client = _get_cached_gemini_client(api_key)
         response = client.models.generate_content(
             model=IMAGE_MODEL_IDS["gemini"],
             contents=prompt,
@@ -1031,10 +1036,9 @@ def _legacy_generate_image(provider: str, api_key: str, prompt: str, user_id, re
         raise Exception("Gemini response did not contain image data")
 
     import base64
-    from openai import OpenAI
     from src.s3_service import upload_image_from_bytes
 
-    client = OpenAI(api_key=api_key)
+    client = _get_cached_openai_client(api_key)
     response = client.images.generate(model=IMAGE_MODEL_IDS["openai"], prompt=prompt, size=size, quality="auto", n=1)
     cdn_url = upload_image_from_bytes(
         base64.b64decode(response.data[0].b64_json), content_type="image/png", user_id=user_id, request_id=request_id
@@ -1088,6 +1092,7 @@ def _build_image_tool(
         from config import settings
         from src.credit_manager import image_credits_scaled, IMAGE_CREDITS_SCALED
 
+        check_provider_call()
         if image_budget is not None and not image_budget.take():
             return (
                 f"ERROR: image limit reached. Only {image_budget.limit} image(s) can be generated for this "
@@ -1174,7 +1179,7 @@ def _build_image_tool(
                     if notify is not None:
                         notify()
 
-            threading.Thread(target=_background_generate, daemon=True).start()
+            threading.Thread(target=copy_context().run, args=(_background_generate,), daemon=True).start()
 
         return f"Image URL: placeholder::{placeholder_id}"
 
@@ -1254,7 +1259,7 @@ def create_multi_image_tool(single_image_tool_fn, request_id: str = None, image_
                 logger.error(f"{log_prefix}Failed to trigger image for '{p[:30]}': {e}")
                 return idx, p, f"ERROR: {str(e)}"
 
-        futures = [_TOOL_EXECUTOR.submit(_gen_single, i, p) for i, p in enumerate(capped_prompts)]
+        futures = [_TOOL_EXECUTOR.submit(copy_context().run, _gen_single, i, p) for i, p in enumerate(capped_prompts)]
         for future in as_completed(futures):
             idx, p, res = future.result()
             placeholders[idx] = (p, res)
@@ -1938,6 +1943,7 @@ def create_agent(
     instructions=None,
     temperature: float = None,
     max_tokens: int = None,
+    timeout: float = MODEL_CALL_TIMEOUT_SECONDS,
 ):
     """
     Factory function to create an agent with the specified model.
@@ -2003,9 +2009,10 @@ def create_agent(
         needs_tools=use_tools,
         temperature=agent_temperature,
         cache_model=not is_byok,
-        managed_retries=settings.provider_fallback_enabled,
+        managed_retries=True,
         max_tokens=max_tokens,
         agent_type=agent_type,
+        timeout=timeout,
     )
 
     agent_kwargs = {
@@ -2238,6 +2245,7 @@ def _agent_text(agent, query, images, provider, use_tools, request_id, output_li
     from .observability import record_text_usage
     metrics = None
     try:
+        check_provider_call()
         if use_tools and provider == 'deepseek':
             response = agent.run(query, stream=False, images=images)
             metrics = getattr(response, 'metrics', None)
@@ -2248,6 +2256,7 @@ def _agent_text(agent, query, images, provider, use_tools, request_id, output_li
                 yield content[i:i + 80]
         else:
             for event in agent.run(query, stream=True, images=images, stream_events=True):
+                check_provider_call()
                 if getattr(event, 'metrics', None) is not None:
                     metrics = event.metrics
                 if getattr(event, 'event', None) == RunEvent.run_error:
@@ -2298,6 +2307,7 @@ def process_user_query_stream(
     chart_request: Optional[dict] = None,
     needs_document: Optional[dict] = None,
     action_resolution: Optional[dict] = None,
+    schema_version: Optional[Literal["1.0", "1.1"]] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2343,6 +2353,8 @@ def process_user_query_stream(
 
     from config import settings
 
+    if cancel_event is not None and cancel_event.is_set():
+        return
     if action_resolution is not None:
         # document_action "auto": which mode the agent picked, before anything that mode produces.
         yield {'__event__': {'event': 'document_action_resolved', 'data': action_resolution}}
@@ -2557,7 +2569,7 @@ def process_user_query_stream(
                 if notify:
                     notify()
 
-        threading.Thread(target=_direct_bg_generate, daemon=True).start()
+        threading.Thread(target=copy_context().run, args=(_direct_bg_generate,), daemon=True).start()
 
         # Same markdown contract the agent path uses, so the editor swaps it on image_ready.
         alt = re.sub(r"[\[\]()\r\n]+", " ", final_prompt).strip()[:80] or "Generated image"
@@ -2679,7 +2691,7 @@ def process_user_query_stream(
             yield from longform[1](
                 user_text, instruction, agent_type, candidates=candidates,
                 key_for=key_resolver if routed else (lambda _provider: api_key), is_byok=is_byok, user_id=user_id,
-                request_id=request_id, report_model=report_model)
+                request_id=request_id, report_model=report_model, cancel_event=cancel_event)
             yield from graph_suggestions()
             return
 
@@ -2692,7 +2704,7 @@ def process_user_query_stream(
             key_for=key_resolver if routed else (lambda _provider: api_key), is_byok=is_byok, user_id=user_id,
             credit_manager=credit_manager, pending_images=pending_images, image_params=image_params,
             document_id=document_id, request_id=request_id, report_model=report_model,
-            available_providers=key_resolver.available_providers if routed else None)
+            available_providers=key_resolver.available_providers if routed else None, cancel_event=cancel_event)
         return
 
     # ------------------------------------------------------------------
@@ -2730,9 +2742,12 @@ def process_user_query_stream(
         # The screenshot is the input of a vision design: fetched with the same size cap as the image route, and a
         # failure is an error (as for a required image reference), not a design that ignores the screenshot.
         reference_image_bytes = None
+        measure_image_bytes = None
         if image_urls and sub_mode == 'create_from_vision':
             try:
-                reference_image_bytes = _design_reference_image(_fetch_reference_bytes(image_urls[0], request_id))
+                original_reference = _fetch_reference_bytes(image_urls[0], request_id)
+                reference_image_bytes = _design_reference_image(original_reference)
+                measure_image_bytes = _design_measure_image(original_reference)
             except Exception as fetch_err:
                 raise ValueError(f"Could not load the reference image: {fetch_err}") from fetch_err
 
@@ -2740,35 +2755,26 @@ def process_user_query_stream(
         if existing_design_ast:
             existing_ast_str = existing_design_ast if isinstance(existing_design_ast, str) else _json.dumps(existing_design_ast)
 
-        # Provider calls run on this pool, never asyncio's default executor: asyncio.run() joins that one on exit,
-        # so an abort would wait for the call in flight. This pool is shut down without waiting.
-        from concurrent.futures import ThreadPoolExecutor
-        call_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="design_call")
-
         class _DesignCanvasRunner:
             """Adapter: exposes run_json_completion() backed by the existing model infrastructure."""
             used = (_dc_candidate.provider, _dc_model)  # the provider that answered last, for billing analytics
 
             async def run_json_completion(self, messages, image_bytes=None, temperature=0.2):
-                loop = asyncio.get_running_loop()
                 last_err = None
                 cand_list = candidates if candidates else [Candidate(model_provider, True)]
                 for cand in cand_list:
+                    check_cancelled(cancel_event)
                     k = key_resolver(cand.provider) if routed else api_key
                     if not k:
                         continue
                     try:
-                        output = await loop.run_in_executor(
-                            call_pool,
-                            lambda c=cand, key=k: _run_design_json_completion(
-                                messages, image_bytes, temperature,
-                                c.provider, key, request_id
-                            ),
-                        )
+                        output = await run_provider_call(_run_design_json_completion, messages, image_bytes,
+                                                         temperature, cand.provider, k, request_id, stop_event=cancel_event)
                         self.used = (cand.provider, design_model_id(cand.provider, cand.provider))
                         record_health_ok(cand.provider, self.used[1], byok=is_byok)
                         return output
                     except Exception as err:
+                        check_cancelled(cancel_event)
                         logger.warning(f"{log_prefix}Design canvas runner attempt failed on {cand.provider}: {err}")
                         _design_failure_kind(cand.provider, design_model_id(cand.provider, cand.provider), err, is_byok)
                         last_err = err
@@ -2780,16 +2786,18 @@ def process_user_query_stream(
         runner = _DesignCanvasRunner()
         harness_report: dict = {}
 
-        async def _harness_unless_aborted():
+        async def _harness_unless_aborted(user_query=query, mode=sub_mode):
             # The stream yields nothing until the design is ready, so the API's per-chunk abort check cannot see an
             # abort here: watch the event and cancel the harness, which then makes no further model calls.
             harness = asyncio.ensure_future(execute_design_canvas_harness(
                 runner,
-                user_query=query,
-                sub_mode=sub_mode,
+                user_query=user_query,
+                sub_mode=mode,
                 reference_image_bytes=reference_image_bytes,
+                measure_image_bytes=measure_image_bytes,
                 existing_ast_json=existing_ast_str,
                 report=harness_report,
+                schema_version=schema_version,
             ))
             while not harness.done():
                 if cancel_event is not None and cancel_event.is_set():
@@ -2797,18 +2805,87 @@ def process_user_query_stream(
                 await asyncio.wait({harness}, timeout=_DESIGN_ABORT_POLL_SECONDS)
             return harness.result()
 
+        if sub_mode == 'fill_design_images':
+            # Photo fill (docs/design_image_fill_plan.md): the selected design's ImageNode placeholders go through the
+            # same image tool the agent and blog use (credits, provider choice, CDN upload, image_ready events). No
+            # layout model call, unless the design has no ImageNode yet: then one edit converts its drawn photos.
+            from .design_canvas import images as design_images
+            from .design_canvas.schema_v11 import DesignDocumentASTV11
+            from .request_plan import ToolBudget
+            t0_fill = _time.perf_counter()
+            fill_ast = DesignDocumentASTV11.model_validate_json(existing_ast_str or "")
+            converted = False
+            if not design_images.image_nodes(fill_ast.model_dump()):
+                try:
+                    fill_ast = asyncio.run(_harness_unless_aborted(design_images.CONVERT_INSTRUCTION, 'edit_existing_ast'))
+                except (asyncio.CancelledError, ProviderCancelled):
+                    trace_mark(request_id, 'design_canvas_aborted')
+                    return
+                converted = True
+                if report_model:
+                    yield {'__model_used__': runner.used}
+            raw_fill = fill_ast.model_dump()
+            targets, fill_summary = design_images.fill_targets(raw_fill, query, settings.design_max_fill_images)
+            fill_warnings = []
+            image_provider = _dc_candidate.provider
+            image_key = key_resolver(image_provider) if routed else api_key
+            image_budget = ToolBudget(len(targets), "image")
+            image_tools = {}
+            started = 0
+            from .design_canvas.schema_v11 import generation_aspect
+            for node in targets:
+                aspect = generation_aspect(node["aspect_ratio"])
+                if aspect not in image_tools:
+                    # The slot's shape wins over any request-level aspect, so the photo fills it without cropping.
+                    base_ctx = image_ctx or {}
+                    slot_ctx = {**base_ctx, "explicit_params": {**(base_ctx.get("explicit_params") or {}),
+                                                                "aspect_ratio": aspect}}
+                    image_tools[aspect] = _build_image_tool(image_provider, image_key, pending_images, request_id,
+                                                            user_id, credit_manager, is_byok, slot_ctx, image_budget)
+                answer = image_tools[aspect](design_images.photo_prompt(node))
+                placeholder = design_images.placeholder_id(answer)
+                if placeholder:
+                    node["placeholder_id"] = placeholder
+                    started += 1
+                else:
+                    fill_warnings.append({"kind": "image_not_started", "node_id": node["id"], "detail": answer})
+            if fill_summary["over_cap"]:
+                fill_warnings.append({"kind": "image_limit", "detail": (
+                    f"{fill_summary['over_cap']} more photo slot(s) were left empty: at most "
+                    f"{settings.design_max_fill_images} photos are made per request. Ask again to fill the rest.")})
+            if not targets:
+                fill_warnings.append({"kind": "no_image_slots", "detail": (
+                    "This design has no empty photo slots." if fill_summary["slots"] else
+                    "This design has no photo slots to fill.")})
+            fill_ast = DesignDocumentASTV11.model_validate(raw_fill)
+            fill_elapsed = round(_time.perf_counter() - t0_fill, 3)
+            trace_set(request_id, design_photo_fill={**fill_summary, "targets": len(targets), "started": started,
+                                                     "converted": converted})
+            from .observability import get_trace
+            _fill_trace = get_trace(request_id)
+            _fill_usage = _fill_trace.attrs if _fill_trace is not None else {}
+            yield {"__event__": {"event": "design_ready", "data": fill_ast.model_dump()}}
+            yield {"__event__": {"event": "complete", "data": {
+                "total_tokens": ((_fill_usage.get("tokens_in") or 0) + (_fill_usage.get("tokens_out") or 0)) or None,
+                "elapsed_seconds": fill_elapsed, "mode": "design_canvas", "sub_mode": "fill_design_images",
+                "images_started": started, "converted": converted, "warnings": fill_warnings,
+                "attempts": len(harness_report.get("attempts", [])),
+                "auto_healed": harness_report.get("auto_healed", False),
+            }}}
+            if started:
+                yield {"__pending_images__": pending_images}
+            return
+
         t0_design = _time.perf_counter()
         try:
             design_ast = asyncio.run(_harness_unless_aborted())
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ProviderCancelled):
             logger.info(f"{log_prefix}Design canvas stopped by client abort after {_time.perf_counter() - t0_design:.2f}s")
             trace_mark(request_id, 'design_canvas_aborted')
             return
         except Exception as _exc:
             logger.error(f"{log_prefix}Design canvas harness failed: {_exc}")
             raise
-        finally:
-            call_pool.shutdown(wait=False, cancel_futures=True)  # a call in flight finishes alone; its answer is dropped
 
         elapsed = round(_time.perf_counter() - t0_design, 3)
         attempts = harness_report.get("attempts", [])
@@ -2828,13 +2905,22 @@ def process_user_query_stream(
         link_warnings = check_links(design_ast, query, existing_ast_str)
         if link_warnings:
             trace_set(request_id, design_link_warnings=[w["kind"] for w in link_warnings])
+        fidelity = harness_report.get("fidelity")
+        fidelity_warnings = []
+        if fidelity:
+            trace_set(request_id, design_fidelity=fidelity, design_reference_analysis=harness_report.get("reference_analysis"),
+                      design_typography=harness_report.get("typography"),
+                      design_reference_coverage=harness_report.get("reference_coverage"),
+                      design_reference_use=harness_report.get("reference_use"))
+            fidelity_warnings = [{"kind": "reference_fidelity", "detail": finding} for finding in fidelity["findings"]]
 
         # Emit the design_ready SSE event payload
         design_payload = design_ast.model_dump()
         yield {"__event__": {"event": "design_ready", "data": design_payload}}
         # Final complete event for the caller
         yield {"__event__": {"event": "complete", "data": {
-            "total_tokens": total_tokens, "elapsed_seconds": elapsed, "mode": "design_canvas", "warnings": link_warnings,
+            "total_tokens": total_tokens, "elapsed_seconds": elapsed, "mode": "design_canvas",
+            "warnings": link_warnings + fidelity_warnings,
             "attempts": len(attempts), "auto_healed": harness_report.get("auto_healed", False),
         }}}
         return
@@ -2847,7 +2933,7 @@ def process_user_query_stream(
     validate_output = agent_type == 'code_writer' and settings.code_validation_enabled
     max_tokens = OUTPUT_TOKENS[prepared_context.metadata.action] if document_mode else refinement_max_tokens(agent_type, query)
     for index, candidate in enumerate(candidates):
-        if document_mode and cancel_event is not None and cancel_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
             return
         provider = candidate.provider
         key = key_resolver(provider) if routed else api_key
@@ -2855,6 +2941,8 @@ def process_user_query_stream(
             raise ValueError(f'No API key configured for {provider}')
         retry = 0
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             try:
                 candidate_plan = _effective_plan(plan, agent_type, provider, key, is_byok, image_ctx)
                 prose_only = (agent_type == 'enhance' and suggest_graphs and settings.chart_suggestions_enabled)
@@ -2873,9 +2961,9 @@ def process_user_query_stream(
                 if provider == 'deepseek' and use_tools:
                     model_id = DEEPSEEK_TOOL_MODEL_ID
                 trace_set(request_id, model_used=f'{provider}/{model_id}')
+                if cancel_event is not None and cancel_event.is_set():
+                    return
                 if document_mode:
-                    if cancel_event is not None and cancel_event.is_set():
-                        return
                     trace_set(request_id, document_model_started=True)
                 output_limit = output_token_budget(model_id, _round_max_tokens(max_tokens)) if document_mode else None
                 stream = _agent_text(agent, prepared_context.prompt if document_mode else query, images, provider, use_tools,
@@ -2889,7 +2977,7 @@ def process_user_query_stream(
                     from .output_guard import guard_enhance
                     stream = guard_enhance(stream, instruction)
                 for chunk in stream:
-                    if document_mode and cancel_event is not None and cancel_event.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
                         return
                     if document_mode and isinstance(chunk, dict):
                         chunk['__warnings__'] = prepared_context.warnings + chunk['__warnings__']
@@ -2907,6 +2995,8 @@ def process_user_query_stream(
                 record_health_ok(provider, model_id, byok=is_byok)
                 break
             except Exception as error:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
                 _record_stream_failure(provider, agent_type, tier, error, is_byok)
                 # A tool may already have started a billed image even without a text token.
                 has_images_started = any(not str(k).startswith('__') for k in pending_images)
@@ -2920,7 +3010,10 @@ def process_user_query_stream(
                     retry += 1
                     delay = retry_delay(error)
                     logger.warning('%sRate limit: retrying %s once after %.2fs', log_prefix, provider, delay)
-                    time.sleep(delay)
+                    if cancel_event is None:
+                        time.sleep(delay)
+                    elif cancel_event.wait(delay):
+                        return
                     continue
                 if index + 1 == len(candidates):
                     raise
@@ -2934,6 +3027,8 @@ def process_user_query_stream(
         if sent or any(not str(k).startswith('__') for k in pending_images):
             break
 
+    if cancel_event is not None and cancel_event.is_set():
+        return
     if validate_output:
         from .code_validate import validate_code, repair_prompt
         reply = ''.join(chunks)
@@ -2942,6 +3037,8 @@ def process_user_query_stream(
         if errors and settings.code_repair_enabled and (non_streaming or settings.code_repair_stream_event):
             from agno.run.base import RunStatus
             from .observability import record_text_usage
+            if cancel_event is not None and cancel_event.is_set():
+                return
             repaired = agent.run(query + '\n\n' + repair_prompt(reply, errors), stream=False, images=images)
             if getattr(repaired, 'status', None) == RunStatus.error or getattr(repaired, 'event', None) == RunEvent.run_error:
                 raise RuntimeError(_agent_error_message(provider, getattr(repaired, 'content', None)))
@@ -2969,11 +3066,13 @@ _PLACEHOLDER_BARE_RE = re.compile(r"placeholder::([0-9A-Za-z-]+)")
 IMAGE_FAILED_NOTE = "*(image could not be generated)*"
 
 
-def _wait_for_images(pending: dict, done_event: threading.Event, timeout: float) -> None:
+def _wait_for_images(pending: dict, done_event: threading.Event, timeout: float, cancel_event=None) -> None:
     """Block until every started image is done or failed, or the timeout passes."""
     entries = [v for k, v in pending.items() if not str(k).startswith("__") and isinstance(v, dict)]
     deadline = time.time() + max(0.0, timeout)
     while time.time() < deadline and any(e.get("status") == "generating" for e in entries):
+        if cancel_event is not None and cancel_event.is_set():
+            return
         done_event.wait(timeout=min(0.5, max(0.0, deadline - time.time())))
         done_event.clear()
 
@@ -3027,6 +3126,8 @@ def process_user_query_with_images(
     chart_request: Optional[dict] = None,
     needs_document: Optional[dict] = None,
     action_resolution: Optional[dict] = None,
+    cancel_event: Optional[threading.Event] = None,
+    schema_version: Optional[Literal["1.0", "1.1"]] = None,
 ):
     """
     Non-streaming query using exactly the same routing as the streaming path (same planner, same direct
@@ -3047,6 +3148,7 @@ def process_user_query_with_images(
 
     done_event = threading.Event()
     chunks, pending = [], {}
+    design_data = None
     for chunk in process_user_query_stream(
         query,
         model_provider=model_provider,
@@ -3077,6 +3179,8 @@ def process_user_query_with_images(
         chart_request=chart_request,
         needs_document=needs_document,
         action_resolution=action_resolution,
+        cancel_event=cancel_event,
+        schema_version=schema_version,
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]
@@ -3090,17 +3194,28 @@ def process_user_query_with_images(
             if ev.get("event") == "design_ready":
                 import json as _json
                 chunks = [_json.dumps(ev.get("data", {}))]
+                design_data = ev.get("data")
             if meta is not None:
                 meta[ev.get("event", "event")] = ev.get("data")
                 if ev.get('event') == 'document_analysis_ready':
                     meta['document_context_ready'] = ev['data']['context']
+                if ev.get("event") == "complete" and ev["data"].get("mode") == "design_canvas":
+                    meta["warnings"] = ev["data"]["warnings"]
         elif isinstance(chunk, str):
             chunks.append(chunk)
 
     text = "".join(chunks)
     if any(not str(k).startswith("__") for k in pending):
-        _wait_for_images(pending, done_event, wait_seconds)
+        _wait_for_images(pending, done_event, wait_seconds, cancel_event)
         text = resolve_image_placeholders(text, pending)
+        if design_data:
+            # A photo fill: the design is returned whole, so put each finished photo into its slot.
+            import json as _json
+            from .design_canvas.images import apply_finished_images
+            design_data = apply_finished_images(design_data, pending)
+            text = _json.dumps(design_data)
+            if meta is not None:
+                meta["design_ready"] = design_data
     return text, pending
 
 
@@ -3313,25 +3428,26 @@ def _get_cached_client(cache_key, factory):
     return client
 
 
-def _get_cached_openai_client(api_key: str, base_url: str = None):
-    cache_key = ("openai", api_key, base_url)
+def _get_cached_openai_client(api_key: str, base_url: str = None, *, timeout=MODEL_CALL_TIMEOUT_SECONDS):
+    cache_key = ("openai", api_key, base_url, timeout)
     from openai import OpenAI
-    kwargs = {"api_key": api_key}
+    kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
     if base_url:
         kwargs["base_url"] = base_url
     return _get_cached_client(cache_key, lambda: OpenAI(**kwargs))
 
 
-def _get_cached_anthropic_client(api_key: str):
-    cache_key = ("claude", api_key)
+def _get_cached_anthropic_client(api_key: str, *, timeout=MODEL_CALL_TIMEOUT_SECONDS):
+    cache_key = ("claude", api_key, timeout)
     import anthropic
-    return _get_cached_client(cache_key, lambda: anthropic.Anthropic(api_key=api_key))
+    return _get_cached_client(cache_key, lambda: anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=0))
 
 
-def _get_cached_gemini_client(api_key: str):
-    cache_key = ("gemini", api_key)
+def _get_cached_gemini_client(api_key: str, *, timeout=MODEL_CALL_TIMEOUT_SECONDS):
+    cache_key = ("gemini", api_key, timeout)
     from google import genai
-    return _get_cached_client(cache_key, lambda: genai.Client(api_key=api_key))
+    return _get_cached_client(cache_key, lambda: genai.Client(
+        api_key=api_key, http_options={'timeout': int(timeout * 1000), 'retry_options': {'attempts': 1}}))
 
 
 _DESIGN_MAX_OUTPUT_TOKENS = 8192
@@ -3382,6 +3498,33 @@ def _design_reference_image(image_bytes: bytes) -> bytes:
     return converted
 
 
+MAX_DESIGN_MEASURE_DIMENSION = 2600
+
+
+def _design_measure_image(image_bytes: bytes) -> Optional[bytes]:
+    """
+    The upload at up to MAX_DESIGN_MEASURE_DIMENSION px as PNG, for measuring typography at more detail than the
+    1500 px copy the model sees. EXIF orientation is applied only where _design_reference_image applies it (on
+    resize), so both images show the same pixels; the harness also checks their aspect ratios agree. None when the
+    bytes are not a readable image (the model's copy is then measured instead).
+    """
+    import io
+    from PIL import Image, ImageOps
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            if max(img.size) > MAX_DESIGN_IMAGE_DIMENSION:
+                img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            if max(img.size) > MAX_DESIGN_MEASURE_DIMENSION:
+                img.thumbnail((MAX_DESIGN_MEASURE_DIMENSION, MAX_DESIGN_MEASURE_DIMENSION), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            return out.getvalue()
+    except Exception:
+        return None
+
+
 def _run_design_json_completion(
     messages: list[dict],
     image_bytes: Optional[bytes],
@@ -3395,14 +3538,17 @@ def _run_design_json_completion(
     Executes a structured JSON completion across Claude, Gemini, or OpenAI.
     """
     import base64
+    from config import settings
     from src.models import OPENAI_DESIGN_EFFORT, design_model_id, output_token_budget
     from .s3_service import sniff_image_bytes
 
+    check_provider_call()
     log_prefix = f"[{request_id}] " if request_id else ""
     provider = (model_provider or "claude").lower()
     model_id = design_model_id(provider, "claude-opus-5-5")
     # The real type of the bytes (_design_reference_image keeps them PNG, JPEG or WebP); a JPEG labelled PNG is rejected.
     media_type = sniff_image_bytes(image_bytes)[0] if image_bytes else None
+    output_cap = settings.design_vision_max_output_tokens if image_bytes else _DESIGN_MAX_OUTPUT_TOKENS
 
     if provider == "claude":
         client = _get_cached_anthropic_client(api_key)
@@ -3433,13 +3579,12 @@ def _run_design_json_completion(
             else:
                 anthropic_messages.append({"role": role, "content": content})
 
-        from config import settings
         claude_kwargs = {"temperature": temperature} if claude_accepts_temperature(model_id) else {}   # Opus 5 and newer: 400
         effort = claude_effort_params(model_id, settings.claude_advanced_effort)
         if effort:
             claude_kwargs["output_config"] = effort
         # Opus 5.5 always thinks and thinking counts against max_tokens, so the cap leaves room for it on top of the JSON.
-        claude_cap = output_token_budget(model_id, _DESIGN_MAX_OUTPUT_TOKENS)
+        claude_cap = output_token_budget(model_id, output_cap)
         resp = client.messages.create(
             model=model_id,
             system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}] if system_prompt else [],
@@ -3479,10 +3624,11 @@ def _run_design_json_completion(
         kwargs = {
             "model": model_id,
             "messages": openai_messages,
-            **_output_limit_kwargs(provider, model_id, _DESIGN_MAX_OUTPUT_TOKENS),  # gpt-5.x / gpt-6.x reject max_tokens
+            **_output_limit_kwargs(provider, model_id, output_cap),  # gpt-5.x / gpt-6.x reject max_tokens
         }
         if provider == "openai" and openai_reasoning_family(model_id):
-            kwargs.update(openai_effort_params(model_id, OPENAI_DESIGN_EFFORT))      # no temperature: a 400 unless effort is "none"
+            effort = settings.design_vision_openai_effort if image_bytes else OPENAI_DESIGN_EFFORT
+            kwargs.update(openai_effort_params(model_id, effort))      # no temperature: a 400 unless effort is "none"
         else:
             kwargs["temperature"] = temperature
         if provider == "openai":
@@ -3493,8 +3639,8 @@ def _run_design_json_completion(
         if choices:
             choice = choices[0]
             if getattr(choice, "finish_reason", None) == "length":
-                logger.warning(f"{log_prefix}{provider} design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
-                raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
+                logger.warning(f"{log_prefix}{provider} design output truncated at max_tokens ({output_cap})")
+                raise ValueError(f"Design output truncated by model at max_tokens limit ({output_cap})")
             return choice.message.content or ""
         return ""
 
@@ -3523,7 +3669,7 @@ def _run_design_json_completion(
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt if system_prompt else None,
                 temperature=temperature,
-                max_output_tokens=_DESIGN_MAX_OUTPUT_TOKENS,
+                max_output_tokens=output_cap,
                 response_mime_type="application/json",
             ),
         )
@@ -3532,8 +3678,8 @@ def _run_design_json_completion(
         if candidates:
             finish = str(getattr(candidates[0], "finish_reason", ""))
             if "MAX_TOKENS" in finish.upper():
-                logger.warning(f"{log_prefix}Gemini design output truncated at max_tokens ({_DESIGN_MAX_OUTPUT_TOKENS})")
-                raise ValueError(f"Design output truncated by model at max_tokens limit ({_DESIGN_MAX_OUTPUT_TOKENS})")
+                logger.warning(f"{log_prefix}Gemini design output truncated at max_tokens ({output_cap})")
+                raise ValueError(f"Design output truncated by model at max_tokens limit ({output_cap})")
         return getattr(resp, "text", "") or ""
 
     raise ValueError(f"Unsupported provider for design canvas: {provider}")
@@ -3612,7 +3758,7 @@ def get_autocomplete_suggestion(
         if model_provider == 'openai' or model_provider in OPENAI_COMPATIBLE_BASES:
             # OpenAI and OpenAI-compatible providers (Grok, DeepSeek)
             base_url = OPENAI_COMPATIBLE_BASES.get(model_provider)
-            client = _get_cached_openai_client(api_key, base_url)
+            client = _get_cached_openai_client(api_key, base_url, timeout=AUTOCOMPLETE_TIMEOUT_SECONDS)
             response = client.chat.completions.create(
                 model=model_id,
                 messages=[
@@ -3626,7 +3772,7 @@ def get_autocomplete_suggestion(
             suggestion = response.choices[0].message.content or ""
 
         elif model_provider == 'claude':
-            client = _get_cached_anthropic_client(api_key)
+            client = _get_cached_anthropic_client(api_key, timeout=AUTOCOMPLETE_TIMEOUT_SECONDS)
             claude_kwargs = {"temperature": 0.3} if claude_accepts_temperature(model_id) else {}   # Haiku 5.5 and newer: 400
             claude_kwargs.update(claude_light_request_params(model_id))                            # Haiku 5.x: thinking off, effort low
             response = client.messages.create(
@@ -3651,7 +3797,7 @@ def get_autocomplete_suggestion(
         elif model_provider == 'gemini':
             from google.genai import types
 
-            client = _get_cached_gemini_client(api_key)
+            client = _get_cached_gemini_client(api_key, timeout=AUTOCOMPLETE_TIMEOUT_SECONDS)
             response = client.models.generate_content(
                 model=model_id,
                 contents=user_prompt,

@@ -6,6 +6,8 @@ from agno.models.google import Gemini as AgnoGemini
 from agno.models.openai import OpenAIChat as AgnoOpenAIChat
 from agno.models.xai import xAI as AgnoXAI
 
+from .provider_work import check_provider_call
+
 
 def _tokens(data, field):
     value = data.get(field) if isinstance(data, dict) else getattr(data, field, None)
@@ -60,6 +62,16 @@ def provider_usage(provider, usage):
 
 
 class _CacheMetrics:
+    def invoke(self, *args, **kwargs):
+        check_provider_call()
+        return super().invoke(*args, **kwargs)
+
+    def invoke_stream(self, *args, **kwargs):
+        check_provider_call()
+        for event in super().invoke_stream(*args, **kwargs):
+            check_provider_call()
+            yield event
+
     def _get_metrics(self, response_usage):
         metrics = super()._get_metrics(response_usage)
         _, _, counters = provider_usage(self.cache_provider, response_usage)

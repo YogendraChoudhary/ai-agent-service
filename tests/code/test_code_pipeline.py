@@ -116,7 +116,7 @@ class TestCodePipeline(unittest.TestCase):
             ('repair_at_cap', {'__content_replace__': 'y' * 2500}, 2 * api.CREDIT_SCALE),
         ):
             manager = Mock()
-            manager.reserve.side_effect = [(True, 1000), (True, 1000), (False, 0)]
+            manager.reserve.side_effect = [(True, 10), (False, 10)]
             with self.subTest(name=name), \
                     patch.object(api, 'async_validate_and_get_api_key', AsyncMock(return_value=('dummy', meta))), \
                     patch.object(api, 'credit_manager', manager), patch.object(api, 'CREDIT_PRECHECK_ENABLED', True), \
@@ -131,7 +131,8 @@ class TestCodePipeline(unittest.TestCase):
             self.assertEqual(events[1]['content'], original)
             self.assertEqual(events[2]['output_chars'], len(original))
             self.assertEqual(bill.call_args.kwargs['output_chars'], len(original))
-            self.assertEqual(bill.call_args.kwargs['reserved_scaled'], 2 * api.CREDIT_SCALE)
+            self.assertEqual(bill.call_args.kwargs['reserved_scaled'], api.CREDIT_SCALE)
+            self.assertEqual(manager.reserve.call_count, 1 if name == 'repair_at_cap' else 2)
             self.assertEqual(log_body.call_args.args[2]['text'], original)
 
     def test_exposed_search_tools_share_limits_across_provider_attempts(self):

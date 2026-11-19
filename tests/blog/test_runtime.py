@@ -174,7 +174,7 @@ class TestStreamHook(RuntimeCase):
             self.assertIn(fragment, sent)
         self.assertEqual(len(self.factory.llm.calls_for("unit")), 6)       # intro + 4 sections + conclusion
 
-    def test_the_pipeline_runs_in_a_fresh_thread_pool_not_the_tool_pool(self):
+    def test_blog_model_calls_use_the_bounded_provider_pool(self):
         names = set()
 
         def spy(req, spec):
@@ -184,7 +184,7 @@ class TestStreamHook(RuntimeCase):
         threading_name = lambda: threading.current_thread().name
         self.factory.llm.units = {u: [spy] for u in ("intro", "s1", "s2")}
         self.stream()
-        self.assertTrue(all(n.startswith("blog_unit") for n in names), names)
+        self.assertTrue(names and all(n.startswith("provider-call") for n in names), names)
 
 
 class TestPictures(RuntimeCase):

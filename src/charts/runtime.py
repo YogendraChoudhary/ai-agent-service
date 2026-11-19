@@ -25,7 +25,8 @@ def stream_graph_suggestion(source, *, candidates, key_for, is_byok, user_id=Non
         return
     try:
         llm = AgnoLLM(candidates, key_for, is_byok=is_byok, user_id=user_id, request_id=request_id,
-                      agent_type="chart_extractor", timeout=settings.chart_extraction_timeout_seconds)
+                      agent_type="chart_extractor", timeout=settings.chart_extraction_timeout_seconds,
+                      cancel_event=cancel_event)
         chart = suggest_chart(source, llm)
         if cancel_event is not None and cancel_event.is_set():
             return
@@ -33,6 +34,8 @@ def stream_graph_suggestion(source, *, candidates, key_for, is_byok, user_id=Non
         if chart:
             yield {"__event__": {"event": "graph_suggestion", "data": graph_suggestion(chart).model_dump(mode="json")}}
     except Exception as error:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         # No content or provider credentials in the public failure event.
         logger.warning("[%s] Optional graph suggestion unavailable (%s)", request_id, type(error).__name__)
         trace_set(request_id, graph_suggestion="unavailable", graph_error=type(error).__name__)

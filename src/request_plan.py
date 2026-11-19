@@ -217,19 +217,22 @@ def plan_design_request(
     )
     if not decision.is_design_request:
         return None
+    sub_mode = decision.sub_mode
+    if sub_mode == "fill_design_images" and not (settings.design_image_fill_enabled and settings.design_schema_v11_enabled):
+        sub_mode = "edit_existing_ast"          # photo fill off: the request is the layout edit it was before
     return RequestPlan(
         image_count=0,
         image_requested=0,
         use_web=False,
         advanced_model=True,
         execution_mode="design_canvas",
-        design_sub_mode=decision.sub_mode,
+        design_sub_mode=sub_mode,
         reasons={
             "images": "disabled=design_canvas_mode",
             "web": "disabled=design_canvas_mode",
             "tier": "advanced",
             "design_intent": decision.reason,
-            "design_sub_mode": decision.sub_mode or "",
+            "design_sub_mode": sub_mode or "",
         },
     )
 

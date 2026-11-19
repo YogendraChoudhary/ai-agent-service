@@ -14,10 +14,10 @@ Each application worker drains the same queue. Redis leases prevent concurrent d
 
 `BILLING_WEBHOOK_IDEMPOTENT` defaults to **false**. Leave it false until the billing receiver is confirmed to deduplicate `Idempotency-Key` atomically with the credit deduction.
 
-- With the default, each message gets one transport attempt. A failed, timed-out or uncertain attempt stays persisted with its credits held for reconciliation. Restarting a worker does not blindly repost that message.
-- With `BILLING_WEBHOOK_IDEMPOTENT=true`, unacknowledged messages retry with the same key and unchanged payload, using a 2-second backoff that increases to at most 300 seconds. Retries are not discarded after a fixed attempt count.
+- With the default, each message gets one transport attempt. A failed, timed-out or uncertain attempt moves to `reconciliation` and leaves the due set. The job and credits stay held. Restarting a worker does not repost it.
+- If `BILLING_WEBHOOK_IDEMPOTENT=true` at the first attempt and remains enabled, unacknowledged messages retry with the same key and payload. Backoff grows from 2 to 300 seconds. After six days from the first attempt, the worker holds the job for reconciliation so a replay stays within the receiver's seven-day deduplication window.
 - A timeout can happen after the receiver has already charged the account. HTTP 500 can also follow a committed operation. Retrying either without receiver-side deduplication can charge twice; this is why Python does not enable retries by default.
-- Missing webhook configuration leaves messages pending rather than discarding their billing records or releasing their holds.
+- Missing webhook configuration moves messages to `reconciliation` with their holds intact. Older jobs that have already been attempted and lack a recorded deduplication window move to reconciliation when next claimed, including after a rollout.
 
 No external backend was modified for this change. Until duplicate protection is verified there, failed messages require operator reconciliation. Retaining holds is deliberate: it can temporarily reduce a user's available balance during a billing outage, but it prevents repeated unbilled provider usage. Do not delete pending messages or counters merely to clear a held balance; first establish whether the receiver recorded the charge.
 
@@ -46,6 +46,11 @@ there, the backend bills from the request `type` (`generate_design` = 3, `edit_d
 **Images.** `images: [{"provider", "model", "credits_scaled"}]` lists each picture with its model's price. Until the
 receiver reads it, `image_count` × 5 credits applies, as today.
 
+**Design photo fill** (`fill_design_images`, docs/design_image_fill_plan.md). A fill makes no design-model call, so
+it is sent like any image request: `operation_type: "image"`, `image_count`, `images[]`, and no `design` object.
+Only when the selected design had no photo slots does one layout edit run first. That body also carries
+`design: {"sub_mode": "fill_design_images", "credits_scaled": 5}`. Charge both: the flat design price and the images.
+
 **Duplicates.** Each message carries a stable `Idempotency-Key` header (also the event id), unchanged across retries.
 The receiver must:
 
@@ -53,11 +58,20 @@ The receiver must:
    charge or charged without its key.
 2. Answer a repeated key with **HTTP 2xx** and no second charge. Only 2xx counts as delivered here; a 409 or other
    error makes the agent keep retrying that message.
-3. Keep keys for at least 7 days. Retries back off up to every 300 seconds with no attempt limit.
+3. Keep keys for at least 7 days. Replays of an event must use the same receiver deduplication store across worker restarts and configuration changes.
 
 **Switching on retries.** Only after (1)–(3) are deployed, set `BILLING_WEBHOOK_IDEMPOTENT=true` on every agent
 worker. Until then it stays `false`: each message is posted once, and a failed or timed-out delivery keeps its credit
 hold for manual reconciliation instead of risking a double charge.
+
+## Requeueing a held event
+
+Use `HGET agent:billing:jobs <event-id>` against the environment that owns the event. An entry in `reconciliation` keeps its credit hold and has no due time.
+
+- For a never-attempted event, restore the webhook configuration and run `.venv/bin/python -m src.billing_delivery <event-id>` from that agent environment. The same command can replay an attempted event only when the receiver's deduplication contract covered its first attempt and the recorded window is still open.
+- When the billing backend confirms it already recorded the exact charge, run `.venv/bin/python -m src.billing_delivery <event-id> --confirm-charged`. This schedules the normal hold settlement without another webhook. An uncertain attempt outside its deduplication window requires reconciliation in the billing backend first.
+
+Requeue schedules the existing event and leaves its attempt history and credit hold intact. It is safe to repeat the command after an uncertain response from Redis. The running worker discovers the scheduled event on its next check. Avoid editing the job or due set directly.
 
 ## Deployment and operations
 
@@ -67,7 +81,7 @@ hold for manual reconciliation instead of risking a double charge.
 - Keep `CREDIT_PRECHECK_ENABLED=true` for managed accounts. Disabling it intentionally disables admission checks against available credits.
 - Use Redis persistence appropriate for financial delivery records, with eviction disabled for the billing data. Surviving an application restart relies on the queued data surviving in Redis; this is not a backup against Redis data loss or a crash before usage can be enqueued.
 - Configure `BACKEND_WEBHOOK_URL`, `WEBHOOK_SECRET` and the existing settlement delay. HTTP redirects are not followed, so webhook credentials are not forwarded to a redirected host.
-- Inspect pending messages with `HGETALL agent:billing:jobs` and due times with `ZRANGE agent:billing:due 0 -1 WITHSCORES`. Messages include counts, billing metadata, attempt count, state and the latest error class/status; no provider keys or document text are stored.
+- Inspect a pending message with `HGET agent:billing:jobs <event-id>` and its due time with `ZSCORE agent:billing:due <event-id>`. Messages include counts, billing metadata, attempt count, state and the latest error class/status. They contain no provider keys or document text.
 - Logs identify held/unacknowledged event IDs. Investigate configuration/authentication errors and unresolved messages. If retries were disabled, verify receiver-side deduplication or reconcile the specific charge before enabling automatic replay.
 
 The settlement delay retains the existing assumption that the backend's balance update reaches Redis before the hold is released. Actual receiver idempotency, Redis durability and balance propagation must be checked in deployment; they were not changed or verified against production here.

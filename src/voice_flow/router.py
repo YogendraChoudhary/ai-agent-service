@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from config import settings
+from src.credit_manager import run_credit_io
 from src.observability import finish_trace, start_trace
 from src.voice_flow.asr.audio import WHISPER_RATE, decode_audio_bytes
 from src.voice_flow.asr.whisper_client import get_transcriber
@@ -152,13 +153,13 @@ async def _dictate(data: bytes, ctx: DictateContext, caller: Caller) -> DictateR
     if audio.size < MIN_UTTERANCE_SECONDS * WHISPER_RATE:
         return _nothing_heard(audio_ms, 0.0, started)                 # nothing is reserved or charged for a key bounce
 
-    reserved = _gate.reserve(caller, audio_ms / 1000.0) if _gate else 0
+    reserved = await run_credit_io(_gate.reserve, caller, audio_ms / 1000.0) if _gate else 0
     settled = False
     try:
         asr = await get_transcriber().transcribe(audio, ctx.custom_dictionary, ctx.language)
         if not asr.text.strip():
             if _gate:
-                _gate.refund(caller, reserved)
+                await run_credit_io(_gate.refund, caller, reserved)
                 settled = True
             return _nothing_heard(asr.audio_ms, asr.asr_ms, started)
         service = _formatter_for(caller)
@@ -174,18 +175,20 @@ async def _dictate(data: bytes, ctx: DictateContext, caller: Caller) -> DictateR
             timings=Timings(audio_ms=asr.audio_ms, asr_ms=asr.asr_ms, llm_ms=llm_ms, post_ms=post_ms, total_ms=total))
         if _gate:
             if not response.formatted_text.strip():
-                _gate.refund(caller, reserved)
+                await run_credit_io(_gate.refund, caller, reserved)
                 settled = True
                 return response
-            reserved = _gate.reserve(caller, 0, output_chars=len(response.formatted_text), reserved=reserved)
+            reserved = await run_credit_io(_gate.reserve, caller, 0, output_chars=len(response.formatted_text), reserved=reserved)
             backend = service.backend
-            _gate.settle(caller, reserved, output_chars=len(response.formatted_text), duration_ms=int(total),
-                         provider=getattr(backend, "name", "unknown"), model=getattr(backend, "model", None) if result.source == "llm" else None)
+            await run_credit_io(_gate.settle, caller, reserved, output_chars=len(response.formatted_text), duration_ms=int(total),
+                                provider=getattr(backend, "name", "unknown"),
+                                model=getattr(backend, "model", None) if result.source == "llm" else None)
             settled = True                                            # the webhook now owns the reservation
         return response
     except (Exception, asyncio.CancelledError) as exc:
         if _gate and not settled:
-            _gate.refund(caller, reserved, error_code=type(exc).__name__, duration_ms=int((time.perf_counter() - started) * 1000))
+            await run_credit_io(_gate.refund, caller, reserved, error_code=type(exc).__name__,
+                                duration_ms=int((time.perf_counter() - started) * 1000))
         raise
 
 

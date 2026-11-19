@@ -2,3 +2,6 @@
 pytest
 pytest-asyncio
 fakeredis[lua]==2.40.0
+# Design canvas render/eval scripts (scripts/design_reference_render.py, scripts/design_fidelity_eval.py --render).
+# Not used by the server. After installing, fetch the browser once: python -m playwright install chromium
+playwright==1.65.2

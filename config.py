@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     design_canvas_enabled: bool = Field(True, alias="DESIGN_CANVAS_ENABLED")
     design_max_repair_attempts: int = Field(2, ge=0, le=5, alias="DESIGN_MAX_REPAIR_ATTEMPTS")
+    design_schema_v11_enabled: bool = Field(False, alias="DESIGN_SCHEMA_V11_ENABLED")
+    design_vision_two_pass: bool = Field(False, alias="DESIGN_VISION_TWO_PASS")
+    design_max_fidelity_repairs: int = Field(1, ge=0, le=1, alias="DESIGN_MAX_FIDELITY_REPAIRS")
+    design_vision_openai_effort: Literal["low", "medium"] = Field("low", alias="DESIGN_VISION_OPENAI_EFFORT")
+    design_vision_max_output_tokens: int = Field(8192, ge=8192, le=12000, alias="DESIGN_VISION_MAX_OUTPUT_TOKENS")
+    # Photo fill (docs/design_image_fill_plan.md): "add real photos" on a selected 1.1 design sends its image
+    # placeholders through the image generation flow. Needs DESIGN_SCHEMA_V11_ENABLED and an editor that renders
+    # ImageNode and applies image_ready by placeholder_id.
+    design_image_fill_enabled: bool = Field(False, alias="DESIGN_IMAGE_FILL_ENABLED")
+    design_max_fill_images: int = Field(12, ge=1, le=24, alias="DESIGN_MAX_FILL_IMAGES")
     # How hard Claude's advanced tier (claude-opus-5-5) thinks: low | medium | high | xhigh | max. Thinking cannot be switched off on
     # this model and is billed as output, so this is the speed/cost/quality dial. "low" measured as good as "medium" on writing, design
     # canvas and code, and faster and cheaper (docs/MODEL_UPGRADE_BENCHMARK.md, section 12). The model's own default would be medium.
@@ -155,10 +165,11 @@ class Settings(BaseSettings):
             data = json.loads(value)
             if not isinstance(data, dict):
                 raise ValueError('expected an object')
+            tasks = {'code', 'writing', 'content', 'design_canvas'}   # the task names src/task_router.py routes
             if info.field_name == 'task_route_defaults':
-                valid = all(k in {'code', 'writing', 'content'} and (v is None or v in providers) for k, v in data.items())
+                valid = all(k in tasks and (v is None or v in providers) for k, v in data.items())
             elif info.field_name == 'task_fallback_trees':
-                valid = all(k in {'code', 'writing', 'content'} and isinstance(v, list)
+                valid = all(k in tasks and isinstance(v, list)
                             and all(isinstance(p, str) and p in providers | {'<requested>'} for p in v)
                             for k, v in data.items())
             else:
@@ -365,7 +376,7 @@ class Settings(BaseSettings):
     # was told, the advanced tier by 15-30% with every structure check passing. Credits are priced per character, not per tier, so this costs the
     # platform more per request on managed plans (not the user). False = every operation uses the tier its single call uses.
     longform_tier_overrides: bool = Field(True, alias="LONGFORM_TIER_OVERRIDES")
-    longform_call_timeout_seconds: float = Field(150.0, ge=0, le=900, alias="LONGFORM_CALL_TIMEOUT_SECONDS")   # one model call; 0 = no limit
+    longform_call_timeout_seconds: float = Field(150.0, ge=0, le=900, alias="LONGFORM_CALL_TIMEOUT_SECONDS")   # 0 uses the SDK deadline without a separate wait limit
 
     # ------------------------------------------------------------------
     # Voice dictation (src/voice_flow). Local Whisper (faster-whisper) turns speech into text; a low-end Gemini model

@@ -31,6 +31,7 @@ from src.models import (
     openai_image_supports_input_fidelity,
 )
 from src.provider_health import HEALTH, record_ok as record_health_ok
+from src.provider_work import MODEL_CALL_TIMEOUT_SECONDS, check_provider_call
 from src.s3_service import (
     sniff_image_bytes,
     convert_image_format,
@@ -617,7 +618,8 @@ def _call_gemini_with_fallback(
     ]
     models_to_try = [primary_model] + fallback_models
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={
+        'timeout': int(MODEL_CALL_TIMEOUT_SECONDS * 1000), 'retry_options': {'attempts': 1}})
 
     def _config_for(target: str, with_size: bool = True):
         """Per-model config: only sizes the model really supports are sent (an unsupported size is a 400)."""
@@ -645,6 +647,7 @@ def _call_gemini_with_fallback(
         try:
             logger.info(f"{log_prefix}Calling Gemini image generation (model={target_model})...")
             try:
+                check_provider_call()
                 response = client.models.generate_content(model=target_model, contents=contents, config=_config_for(target_model))
             except Exception as gen_err:
                 msg = str(gen_err).lower()
@@ -654,6 +657,7 @@ def _call_gemini_with_fallback(
                 ):
                     # Keep the aspect ratio, drop only the size
                     logger.warning(f"{log_prefix}Gemini rejected the image size ({gen_err}); retrying with the aspect ratio only")
+                    check_provider_call()
                     response = client.models.generate_content(
                         model=target_model, contents=contents, config=_config_for(target_model, with_size=False)
                     )
@@ -711,7 +715,7 @@ def _call_openai_with_fallback(
     primary_model = model_id or get_image_model_id("openai")
     models_to_try = list(dict.fromkeys([primary_model, get_image_model_id("openai"), *get_image_model_fallbacks("openai")]))
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=MODEL_CALL_TIMEOUT_SECONDS, max_retries=0)
     size = params.to_openai_size()
     extras: Dict[str, Any] = {
         "quality": params.to_openai_quality(),
@@ -721,6 +725,7 @@ def _call_openai_with_fallback(
         extras["background"] = "transparent"
 
     def _request(target_m: str, tuning: Dict[str, Any]):
+        check_provider_call()
         if reference_image_bytes:
             _, ref_ext = sniff_image_bytes(reference_image_bytes)
             buf = io.BytesIO(reference_image_bytes)
@@ -825,6 +830,7 @@ def _call_grok_edit(
     for idx, model_id in enumerate(models_to_try):
         try:
             logger.info(f"{log_prefix}Calling Grok image edit (model={model_id})...")
+            check_provider_call()
             r = requests.post(
                 GROK_EDIT_URL,
                 headers=headers,
@@ -884,12 +890,13 @@ def _call_grok_with_fallback(
         return _call_grok_edit(api_key, prompt, reference_image_bytes, models_to_try, request_id)
 
     from openai import OpenAI
-    client = OpenAI(base_url="https://api.x.ai/v1", api_key=api_key)
+    client = OpenAI(base_url="https://api.x.ai/v1", api_key=api_key, timeout=MODEL_CALL_TIMEOUT_SECONDS, max_retries=0)
 
     last_error = None
     for idx, target_model in enumerate(models_to_try):
         try:
             logger.info(f"{log_prefix}Calling Grok image generation (model={target_model})...")
+            check_provider_call()
             resp = client.images.generate(model=target_model, prompt=prompt, n=1)
             content, mime = _grok_download(resp.data[0].url)
             return content, mime, target_model
@@ -999,6 +1006,7 @@ def generate_image_unified(
     6. Sniffs real bytes, converts format if needed, uploads to S3/CDN, measures dimensions
     7. Stores context for follow-ups (scoped to document_id when given)
     """
+    check_provider_call()
     start_time = time.time()
     log_prefix = f"[{request_id}] " if request_id else ""
 
@@ -1023,6 +1031,7 @@ def generate_image_unified(
                 eff_api_key, prompt, params, reference_image_bytes, request_id, model_id=target_model
             )
         except Exception as grok_err:
+            check_provider_call()
             gemini_key = getattr(settings, "default_gemini_api_key", None)
             if is_byok or not gemini_key:
                 raise ValueError(f"Grok image edit failed and no fallback is available: {grok_err}") from grok_err

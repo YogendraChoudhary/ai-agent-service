@@ -212,7 +212,9 @@ That section documents `event: token`, `event: placeholder` and a `content_repla
 ### 2.5 Cancelling
 
 `POST /agent/abort` with `{"request_id": "<from start>", "api_key": "<licence key>"}` → `200 {"success": true}`
-(401 if the licence is invalid). Also abort the `fetch` with an `AbortController`.
+(401 if the licence is invalid, 503 if a remote cancellation cannot be published). The licence must belong to the
+stream's user. Abort works across API workers and stops new provider work. A provider call already in flight can
+continue until it returns or times out. Also abort the `fetch` with an `AbortController`.
 
 For design requests the abort matters more than usual: the stream is silent while the model works, so the server can
 only notice an abort through this call. Observed: abort during a design ends the stream in about 0.1 s with a `done` and
@@ -513,7 +515,8 @@ start → init → [silent while the model works: 9.5–47 s observed] → desig
 * Show a working state at `init`. Nothing else arrives until `design_ready`.
 * The server validates, self-repairs (up to 2 retries by default) and deterministically fixes the AST before sending, so
   **`design_ready` is always schema-valid.** `complete.auto_healed: true` means the server had to fix contrast, ids,
-  depth or SVG attributes in code. `attempts` is the number of model calls. Neither needs UI.
+  depth or SVG attributes in code. `attempts` counts the draft and repair calls. Vision can also analyze the screenshot
+  before the draft. Neither field needs UI.
 * Failure (model unusable, output never valid) → an `error` frame and **no** `design_ready`.
 * Billing, platform keys only: reserved up front (**3.0 credits** for a new design, **0.5** for an edit; 402
   `INSUFFICIENT_CREDITS` if short), charged only when `design_ready` is delivered, released on error. BYOK users are not charged.
@@ -655,6 +658,78 @@ whitelisted attributes above even though the server already filtered them.
 - [ ] `error` frame, 402 `INSUFFICIENT_CREDITS` and "asked for a design, got text" are all handled
 - [ ] A 45-second generation does not time out in the browser or the proxy
 - [ ] No `innerHTML`/`dangerouslySetInnerHTML` on AST-derived strings
+
+### 4.8 Schema 1.1
+
+Branch on the returned `version`. Schema 1.0 continues to use §4.5. While the renderer is in rollout, send
+`schema_version: "1.0"` on design requests to pin the legacy format. Save the full AST, including its version and font
+tokens, and send it back for AI edits. A server with `DESIGN_SCHEMA_V11_ENABLED=false` refuses an edit of a saved 1.1 AST.
+Enable both 1.1 and two-pass vision in production after this renderer passes the editor acceptance checks below.
+
+| Field | Rendering rule |
+|---|---|
+| `fonts.{display,heading,body,mono}` | Each non-null token contains an allow-listed `family` and a CSS `fallback` of `sans-serif`, `serif`, or `monospace`. Set the 1.1 canvas font to the body token or `system-ui, sans-serif`. Text and buttons select `font_role` and fall back to the canvas font. |
+| `font_weight`, `font_size_px`, `letter_spacing_em`, `text_transform` | On text nodes **and buttons**. Map weights from `light` (300) through `extrabold` (800). Text size can reach 200 px. Use `em` for letter spacing and CSS `text-transform` to preserve the underlying editable string (a button's `label` stays as typed). |
+| `span.font_weight_value`, `button.font_weight_value` | Exact weight measured from a reference screenshot (100–1000, e.g. `550`). When set, use it as the CSS `font-weight`; `font_weight` is the nearest named weight for fonts or renderers without a weight axis. |
+| `span.gradient`, `baseline`, `size_scale` | A gradient has an `angle_deg` and 2–5 evenly spaced hex `stops`. Keep `span.color` as the solid fallback and use text clipping where supported. Set `vertical-align` to `super` or `sub` as applicable, and set the span font size to `size_scale` em. |
+| `style.background_gradient`, `shadow`, `shadow_color` | Apply a CSS linear gradient over the solid background. Use `0 8px 24px rgb(0 0 0 / .35)` for `soft` and `0 0 24px color-mix(in srgb, <shadow_color> 40%, transparent)` for `glow`. |
+| `icon_name`, `trailing_icon` | Add `copy`, `arrow_up_right`, and `chevron_down` to the icon registry. Render a button's trailing icon after the label and hide that decorative icon from assistive technology. |
+| `columns`, `column_ratios` | Ratios belong to a grid with one ratio per column. Set each track to `minmax(0, <ratio>fr)`, with a single content panel per track. |
+| `flex_row`, `wrap`, `style.flex_grow` | Default to `flex-wrap: nowrap`. A weighted panel gets `flex: <weight> 1 0` and `min-width: 0` so its contents cannot change the intended ratio. |
+| `DividerNode.orientation: "vertical"` | Sits between content panels in a non-wrapping flex row, or between inline items such as `14-day free trial · No credit card required │ Compare every detail` (the rule then spans the row's height, so keep that row's `align_items` as sent). Draw `border-left` with the given thickness and colour, set `align-self: stretch` and `flex-shrink: 0`, and expose `aria-orientation="vertical"`. Use `width_percent` and `margin_y_px` for horizontal rules. |
+
+Load each allow-listed family once with its full axes, not a fixed list of weights: a measured weight such as 550
+needs the weight axis, and DM Sans, Inter and Fraunces also need their optical-size axis (`opsz`), which browsers apply
+from the font size by default (`font-optical-sizing: auto`); the server measured with it applied. The exact Google
+Fonts CSS2 family specs are produced by `font_query()` in `scripts/design_reference_render.py`, for example
+`DM Sans:opsz,wght@9..40,100..1000`, `Inter Tight:wght@100..900`, `Poppins:wght@300;400;500;600;700;800`.
+Load each allow-listed family once with the weights it supports. The allow-list lives in
+`src/design_canvas/schema_v11.py`. Keep a generic fallback while the webfont loads. The weights available differ across
+families. [Google Fonts CSS API](https://developers.google.com/fonts/docs/css2)
+
+For a narrower editing area, lay out the design at its natural width (`root.style.max_width` for recreations) and fit it
+with the editor's canvas zoom or viewport mechanism. The zoom must be used when converting pointer positions into canvas
+coordinates. A raw `transform: scale()` on the root can put the caret, drag handles, and hit-testing in different coordinate
+spaces. Preserve IDs and ignore unknown fields during rendering.
+
+#### Photos: `ImageNode` and photo fill
+
+A recreated screenshot now has a photo slot wherever the reference shows a photograph:
+
+```ts
+interface ImageNode { node_type: 'image'; id: string; alt: string; prompt: string /* what the photo shows */;
+  src: string | null /* https on the image CDN only */; placeholder_id: string | null /* uuid while generating */;
+  aspect_ratio: '1:1' | '4:3' | '3:4' | '16:9' | '9:16'; width_percent: number; object_fit: 'cover' | 'contain';
+  source_box: [number, number, number, number] | null; style: NodeStyle; editable: boolean }
+```
+
+* Render an `<img>` with CSS `aspect-ratio` and `object-fit` when `src` is set, else a neutral placeholder showing
+  `alt`, animated while `placeholder_id` is set. Never load a `src` outside the CDN host (the server only ever
+  sends CDN URLs; check again, since users can edit the AST). Send `prompt` back unchanged: it is what a fill draws.
+* **Photo fill.** With a design selected, a request like "add real photos" / "fill the images" / "generate images for
+  each card" (plain `general` or `edit_design` type, `existing_design_ast` attached) returns `init`, then
+  `design_ready` at once with `placeholder_id` set on every slot being filled, then `complete`
+  (`sub_mode: "fill_design_images"`, `images_started`, `warnings`). Then, as each photo finishes, the same
+  `image_ready {placeholder_id, url, width, height, format}` / `image_failed {placeholder_id, error}` frames as for
+  chat images, and `stream_end`. On `image_ready`, set `src = url` on the node whose `placeholder_id` matches and
+  clear `placeholder_id`. On `image_failed`, clear it and keep the old `src`. Save the AST after each.
+* "replace / new / different photos" regenerates every slot; naming a card by one of its texts ("only the KFC
+  one") fills that card only; otherwise only empty slots are filled. At most `DESIGN_MAX_FILL_IMAGES` (12) per request;
+  the rest are listed in `complete.warnings` (`image_limit`). A design with no photo slots gets one layout edit
+  first (`converted: true`).
+* `/agent/process` waits for the photos and returns `design` with each finished `src` already in place. That endpoint
+  always runs as bring-your-own-key, so photos only generate when the request's own key can draw images (not with
+  `claude`); otherwise `warnings` lists `image_not_started` per slot. The editor should use `/agent/stream`.
+* Price: each photo is charged like any generated image (5 credits); the fill itself is free unless the conversion
+  edit ran (0.5 credits).
+
+Show outstanding reference fidelity findings from `complete.warnings` as a non-blocking notice. Each has
+`{kind: "reference_fidelity", detail: string}`. The `design_ready` event still carries an editable design.
+
+- [ ] The promo's panels and vertical rule share one row at full width and at narrow editor width.
+- [ ] In a narrow editor, the caret, selection, drag handles, and pointer hit tests line up with the zoomed canvas.
+- [ ] The gradient headline, tracked mono labels, raised percent sign, copy icon, and button glow render after reload.
+- [ ] A 1.0 document still renders and a `schema_version: "1.0"` request gets only 1.0 fields.
 
 ---
 

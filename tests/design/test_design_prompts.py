@@ -66,9 +66,13 @@ class TestExampleInPrompt:
 
 
 @pytest.mark.asyncio
-async def test_harness_sends_the_schema_bearing_prompt_as_the_system_message():
+@pytest.mark.parametrize("v11", [False, True])
+async def test_harness_sends_the_schema_bearing_prompt_as_the_system_message(monkeypatch, v11):
+    from config import settings
     from src.design_canvas.service import execute_design_canvas_harness
 
+    # Pinned: this environment's .env turns schema 1.1 on, and the expected prompt depends on it.
+    monkeypatch.setattr(settings, "design_schema_v11_enabled", v11)
     seen = []
 
     async def _run(messages, image_bytes=None, temperature=0.2):
@@ -77,4 +81,5 @@ async def test_harness_sends_the_schema_bearing_prompt_as_the_system_message():
 
     runner = type("Runner", (), {"run_json_completion": staticmethod(_run)})()
     await execute_design_canvas_harness(runner, "design a card", "create_from_prompt")
-    assert seen[0] == {"role": "system", "content": prompts.DESIGN_SYSTEM_PROMPT}
+    expected = prompts.DESIGN_SYSTEM_PROMPT_V11 if v11 else prompts.DESIGN_SYSTEM_PROMPT
+    assert seen[0] == {"role": "system", "content": expected}

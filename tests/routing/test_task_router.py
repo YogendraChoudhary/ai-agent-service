@@ -58,6 +58,16 @@ class TestTaskRouter(unittest.TestCase):
         config = Settings(_env_file=None, TASK_ROUTE_DEFAULTS='{"writing": "claude"}')
         self.assertEqual(config.task_route_defaults, '{"writing": "claude"}')
 
+    def test_design_canvas_default_and_tree_are_accepted(self):
+        # The router has a design_canvas task; its default (Claude) and fallback tree can be pinned per environment.
+        config = Settings(_env_file=None, TASK_ROUTE_DEFAULTS='{"design_canvas": "claude"}',
+                          TASK_FALLBACK_TREES='{"design_canvas": ["claude", "openai"]}')
+        self.assertEqual(config.task_route_defaults, '{"design_canvas": "claude"}')
+        self.assertEqual(config.task_fallback_trees, '{"design_canvas": ["claude", "openai"]}')
+        with patch.object(settings, 'task_route_defaults', '{"design_canvas": "claude"}'):
+            route = resolve_route('design_canvas', 'openai', 'auto', {'claude', 'openai', 'gemini'}, True)
+        self.assertEqual(route[0].provider, 'claude')
+
     @patch.object(settings, 'provider_fallback_enabled', True)
     def test_same_tier_vision_filter_and_deduplication(self):
         route = resolve_route('content', 'deepseek', 'user', set(ADVANCED_MODEL_IDS), False, has_images=True)

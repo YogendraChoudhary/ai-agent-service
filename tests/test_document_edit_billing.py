@@ -35,7 +35,7 @@ def test_zero_call_canceled_edit_refunds_credit_and_reports_abort(paid_editor, m
         monkeypatch.setattr(tpa, 'create_agent', factory)
     else:
         cancel.set()
-    monkeypatch.setattr(api, 'register_cancellation_event', lambda rid: cancel)
+    monkeypatch.setattr(api, 'register_cancellation_event', lambda rid, user_id: cancel)
     request = edit_body()
     if explicit:
         request['document_context'] = {'text': request.pop('document_text')}

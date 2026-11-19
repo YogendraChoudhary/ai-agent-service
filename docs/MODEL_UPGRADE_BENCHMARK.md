@@ -170,6 +170,37 @@ Same overall accuracy, opposite error profile: 4o-mini over-calls "code", luna u
 
 Terra is not faster than gpt-5.2 here and drifts slower at default effort. Sol is the standout, but n=6 per config. Sol lists at $2/$10 per 1M tokens (gpt-5.2: $1.75/$14), and it wrote 33% fewer tokens.
 
+#### 4.5.1 Reference-image recreation (2026-11-19)
+
+The live harness in `scripts/design_fidelity_eval.py` records per-fixture text recall, layout, accent coverage,
+font selection, latency and model usage. Its four fixtures cover the supplied promo, a three-card pricing row,
+a serif editorial hero, and mobile onboarding. `--render` needs the optional Playwright package and its Chromium
+browser. It saves the generated image and a comparison with the reference.
+
+On the supplied promo at the 1500 px model input scale, the nearest measured shade changed from ΔE 39.0 to 0.6
+for lavender and from 33.8 to 1.3 for mint. The dominant background is within ΔE 1.0 of `#1B1923`. On a 1920×1080
+resize of the fixture, the new extractor's median over 21 runs was 7.9 ms for WebP, 4.3 ms for JPEG, and 13.7 ms for
+PNG. The browser regression checks the 58/42 panels and vertical rule at a 370 px viewport.
+
+| OpenAI vision setting | Effort | Visible output budget | Live fidelity and latency |
+|---|---|---:|---|
+| Default | low | 8,192 | Pending provider evaluation |
+| Local candidate | medium | 12,000 | Pending provider evaluation |
+
+The provider cap also includes the usual reasoning headroom. The default keeps the existing budget until the
+reference runs establish a latency and fidelity tradeoff. Both
+schema 1.1 and two-pass vision default to off. To compare budgets locally after authorizing the paid provider calls,
+run these with the same fixtures and model:
+
+```sh
+DESIGN_SCHEMA_V11_ENABLED=true DESIGN_VISION_TWO_PASS=true \
+  python scripts/design_fidelity_eval.py promo_blackfriday --runs 5 --label two_pass_low --render
+
+DESIGN_SCHEMA_V11_ENABLED=true DESIGN_VISION_TWO_PASS=true \
+  DESIGN_VISION_OPENAI_EFFORT=medium DESIGN_VISION_MAX_OUTPUT_TOKENS=12000 \
+  python scripts/design_fidelity_eval.py promo_blackfriday --runs 5 --label two_pass_medium --render
+```
+
 ### 4.6 Images (medium quality, 1024x1024, 2 prompts per model, one run each)
 
 Eyeball sheets: `local_run/model_upgrade/sheet_poster.jpg`, `sheet_product.jpg`, `images.html`.

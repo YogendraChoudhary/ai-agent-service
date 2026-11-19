@@ -68,6 +68,7 @@ def stream_blog(
     request_id: Optional[str],
     report_model: bool = False,
     available_providers: Optional[Iterable[str]] = None,
+    cancel_event=None,
 ) -> Iterator[Union[str, dict]]:
     """
     The blog pipeline for one request. Pictures it starts are registered in `pending_images`, the same dict (and the
@@ -108,12 +109,14 @@ def stream_blog(
 
     fast_outline = outline_chain(settings.blog_outline_model, candidates, available_providers)
     llm = AgnoLLM(candidates, key_for, outline_candidates=fast_outline, request_id=request_id, user_id=user_id,
-                  is_byok=is_byok, image_ctx=ctx)
+                  is_byok=is_byok, image_ctx=ctx, timeout=settings.longform_call_timeout_seconds or None,
+                  cancel_event=cancel_event)
     if fast_outline:
         logger.info(f"[{request_id}] blog outline model: {fast_outline[0].provider} "
                     f"({'advanced' if fast_outline[0].advanced else 'basic'}), then the drafting model")
     reported = handed_over = False
-    for chunk in generate_blog_stream(request, plan, llm, media, sources=sources, request_id=request_id):
+    for chunk in generate_blog_stream(request, plan, llm, media, sources=sources, request_id=request_id,
+                                      cancel_event=cancel_event):
         if report_model and not reported:
             reported = True
             # Attribution follows the model that writes the post, which is known before it has run a single part.

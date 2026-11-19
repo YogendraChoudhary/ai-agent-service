@@ -3,7 +3,9 @@
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
+import src.provider_work as work
 from src.longform.llm import call_with_timeout
 from src.provider_errors import can_fall_back, is_retryable
 
@@ -37,13 +39,22 @@ class TestCallWithTimeout(unittest.TestCase):
         self.assertTrue(is_retryable(raised.exception))
         self.assertTrue(can_fall_back(raised.exception))
 
-    def test_the_stuck_call_does_not_keep_the_process_alive(self):
+    def test_timed_out_calls_keep_their_pool_slots_until_workers_finish(self):
         release = threading.Event()
-        with self.assertRaises(TimeoutError):
-            call_with_timeout(lambda: release.wait(5), 0.1)
-        stuck = [t for t in threading.enumerate() if t.name == "llm-call"]
-        release.set()
-        self.assertTrue(all(t.daemon for t in stuck))
+        started = []
+        workers = work._Workers(1, 'test-stage')
+        try:
+            with patch.object(work, '_call_workers', workers):
+                with self.assertRaises(TimeoutError):
+                    call_with_timeout(lambda: release.wait(5), 0.1)
+                with self.assertRaises(TimeoutError):
+                    call_with_timeout(lambda: started.append(True), 0.05)
+                with self.assertRaises(work.ProviderBusy):
+                    call_with_timeout(lambda: None, 0.05)
+        finally:
+            release.set()
+            workers.pool.shutdown()
+        self.assertEqual(started, [])
 
 
 if __name__ == "__main__":

@@ -13,19 +13,22 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 # ---------------------------------------------------------------------------
 # Third-party
 # ---------------------------------------------------------------------------
+import certifi
 import uvicorn
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
+from redis.asyncio import Redis as AsyncRedis
+from redis.exceptions import RedisError
+from starlette.concurrency import run_in_threadpool
 
 # ---------------------------------------------------------------------------
 # Local
@@ -45,13 +48,16 @@ from src.key_points import HighlightResult, KeyPointValidationError, MAX_TEXT_CH
 from src.code_validate import CodeValidationError
 from src.credit_manager import (
     AUTOCOMPLETE_CREDITS_SCALED,
+    CHARS_PER_CREDIT,
     CREDIT_SCALE,
     IMAGE_CREDITS_SCALED,
     CreditManager,
     design_credits_scaled,
+    run_credit_io,
     text_credits_scaled,
 )
 from src.redis_manager import get_redis_manager
+from src.provider_work import AUTOCOMPLETE_TIMEOUT_SECONDS, iterate_provider, run_provider_work
 from src.image_gen import sanitize_image_params
 from src.text_processing_agent import (
     FREE_FORM_AGENT,
@@ -125,59 +131,80 @@ VALID_AGENT_TYPES: frozenset[str] = frozenset({
 _SORTED_AGENT_TYPES = ', '.join(sorted(VALID_AGENT_TYPES))
 
 # ---------------------------------------------------------------------------
-# Cancellation registry (Lock-Free per-request threading.Event)
-# Active entries have no expiry; pre-cancelled entries expire after the TTL.
-# Eliminates global mutex contention in the hot streaming loop.
+# Cancellation registry. Provider workers only read their own event.
 # ---------------------------------------------------------------------------
-_active_cancellations: dict[str, tuple[threading.Event, Optional[float]]] = {}
+_active_cancellations: dict[tuple[str, str], threading.Event] = {}
 _cancel_registry_lock = threading.Lock()
-CANCEL_ENTRY_TTL = 300  # seconds before a stale entry is purged
+ABORT_CHANNEL = 'eddyter:agent:abort:v1'
 
 
-def register_cancellation_event(request_id: str) -> threading.Event:
-    """Register and return a new threading.Event for this request."""
+def register_cancellation_event(request_id: str, user_id: str) -> threading.Event:
+    event = threading.Event()
     with _cancel_registry_lock:
-        if request_id in _active_cancellations:
-            existing_event, _ = _active_cancellations[request_id]
-            _active_cancellations[request_id] = (existing_event, None)
-            return existing_event
-        event = threading.Event()
-        _active_cancellations[request_id] = (event, None)
-        return event
+        _active_cancellations[user_id, request_id] = event
+    return event
 
 
-def cancel_request_by_id(request_id: str) -> bool:
-    """Mark a request as cancelled by setting its event."""
+def cancel_request_by_id(request_id: str, user_id: str) -> bool:
     with _cancel_registry_lock:
-        if request_id in _active_cancellations:
-            event, _ = _active_cancellations[request_id]
-            event.set()
-        else:
-            # Pre-set event in case cancel arrives before registration
-            event = threading.Event()
-            event.set()
-            _active_cancellations[request_id] = (event, time.time())
+        event = _active_cancellations.get((user_id, request_id))
+    if event is None:
+        return False
+    event.set()
     return True
 
 
-def unregister_cancellation_event(request_id: str) -> None:
-    """Clean up request event when stream completes."""
+def unregister_cancellation_event(request_id: str, user_id: str) -> None:
     with _cancel_registry_lock:
-        _active_cancellations.pop(request_id, None)
+        _active_cancellations.pop((user_id, request_id), None)
 
 
-def cleanup_stale_cancellations() -> None:
-    """Purge stale cancellation records older than CANCEL_ENTRY_TTL."""
-    now = time.time()
-    with _cancel_registry_lock:
-        stale = [
-            key for key, (_, created_at) in _active_cancellations.items()
-            if created_at is not None and now - created_at > CANCEL_ENTRY_TTL
-        ]
-        for k in stale:
-            _active_cancellations.pop(k, None)
-    if stale:
-        logger.info(f"Cleaned up {len(stale)} stale cancellation entries")
+async def listen_for_stream_aborts(redis_url: str, ready: asyncio.Event) -> None:
+    tls = {'ssl_ca_certs': certifi.where()} if redis_url.startswith('rediss://') else {}
+    # shortcut: Pub/Sub delivers live aborts only, use a replayable stream if aborts must survive a Redis outage.
+    async with AsyncRedis.from_url(redis_url, decode_responses=True, socket_timeout=None,
+                                   socket_connect_timeout=5, socket_keepalive=True, **tls) as client:
+        delay = 2
+        while True:
+            try:
+                async with client.pubsub() as subscription:
+                    await subscription.subscribe(ABORT_CHANNEL)
+                    async for message in subscription.listen():
+                        if message['type'] == 'subscribe':
+                            if delay > 2:
+                                logger.info('Redis abort listener recovered')
+                            ready.set()
+                            delay = 2
+                        elif message['type'] == 'message':
+                            try:
+                                payload = json.loads(message['data'])
+                            except (ValueError, TypeError):
+                                continue
+                            if isinstance(payload, list) and len(payload) == 2 and all(isinstance(value, str) for value in payload):
+                                cancel_request_by_id(*payload)
+            except (RedisError, OSError) as error:
+                if delay == 2:
+                    logger.warning('Redis abort listener disconnected: %s', error)
+            await asyncio.sleep(delay)
+            delay = min(60, delay * 2)
+
+
+class AgentStreamingResponse(StreamingResponse):
+    async def stream_response(self, send) -> None:
+        # Register the stream before either its header or its first SSE frame exposes the request ID.
+        iterator = self.body_iterator
+        first = await anext(iterator)
+
+        async def with_start():
+            yield first
+            async for chunk in iterator:
+                yield chunk
+
+        self.body_iterator = with_start()
+        try:
+            await super().stream_response(send)
+        finally:
+            await iterator.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +226,7 @@ async def lifespan(app: FastAPI):
 
     # ---- startup ----
     try:
-        redis_manager = get_redis_manager()
+        redis_manager = await run_in_threadpool(get_redis_manager)
         logger.info("✅ Redis manager initialised successfully")
     except Exception as e:
         logger.error(f"❌ Failed to initialise Redis manager: {e}")
@@ -240,13 +267,25 @@ async def lifespan(app: FastAPI):
         from src.voice_flow.router import warm_up as warm_up_voice
         await warm_up_voice()
 
-    yield
+    listener = None
+    try:
+        if redis_manager is not None and (redis_url := getattr(redis_manager, 'redis_url', None)):
+            ready = asyncio.Event()
+            listener = asyncio.create_task(listen_for_stream_aborts(redis_url, ready))
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(ready.wait(), timeout=3)
+        yield
+    finally:
+        if listener is not None:
+            listener.cancel()
+            with suppress(asyncio.CancelledError):
+                await listener
 
     # ---- shutdown ----
-    stop_billing_delivery()
+    await run_in_threadpool(stop_billing_delivery)
     if redis_manager is not None:
         try:
-            redis_manager.close()
+            await run_in_threadpool(redis_manager.close)
             logger.info("Redis connection closed on shutdown")
         except Exception:
             pass
@@ -490,6 +529,7 @@ class ProcessRequest(BaseModel):
     image_params: Optional[Dict[str, Any]] = None
     blog_options: Optional[BlogOptions] = None      # generate_blog only
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
+    schema_version: Optional[Literal["1.0", "1.1"]] = None
     suggest_graphs: bool = True       # Enhance only; also requires CHART_SUGGESTIONS_ENABLED
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
     document_context: Optional[DocumentContext] = None
@@ -562,6 +602,7 @@ class StreamRequest(BaseModel):
     image_params: Optional[Dict[str, Any]] = None
     blog_options: Optional[BlogOptions] = None      # generate_blog only
     existing_design_ast: Optional[Union[Dict[str, Any], str]] = None
+    schema_version: Optional[Literal["1.0", "1.1"]] = None
     suggest_graphs: bool = True
     document_text: Optional[str] = Field(default=None, min_length=1, max_length=100_000)
     document_context: Optional[DocumentContext] = None
@@ -622,7 +663,7 @@ class AutocompleteRequest(BaseModel):
 
 
 class AbortRequest(BaseModel):
-    request_id: str = Field(..., min_length=1)
+    request_id: str = Field(..., min_length=1, max_length=64)
     api_key: str = Field(..., min_length=1)
 
 
@@ -983,7 +1024,7 @@ async def async_validate_and_get_api_key(
         if background_tasks:
             background_tasks.add_task(redis_manager.update_heartbeat, license_key)
         else:
-            redis_manager.update_heartbeat(license_key)
+            await run_in_threadpool(redis_manager.update_heartbeat, license_key)
     except Exception as e:
         logger.warning(f"[{request_id}] Failed to update heartbeat: {e}")
 
@@ -1074,7 +1115,7 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
         action_resolution = None
         if request_data.document_action == 'auto':
             # The backend's provider key serves the classifier as it would a BYOK key: the document task stays with that provider.
-            decision = auto_action_by_rules(request_data) or await run_in_threadpool(
+            decision = auto_action_by_rules(request_data) or await run_provider_work(
                 classify_auto_action, request_data, provider=request_data.model, api_key=request_data.api_key, is_byok=True,
                 platform_key=None, request_id=request_id)
             action_resolution = decision.event()
@@ -1121,9 +1162,12 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
         meta: dict = {}
         # Same routing, planner, direct image route and model selection as /agent/stream; images are
         # awaited and their URLs written into the text, so there are never dead placeholders.
-        response, pending_images = await run_in_threadpool(
+        stop_event = threading.Event()
+        response, pending_images = await run_provider_work(
             process_user_query_with_images,
             full_query,
+            stop_event=stop_event,
+            cancel_event=stop_event,
             model_provider=model_provider,
             api_key=api_key,
             request_id=request_id,
@@ -1140,6 +1184,7 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
             meta=meta,
             user_text=request_data.query,
             existing_design_ast=request_data.existing_design_ast,
+            schema_version=request_data.schema_version,
             operation_type=agent_type,
             suggest_graphs=request_data.suggest_graphs,
             document_text=document_text,
@@ -1161,7 +1206,8 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
             bill_provider, bill_model = billed_provider_model(model_provider, 'image', image_details)
             duration_ms = int((time.time() - start_time) * 1000)
             if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
-                fire_credit_deduction_and_release(
+                await run_credit_io(
+                    fire_credit_deduction_and_release,
                     user_id=user_id, input_chars=0, output_chars=0, operation_type='image',
                     image_count=len(image_details), reserved_scaled=image_reserved_scaled,
                     credit_manager=credit_manager, settle_delay_seconds=CREDIT_SETTLE_DELAY_SECONDS,
@@ -1169,7 +1215,8 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
                     success=True, images=image_details,
                 )
             elif image_details:
-                fire_credit_deduction(
+                await run_credit_io(
+                    fire_credit_deduction,
                     user_id, 0, 0, 'image', len(image_details),
                     provider=bill_provider, model=bill_model, duration_ms=duration_ms,
                     success=True, images=image_details,
@@ -1251,7 +1298,7 @@ async def stream_text(
     Licence validation and API-key lookup stay off the event loop.
     Enhancement #2: X-Request-ID added to SSE response headers.
     """
-    request_id = str(uuid.uuid4())[:8]
+    request_id = uuid.uuid4().hex
     start_time = time.time()
     start_trace(
         request_id, '/agent/stream', type=request_data.type, chat_model=request_data.model,
@@ -1311,7 +1358,7 @@ async def stream_text(
         text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
         if defer_action:
             # Same key rules as the code classifier: a BYOK request stays on its own key, anything else uses the platform's Claude key.
-            decision = await run_in_threadpool(
+            decision = await run_provider_work(
                 classify_auto_action, request_data, provider=model_provider, api_key=api_key, is_byok=text_byok,
                 platform_key=DEFAULT_API_KEYS.get('anthropic_api_key') if not text_byok else None, request_id=request_id)
             action_resolution = decision.event()
@@ -1360,7 +1407,11 @@ async def stream_text(
             from src.request_plan import plan_design_request
             design_plan = plan_design_request(
                 request_data.query, agent_type, bool(image_urls), bool(request_data.existing_design_ast))
-        design_price_scaled = design_credits_scaled(design_plan.design_sub_mode) if design_plan else 0
+        design_price_scaled = 0
+        if design_plan:
+            from src.design_canvas.images import has_image_slots
+            design_price_scaled = design_credits_scaled(
+                design_plan.design_sub_mode, has_image_slots(request_data.existing_design_ast))
 
         # Upfront credit reservation (skipped for BYOK users)
         upfront_reserved_scaled = 0
@@ -1387,7 +1438,7 @@ async def stream_text(
                     'code': 'REQUEST_CREDIT_LIMIT'})
             if image_urls and not design_plan:
                 upfront_reserved_scaled += IMAGE_CREDITS_SCALED * len(image_urls)
-            ok, available_scaled = credit_manager.reserve(user_id, upfront_reserved_scaled)
+            ok, available_scaled = await run_credit_io(credit_manager.reserve, user_id, upfront_reserved_scaled)
             if not ok:
                 logger.warning(
                     f"[{request_id}] Insufficient credits: "
@@ -1411,14 +1462,13 @@ async def stream_text(
             pending_images: dict = {}
             resolved_image_count = 0
             extra_reserved_scaled = 0
-            credit_limit_hit = False
             stream_warnings: list = []
             design_billing = None   # set when a Mode 8 design is delivered: its flat price replaces the char charge
             analysis_billing = None
             edit_result = None
+            stream_started = False
 
-            # Register lock-free cancellation event for this request (Point 6)
-            cancel_event = register_cancellation_event(request_id)
+            cancel_event = register_cancellation_event(request_id, user_id)
             completion_event = asyncio.Event()
             loop = asyncio.get_running_loop()
 
@@ -1428,6 +1478,12 @@ async def stream_text(
                 except RuntimeError:
                     pass
 
+            def start_stream(iterator):
+                nonlocal stream_started
+                if not cancel_event.is_set():
+                    stream_started = True
+                    yield from iterator
+
             trace_status = 'ok'
             trace_error = None
             out_preview: list[str] = []
@@ -1436,13 +1492,13 @@ async def stream_text(
             try:
                 yield f"data: {json.dumps({'type': 'start', 'request_id': request_id})}\n\n"
 
-                next_reserve_threshold = (upfront_reserved_scaled // CREDIT_SCALE) * 1000
+                next_reserve_threshold = (upfront_reserved_scaled // CREDIT_SCALE) * CHARS_PER_CREDIT
 
                 merged_image_params = resolve_request_image_params(
                     request_data, agent_type, model_provider, license_meta, is_byok
                 )
 
-                async for chunk in iterate_in_threadpool(process_user_query_stream(
+                provider_stream = process_user_query_stream(
                     full_query,
                     model_provider=model_provider,
                     api_key=api_key,
@@ -1467,6 +1523,7 @@ async def stream_text(
                     blog_options=request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None,
                     user_text=request_data.query,
                     existing_design_ast=request_data.existing_design_ast,
+                    schema_version=request_data.schema_version,
                     operation_type=agent_type,
                     cancel_event=cancel_event,
                     suggest_graphs=request_data.suggest_graphs,
@@ -1478,7 +1535,8 @@ async def stream_text(
                     action_resolution=action_resolution,
                     chart_request=chart_request,
                     needs_document=needs_document,
-                )):
+                )
+                async for chunk in iterate_provider(start_stream(provider_stream), cancel_event):
                     # Lock-free cancellation check on every streamed token (Point 6)
                     if cancel_event.is_set():
                         if prepared_context is not None or document_text is not None:
@@ -1503,7 +1561,8 @@ async def stream_text(
                                 analysis_billing = ev['data']['billing']
                             if ev['event'] == 'document_edit_ready':
                                 edit_result = ev['data']
-                            if ev['event'] == 'design_ready' and design_plan is not None:
+                            # A photo fill with no layout call (price 0) is billed as its images, like any image request.
+                            if ev['event'] == 'design_ready' and design_plan is not None and design_price_scaled:
                                 design_billing = {'sub_mode': design_plan.design_sub_mode,
                                                   'credits_scaled': design_price_scaled}
                             yield f"event: {ev['event']}\ndata: {json.dumps(ev['data'])}\n\n"
@@ -1519,26 +1578,21 @@ async def stream_text(
 
                     next_output_chars = len(chunk) if replacing else output_chars + len(chunk)
 
-                    # Per-1000-char incremental reservation (non-BYOK only)
+                    # Reserve the full cost of the next chunk before sending it.
                     # An Edit streams the whole document snapshot back; it is billed on its patches, not on these characters.
                     if not context_no_model and analysis_billing is None and document_text is None and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
-                        while (input_chars + next_output_chars) > next_reserve_threshold:
-                            if (
-                                upfront_reserved_scaled + extra_reserved_scaled
-                                >= MAX_RESERVATION_PER_REQUEST_SCALED
-                            ):
-                                credit_limit_hit = True
+                        shortfall = input_chars + next_output_chars - next_reserve_threshold
+                        if shortfall > 0:
+                            topup = text_credits_scaled(shortfall, 0)
+                            total_reserved = upfront_reserved_scaled + extra_reserved_scaled + topup
+                            can_reserve = total_reserved <= MAX_RESERVATION_PER_REQUEST_SCALED
+                            if can_reserve:
+                                can_reserve, _ = await run_credit_io(credit_manager.reserve, user_id, topup)
+                            if not can_reserve:
+                                yield f"data: {json.dumps({'type': 'credit_limit_reached', 'output_chars': output_chars})}\n\n"
                                 break
-                            ok, _ = credit_manager.reserve(user_id, CREDIT_SCALE)
-                            if not ok:
-                                credit_limit_hit = True
-                                break
-                            extra_reserved_scaled += CREDIT_SCALE
-                            next_reserve_threshold += 1000
-
-                        if credit_limit_hit:
-                            yield f"data: {json.dumps({'type': 'credit_limit_reached', 'output_chars': output_chars})}\n\n"
-                            break
+                            extra_reserved_scaled += topup
+                            next_reserve_threshold += (topup // CREDIT_SCALE) * CHARS_PER_CREDIT
 
                     if output_chars == 0 and chunk:
                         trace_mark(request_id, 'first_token')
@@ -1648,18 +1702,16 @@ async def stream_text(
 
             except GeneratorExit:
                 trace_status = 'aborted'
-                unregister_cancellation_event(request_id)
                 logger.info(
                     f"[{request_id}] Generator closed by client disconnect "
                     f"(output_chars={output_chars})"
                 )
 
             finally:
-                if prepared_context is not None and prepared_context.analysis is not None:
-                    cancel_event.set()
-                unregister_cancellation_event(request_id)
+                cancel_event.set()
+                unregister_cancellation_event(request_id, user_id)
                 context_trace = get_trace(request_id)
-                context_used_model = (prepared_context is None and document_text is None and needs_document is None) or bool(context_trace and context_trace.attrs.get('document_model_started'))
+                context_used_model = (stream_started and prepared_context is None and document_text is None and needs_document is None) or bool(context_trace and context_trace.attrs.get('document_model_started'))
                 if prepared_context is not None and prepared_context.analysis is not None and analysis_billing is None and not had_error:
                     context_used_model = False
                 if edit_result is not None and edit_result.get('status') != 'proposed':
@@ -1701,7 +1753,8 @@ async def stream_text(
                             + extra_reserved_scaled
                             + image_reserved_scaled
                         )
-                        fire_credit_deduction_and_release(
+                        await run_credit_io(
+                            fire_credit_deduction_and_release,
                             user_id=user_id,
                             input_chars=billed_input_chars,
                             output_chars=billed_output_chars,
@@ -1718,7 +1771,8 @@ async def stream_text(
                             design=design_billing,
                         )
                     else:
-                        fire_credit_deduction(
+                        await run_credit_io(
+                            fire_credit_deduction,
                             user_id, billed_input_chars, billed_output_chars, op_type,
                             resolved_image_count,
                             provider=bill_provider, model=bill_model,
@@ -1736,7 +1790,8 @@ async def stream_text(
                         credit_manager.schedule_release(
                             user_id, total_reserved_scaled, delay_seconds=0,
                         )
-                    fire_credit_deduction(
+                    await run_credit_io(
+                        fire_credit_deduction,
                         user_id, input_chars, output_chars, 'text',
                         resolved_image_count,
                         provider=used_provider, model=used_model,
@@ -1746,7 +1801,7 @@ async def stream_text(
                 if not had_error and original_prompt:
                     fire_prompt_history_save(user_id, original_prompt)
 
-        return StreamingResponse(
+        return AgentStreamingResponse(
             generate(),
             media_type='text/event-stream',
             headers={
@@ -1814,7 +1869,7 @@ async def autocomplete_text(
         is_byok = license_meta['requires_user_api_keys']
 
         if CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is not None:
-            ok, available = credit_manager.reserve(user_id, AUTOCOMPLETE_CREDITS_SCALED)
+            ok, available = await run_credit_io(credit_manager.reserve, user_id, AUTOCOMPLETE_CREDITS_SCALED)
             if not ok:
                 logger.warning(
                     f"[{request_id}] Autocomplete blocked: insufficient credits "
@@ -1841,8 +1896,9 @@ async def autocomplete_text(
             f"context_before={len(text_before)} chars"
         )
 
-        suggestion = await run_in_threadpool(
+        suggestion = await run_provider_work(
             get_autocomplete_suggestion,
+            deadline=time.monotonic() + AUTOCOMPLETE_TIMEOUT_SECONDS,
             text_before=text_before,
             text_after=text_after,
             model_provider=model_provider,
@@ -1861,7 +1917,8 @@ async def autocomplete_text(
         if not is_byok:
             if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
                 if suggestion:
-                    fire_credit_deduction_and_release(
+                    await run_credit_io(
+                        fire_credit_deduction_and_release,
                         user_id=user_id,
                         input_chars=0,
                         output_chars=0,
@@ -1883,7 +1940,8 @@ async def autocomplete_text(
                     )
                 autocomplete_reserved = False
             elif suggestion:
-                fire_credit_deduction(
+                await run_credit_io(
+                    fire_credit_deduction,
                     user_id, 0, 0, 'autocomplete',
                     provider=model_provider, model=None,
                     duration_ms=duration_ms, success=True,
@@ -1898,9 +1956,13 @@ async def autocomplete_text(
         )
 
     except HTTPException as exc:
+        if autocomplete_reserved and credit_manager is not None and user_id:
+            credit_manager.schedule_release(user_id, AUTOCOMPLETE_CREDITS_SCALED, delay_seconds=0)
         finish_trace(request_id, 'rejected', http_status=exc.status_code)
         raise
     except asyncio.CancelledError:
+        if autocomplete_reserved and credit_manager is not None and user_id:
+            credit_manager.schedule_release(user_id, AUTOCOMPLETE_CREDITS_SCALED, delay_seconds=0)
         finish_trace(request_id, 'aborted')
         raise
     except Exception as e:
@@ -1919,7 +1981,8 @@ async def autocomplete_text(
         # Log failed telemetry
         try:
             if user_id and model_provider and not is_byok:
-                fire_credit_deduction(
+                await run_credit_io(
+                    fire_credit_deduction,
                     user_id, 0, 0, 'autocomplete',
                     provider=model_provider, model=None,
                     duration_ms=int(total_duration * 1000),
@@ -1977,9 +2040,19 @@ async def abort_request(request_data: AbortRequest) -> JSONResponse:
             raise HTTPException(status_code=503, detail=license_result['error'])
         raise HTTPException(status_code=401, detail='Unauthorized')
 
-    cleanup_stale_cancellations()
-    cancel_request_by_id(req_id)
-    logger.info(f"[{req_id}] Request cancelled by client")
+    user_id = license_result.get('user_id')
+    if not user_id:
+        raise HTTPException(status_code=401, detail='Unauthorized')
+    if not cancel_request_by_id(req_id, user_id):
+        try:
+            listeners = await run_in_threadpool(redis_manager.redis_client.publish, ABORT_CHANNEL,
+                                                json.dumps([req_id, user_id]))
+        except RedisError as error:
+            logger.warning('[%s] Redis abort publish failed: %s', req_id, error)
+            raise HTTPException(status_code=503, detail='Cancellation service unavailable') from error
+        if not listeners:
+            raise HTTPException(status_code=503, detail='Cancellation service unavailable')
+    logger.info('[%s] Client cancellation accepted', req_id)
     return JSONResponse(
         status_code=200,
         content={'success': True},
@@ -2103,7 +2176,7 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
     reserved_scaled = 0
     if billed and CREDIT_PRECHECK_ENABLED and credit_manager is not None:
         reserved_scaled = text_credits_scaled(input_chars, EMAIL_OUTPUT_CHARS_PER_VARIANT * request_data.variants)
-        ok, available_scaled = credit_manager.reserve(user_id, reserved_scaled)
+        ok, available_scaled = await run_credit_io(credit_manager.reserve, user_id, reserved_scaled)
         if not ok:
             finish_trace(request_id, 'rejected', error='insufficient credits', http_status=402)
             return JSONResponse(status_code=402, headers=headers, content={
@@ -2123,9 +2196,15 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
         sign_off=request_data.sign_off, social_links=request_data.social_links,
         theme=request_data.theme.model_dump(exclude_none=True) if request_data.theme else None,
     )
-    llm = make_routed_llm(caller['candidates'], caller['key_for'], request_id=request_id, is_byok=caller['text_byok'])
+    stop_event = threading.Event()
+    llm = make_routed_llm(caller['candidates'], caller['key_for'], request_id=request_id,
+                          is_byok=caller['text_byok'], cancel_event=stop_event)
     try:
-        result = await run_in_threadpool(generate, req, llm, request_id)
+        result = await run_provider_work(generate, req, llm, request_id, stop_event=stop_event)
+    except (HTTPException, asyncio.CancelledError) as error:
+        release_reservation()
+        finish_trace(request_id, 'aborted' if isinstance(error, asyncio.CancelledError) else 'rejected')
+        raise
     except ValueError as e:
         release_reservation()   # a failed generation is not charged, as on /agent/stream
         finish_trace(request_id, 'rejected', error=str(e), http_status=400)
@@ -2160,14 +2239,15 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
         # templates' readable text out (all variants). BYOK and backend-secret calls are not billed here.
         duration_ms = int((time.time() - start_time) * 1000)
         if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
-            fire_credit_deduction_and_release(
+            await run_credit_io(
+                fire_credit_deduction_and_release,
                 user_id=user_id, input_chars=input_chars, output_chars=output_chars, operation_type='text',
                 image_count=0, reserved_scaled=reserved_scaled, credit_manager=credit_manager,
                 settle_delay_seconds=CREDIT_SETTLE_DELAY_SECONDS, provider=provider, model=model_id,
                 duration_ms=duration_ms, success=True)
         else:
-            fire_credit_deduction(user_id, input_chars, output_chars, 'text', 0, provider=provider, model=model_id,
-                                  duration_ms=duration_ms, success=True)
+            await run_credit_io(fire_credit_deduction, user_id, input_chars, output_chars, 'text', 0,
+                                provider=provider, model=model_id, duration_ms=duration_ms, success=True)
 
     log_response_body(request_id, '/agent/email/generate', result)
     finish_trace(request_id, 'ok', http_status=200)

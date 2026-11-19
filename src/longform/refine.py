@@ -128,7 +128,7 @@ def _warning(result: ChunkResult, total: int) -> dict:
 
 
 def refine_stream(text: str, instruction: Optional[str], operation: Operation, llm: LLM, config: Optional[RefineConfig] = None,
-                  *, request_id: Optional[str] = None) -> Iterator[Union[str, dict]]:
+                  *, request_id: Optional[str] = None, cancel_event=None) -> Iterator[Union[str, dict]]:
     """Refine `text` (a document that qualifies) and stream it back in verified chunks, in document order."""
     config = config or RefineConfig()
     started = time.perf_counter()
@@ -140,7 +140,7 @@ def refine_stream(text: str, instruction: Optional[str], operation: Operation, l
 
     tasks = [partial(refine_chunk, llm, operation, instruction, c, config, request_id) for c in chunks]
     results: List[ChunkResult] = []
-    for item in run_ordered(tasks, config.parallel, progress=True, thread_name_prefix="longform"):
+    for item in run_ordered(tasks, config.parallel, progress=True, thread_name_prefix="longform", cancel_event=cancel_event):
         if isinstance(item, dict):                                       # the progress sentinel
             yield {"__event__": {"type": "refine_progress", **item["__progress__"]}}
             continue

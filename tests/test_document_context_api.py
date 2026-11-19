@@ -214,7 +214,7 @@ def test_precancelled_request_releases_reservation_without_model_or_charge(runti
     state = paid(runtime, monkeypatch)
     event = threading.Event()
     event.set()
-    monkeypatch.setattr(api, 'register_cancellation_event', lambda rid: event)
+    monkeypatch.setattr(api, 'register_cancellation_event', lambda rid, user_id: event)
     response = client.post('/agent/stream', json=body())
     assert response.status_code == 200
     assert not state['calls'] and not state['charges']
@@ -270,7 +270,7 @@ def test_abort_after_content_bills_only_emitted_output_and_cannot_restart(runtim
     client, _ = runtime
     state = paid(runtime, monkeypatch)
     cancel = threading.Event()
-    monkeypatch.setattr(api, 'register_cancellation_event', lambda rid: cancel)
+    monkeypatch.setattr(api, 'register_cancellation_event', lambda rid, user_id: cancel)
     def run(agent, prompt, **kwargs):
         state['calls'].append(prompt)
         yield SimpleNamespace(event=RunEvent.run_content, content='First.', metrics=None)

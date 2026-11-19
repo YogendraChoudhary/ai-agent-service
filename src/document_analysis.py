@@ -18,6 +18,7 @@ from .document_retrieval import SourceChunk, chunk_source
 from .email_template.validate import parse_json
 from .longform.llm import AgnoLLM, CallSpec, call_with_timeout
 from .longform.ordered_stream import run_ordered
+from .provider_work import ProviderCancelled
 from .observability import trace_set
 
 MAX_CHUNKS = 32
@@ -237,9 +238,13 @@ class AnalysisBudget:
                 raise ValueError('Document analysis call or input allowance exceeded')
             self.stage_calls += 1
             self.inputs += len(payload)
-        reply = call_with_timeout(lambda: llm(system, [{'role': 'user', 'content': payload}],
-            CallSpec(stage, 0.0, 2048 if stage != 'document_analysis_reduce' else 4096, unit=unit)),
-            max(0.001, self.deadline - time.monotonic()), 'Document analysis')
+        messages = [{'role': 'user', 'content': payload}]
+        spec = CallSpec(stage, 0.0, 2048 if stage != 'document_analysis_reduce' else 4096, unit=unit)
+        if isinstance(llm, AgnoLLM):
+            reply = llm(system, messages, spec)
+        else:
+            reply = call_with_timeout(lambda: llm(system, messages, spec),
+                                      max(0.001, self.deadline - time.monotonic()), 'Document analysis')
         self.check()
         with self.lock:
             self.outputs += len(reply)
@@ -268,7 +273,8 @@ def analyze_document(prepared, llm, *, cancel_event=None, budget=None):
             raise
 
     try:
-        for chunk, result in run_ordered([lambda c=c: extract(c) for c in plan.chunks], parallel=2, thread_name_prefix='document-analysis'):
+        for chunk, result in run_ordered([lambda c=c: extract(c) for c in plan.chunks], parallel=2,
+                                         thread_name_prefix='document-analysis', cancel_event=cancel_event):
             budget.check()
             completed.append(chunk)
             for claim in result.claims:
@@ -321,6 +327,8 @@ def analyze_document(prepared, llm, *, cancel_event=None, budget=None):
         else:
             yield ('No verified contradictions were identified. This does not establish that none exist.' if plan.mode == 'contradictions'
                    else 'All source chunks were read, but no supported summary findings could be established.')
+    except ProviderCancelled as error:
+        raise EditCancelled() from error
     finally:
         budget.stop.set()
 
@@ -337,13 +345,14 @@ def stream_document_analysis(prepared, *, candidates, key_for, is_byok, user_id=
 
     timeout = float(settings.longform_call_timeout_seconds)
     llm = RequestLLM(candidates, key_for, is_byok=is_byok, user_id=user_id, request_id=request_id,
-        agent_type='document_analyst', timeout=min(timeout, 30) if timeout else 30)
+        agent_type='document_analyst', timeout=min(timeout, 30) if timeout else 30,
+        cancel_event=cancel_event, deadline=budget.deadline)
     try:
         for chunk in analyze_document(prepared, llm, cancel_event=cancel_event, budget=budget):
             if report_model and isinstance(chunk, dict) and chunk.get('__event__', {}).get('event') == 'document_analysis_ready':
                 yield {'__model_used__': llm.used or llm.drafting_model()}
             yield chunk
-    except EditCancelled:
+    except (EditCancelled, ProviderCancelled):
         return
     finally:
         budget.stop.set()

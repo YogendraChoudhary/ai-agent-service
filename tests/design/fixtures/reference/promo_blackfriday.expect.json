@@ -1,0 +1,297 @@
+{
+  "source": "Clean reference supplied with the fidelity report",
+  "accents": [
+    "#BD9CF4",
+    "#BED5D4"
+  ],
+  "spec": {
+    "canvas_background_hex": "#1B1923",
+    "regions": [
+      {
+        "id": "hero",
+        "parent_id": null,
+        "arrangement": "stack",
+        "text_ids": [
+          "t1",
+          "t2",
+          "t3",
+          "t4",
+          "t5",
+          "t6"
+        ]
+      },
+      {
+        "id": "offer",
+        "parent_id": null,
+        "arrangement": "side_by_side",
+        "text_ids": [],
+        "ratio": [
+          56,
+          44
+        ],
+        "separator": "vertical_rule",
+        "background_hex": "#282333",
+        "has_border": true,
+        "corner_radius_px": 22
+      },
+      {
+        "id": "offer_copy",
+        "parent_id": "offer",
+        "arrangement": "stack",
+        "text_ids": [
+          "t7",
+          "t8",
+          "t9",
+          "t10",
+          "t11",
+          "t12"
+        ]
+      },
+      {
+        "id": "offer_discount",
+        "parent_id": "offer",
+        "arrangement": "stack",
+        "text_ids": [
+          "t13",
+          "t14",
+          "t15",
+          "t16",
+          "t17",
+          "t18"
+        ]
+      },
+      {
+        "id": "terms",
+        "parent_id": null,
+        "arrangement": "stack",
+        "text_ids": [
+          "t19"
+        ]
+      }
+    ],
+    "texts": [
+      {
+        "id": "t1",
+        "text": "Your next big idea.",
+        "approx_size_px": 100,
+        "color_hex": "#F4F1EB",
+        "role": "display",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "tight"
+      },
+      {
+        "id": "t2",
+        "text": "Half the price to start.",
+        "approx_size_px": 100,
+        "color_hex": "#BD9CF4",
+        "role": "display",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "tight",
+        "gradient_hex": [
+          "#DBCCE9",
+          "#BCA7D9",
+          "#BED5D4"
+        ]
+      },
+      {
+        "id": "t3",
+        "text": "Celebrate Thanksgiving & Black Friday with 50% off any paid monthly plan for your first 3 months.",
+        "approx_size_px": 17,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t4",
+        "text": "14-day free trial",
+        "approx_size_px": 13,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t5",
+        "text": "No credit card required",
+        "approx_size_px": 13,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t6",
+        "text": "Compare every detail",
+        "approx_size_px": 13,
+        "color_hex": "#B4ADBD",
+        "role": "label",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal",
+        "rule_before": true
+      },
+      {
+        "id": "t7",
+        "text": "THANKSGIVING & BLACK FRIDAY",
+        "approx_size_px": 12,
+        "color_hex": "#BD9CF4",
+        "role": "eyebrow",
+        "font_class": "mono",
+        "weight": "normal",
+        "uppercase": true,
+        "letter_spacing": "wide"
+      },
+      {
+        "id": "t8",
+        "text": "More room to build.",
+        "approx_size_px": 46,
+        "color_hex": "#F4F1EB",
+        "role": "heading",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "tight"
+      },
+      {
+        "id": "t9",
+        "text": "A little less to spend.",
+        "approx_size_px": 46,
+        "color_hex": "#F4F1EB",
+        "role": "heading",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "tight"
+      },
+      {
+        "id": "t10",
+        "text": "Pick your plan. Enjoy three months at half price.",
+        "approx_size_px": 15,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t11",
+        "text": "Your next chapter starts here.",
+        "approx_size_px": 15,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t12",
+        "text": "Find my plan",
+        "approx_size_px": 14,
+        "color_hex": "#1B1923",
+        "role": "button",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t13",
+        "text": "50%",
+        "approx_size_px": 195,
+        "color_hex": "#D1B6F1",
+        "role": "numeral",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "tight",
+        "raised_suffix": "%"
+      },
+      {
+        "id": "t14",
+        "text": "OFF FOR 3 MONTHS",
+        "approx_size_px": 14,
+        "color_hex": "#E5D4F2",
+        "role": "label",
+        "font_class": "mono",
+        "weight": "normal",
+        "uppercase": true,
+        "letter_spacing": "wide"
+      },
+      {
+        "id": "t15",
+        "text": "All paid monthly plans",
+        "approx_size_px": 14,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t16",
+        "text": "Use code",
+        "approx_size_px": 14,
+        "color_hex": "#B4ADBD",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t17",
+        "text": "BLACKFRIDAY",
+        "approx_size_px": 14,
+        "color_hex": "#E5D4F2",
+        "role": "label",
+        "font_class": "mono",
+        "weight": "normal",
+        "uppercase": true,
+        "letter_spacing": "wide"
+      },
+      {
+        "id": "t18",
+        "text": "Offer ends November 30, 2026",
+        "approx_size_px": 14,
+        "color_hex": "#B4ADBD",
+        "role": "caption",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t19",
+        "text": "First 3 paid months, then standard monthly pricing. Annual subscriptions, AI credit packs and storage add-ons retain their listed prices.",
+        "approx_size_px": 13,
+        "color_hex": "#B4ADBD",
+        "role": "caption",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      }
+    ],
+    "font_guess": {
+      "display": "Inter Tight",
+      "body": "Inter",
+      "mono": "IBM Plex Mono"
+    }
+  },
+  "notes": "t4 is a hyphen: the reference draws '14-day' and 'add-ons' with the same dash glyph (10 px wide, 0.625 of the glyph height at 2512 px), and 'add-ons' is always hyphenated. Measured 2026-11-19."
+}

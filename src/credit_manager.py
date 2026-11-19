@@ -15,9 +15,19 @@ import threading
 import time
 from typing import Tuple
 
+from anyio import CancelScope
+from starlette.concurrency import run_in_threadpool
+
 from .billing_delivery import pending_credits_key
 
 logger = logging.getLogger(__name__)
+
+
+async def run_credit_io(func, *args, **kwargs):
+    # A disconnected stream must still be able to acquire a thread and persist its billing handoff.
+    with CancelScope(shield=True):
+        return await run_in_threadpool(func, *args, **kwargs)
+
 
 # Scale factor used internally so sub-1 credit costs (autocomplete = 0.2)
 # can be expressed as integers — Redis INCRBY/DECRBY operate on integers.
@@ -66,8 +76,14 @@ def image_credits_scaled(provider: str | None, model: str | None) -> int:
     return IMAGE_CREDITS_SCALED
 
 
-def design_credits_scaled(sub_mode: str | None) -> int:
-    """Flat Mode 8 price: an edit of an existing AST, or a new design (from a prompt or a screenshot)."""
+def design_credits_scaled(sub_mode: str | None, has_image_slots: bool = True) -> int:
+    """
+    Flat Mode 8 price: an edit of an existing AST, or a new design (from a prompt or a screenshot). A photo fill
+    makes no design-model call, so it costs only its images (charged per image by the image tool), unless the design
+    has no photo slots yet: then one layout edit converts it first, at the edit price.
+    """
+    if sub_mode == "fill_design_images":
+        return 0 if has_image_slots else DESIGN_CANVAS_EDIT_CREDITS_SCALED
     if sub_mode == "edit_existing_ast":
         return DESIGN_CANVAS_EDIT_CREDITS_SCALED
     return DESIGN_CANVAS_GENERATION_CREDITS_SCALED

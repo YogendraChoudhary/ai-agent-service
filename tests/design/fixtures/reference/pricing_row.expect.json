@@ -1,0 +1,152 @@
+{
+  "source": "Synthetic design fixture",
+  "accents": [
+    "#245DEB"
+  ],
+  "spec": {
+    "canvas_background_hex": "#EEF4FF",
+    "regions": [
+      {
+        "id": "header",
+        "parent_id": null,
+        "arrangement": "stack",
+        "text_ids": [
+          "t0",
+          "t1"
+        ]
+      },
+      {
+        "id": "pricing",
+        "parent_id": null,
+        "arrangement": "side_by_side",
+        "text_ids": [],
+        "ratio": [
+          1,
+          1,
+          1
+        ],
+        "separator": "gap"
+      },
+      {
+        "id": "starter",
+        "parent_id": "pricing",
+        "arrangement": "stack",
+        "text_ids": [
+          "t2",
+          "t3"
+        ]
+      },
+      {
+        "id": "team",
+        "parent_id": "pricing",
+        "arrangement": "stack",
+        "text_ids": [
+          "t4",
+          "t5"
+        ]
+      },
+      {
+        "id": "studio",
+        "parent_id": "pricing",
+        "arrangement": "stack",
+        "text_ids": [
+          "t6",
+          "t7"
+        ]
+      }
+    ],
+    "texts": [
+      {
+        "id": "t0",
+        "text": "Plans for every studio",
+        "approx_size_px": 46,
+        "color_hex": "#142F4A",
+        "role": "display",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t1",
+        "text": "Find the right space for your team.",
+        "approx_size_px": 24,
+        "color_hex": "#142F4A",
+        "role": "body",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t2",
+        "text": "Starter",
+        "approx_size_px": 28,
+        "color_hex": "#142F4A",
+        "role": "heading",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t4",
+        "text": "Team",
+        "approx_size_px": 28,
+        "color_hex": "#142F4A",
+        "role": "heading",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t6",
+        "text": "Studio",
+        "approx_size_px": 28,
+        "color_hex": "#142F4A",
+        "role": "heading",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t3",
+        "text": "$12",
+        "approx_size_px": 42,
+        "color_hex": "#245DEB",
+        "role": "numeral",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t5",
+        "text": "$25",
+        "approx_size_px": 42,
+        "color_hex": "#245DEB",
+        "role": "numeral",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      },
+      {
+        "id": "t7",
+        "text": "$60",
+        "approx_size_px": 42,
+        "color_hex": "#245DEB",
+        "role": "numeral",
+        "font_class": "grotesk_sans",
+        "weight": "normal",
+        "uppercase": false,
+        "letter_spacing": "normal"
+      }
+    ],
+    "font_guess": {
+      "body": "Inter"
+    }
+  }
+}

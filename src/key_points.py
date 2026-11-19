@@ -180,7 +180,8 @@ def stream_key_points(source, *, candidates, key_for, is_byok, request_id=None, 
     if cancel_event is not None and cancel_event.is_set():
         return
     llm = AgnoLLM(candidates, key_for, is_byok=is_byok, request_id=request_id, user_id=user_id,
-                  agent_type="key_point_highlighter", timeout=float(settings.longform_call_timeout_seconds) or None)
+                  agent_type="key_point_highlighter", timeout=float(settings.longform_call_timeout_seconds) or None,
+                  cancel_event=cancel_event)
     result = highlight_key_points(source, llm, cancel_event=cancel_event)
     if result is None or (cancel_event is not None and cancel_event.is_set()):
         return

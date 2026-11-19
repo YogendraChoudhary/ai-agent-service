@@ -18,8 +18,12 @@ With progress=True a {"__progress__": {"chunk": i, "of": n}} sentinel follows ea
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextvars import copy_context
+from threading import Event
 from typing import Any, Callable, Iterator, Sequence
+
+from src.provider_work import check_cancelled, provider_batch_stop
 
 
 def run_ordered(
@@ -28,24 +32,48 @@ def run_ordered(
     *,
     progress: bool = False,
     thread_name_prefix: str = "ordered",
+    cancel_event=None,
 ) -> Iterator[Any]:
     n = len(tasks)
     if n == 0:
         return
-    pool = ThreadPoolExecutor(max_workers=max(1, min(int(parallel), n)), thread_name_prefix=thread_name_prefix)
+    limit = max(1, min(int(parallel), n))
+    pool = ThreadPoolExecutor(max_workers=limit, thread_name_prefix=thread_name_prefix)
+    failed = Event()
+    closed = Event()
 
-    def cancel_rest(future) -> None:
-        if not future.cancelled() and future.exception() is not None:
-            for f in futures:
-                f.cancel()                      # only futures that have not started can be cancelled
+    def run(task):
+        check_cancelled(cancel_event)
+        if failed.is_set():
+            raise CancelledError()
+        token = provider_batch_stop.set(closed)
+        try:
+            return task()
+        except BaseException:
+            failed.set()
+            raise
+        finally:
+            provider_batch_stop.reset(token)
 
-    futures = [pool.submit(task) for task in tasks]
-    for f in futures:
-        f.add_done_callback(cancel_rest)
+    def submit(index):
+        return pool.submit(copy_context().run, run, tasks[index])
+
+    futures = {}
     try:
-        for i, future in enumerate(futures):
-            yield future.result()               # raises the unit's own exception
+        for index in range(limit):
+            check_cancelled(cancel_event)
+            futures[index] = submit(index)
+        for i in range(n):
+            check_cancelled(cancel_event)
+            result = futures.pop(i).result()
+            check_cancelled(cancel_event)
+            yield result
             if progress:
                 yield {"__progress__": {"chunk": i + 1, "of": n}}
+            if i + limit < n and not failed.is_set():
+                check_cancelled(cancel_event)
+                futures[i + limit] = submit(i + limit)
     finally:
+        closed.set()
+        failed.set()
         pool.shutdown(wait=False, cancel_futures=True)

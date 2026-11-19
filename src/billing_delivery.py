@@ -18,6 +18,7 @@ JOBS = 'agent:billing:jobs'
 DUE = 'agent:billing:due'
 LEASES = 'agent:billing:leases'
 LEASE_SECONDS = 30
+RETRY_WINDOW_SECONDS = 6 * 24 * 60 * 60  # Stay within the receiver's seven-day deduplication guarantee.
 MAX_POLL_SECONDS = 60
 INITIAL_REDIS_BACKOFF_SECONDS = 2
 
@@ -68,8 +69,16 @@ return {id, job}
 _UPDATE = """
 if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
-redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
+if ARGV[4] == '' then redis.call('ZREM', KEYS[2], ARGV[1])
+else redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1]) end
 if ARGV[5] == '1' then redis.call('HDEL', KEYS[3], ARGV[1]) end
+return 1
+"""
+
+_REQUEUE = """
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
 return 1
 """
 
@@ -101,6 +110,7 @@ class BillingDelivery:
         self._enqueue = redis_client.register_script(_ENQUEUE)
         self._claim = redis_client.register_script(_CLAIM)
         self._update = redis_client.register_script(_UPDATE)
+        self._requeue = redis_client.register_script(_REQUEUE)
         self._complete = redis_client.register_script(_COMPLETE)
         self._stop, self._wake = threading.Event(), threading.Event()
         self._thread = None
@@ -124,7 +134,36 @@ class BillingDelivery:
 
     def _save(self, event_id, token, job, due, *, release=True):
         return bool(self._update(keys=[JOBS, DUE, LEASES],
-            args=[event_id, token, _json(job), due, int(release)]))
+            args=[event_id, token, _json(job), '' if due is None else due, int(release)]))
+
+    def _can_retry(self, job, now):
+        return self.allow_retries and now < job.get('retry_until', 0)
+
+    def requeue(self, event_id: str, *, confirm_charged: bool = False) -> bool:
+        """Schedule delivery or settlement of one reconciled event without changing its hold."""
+        raw = self.redis.hget(JOBS, event_id)
+        if raw is None:
+            return False
+        job = json.loads(raw)
+        if job['state'] != 'reconciliation':
+            return False
+        now = time.time()
+        if confirm_charged:
+            if not job['attempts']:
+                raise ValueError('Only an attempted charge can be confirmed')
+            job['state'] = 'acknowledged'
+            due = now + job['settle_delay']
+        else:
+            if job['attempts'] and not self._can_retry(job, now):
+                raise ValueError('This attempted charge has no active receiver deduplication window')
+            if not self.url or not self.secret:
+                raise ValueError('Billing webhook configuration is required for delivery')
+            job['state'] = 'queued'
+            due = now
+        scheduled = bool(self._requeue(keys=[JOBS, DUE], args=[event_id, raw, _json(job), due]))
+        if scheduled:
+            self._wake.set()
+        return scheduled
 
     def process_once(self) -> bool:
         processed, _ = self._process_due_job()
@@ -147,10 +186,13 @@ class BillingDelivery:
                 f'agent:billing:done:{event_id}'], args=[event_id, token])
             return True, None
         # A failed response or timeout may follow a committed charge; retries need receiver-side deduplication.
-        if not self.url or not self.secret or (job['attempts'] and not self.allow_retries):
-            self._save(event_id, token, job, now + 300)
-            logger.error('Billing event %s held pending configuration or reconciliation', event_id)
+        if not self.url or not self.secret or (job['attempts'] and not self._can_retry(job, now)):
+            job['state'] = 'reconciliation'
+            if self._save(event_id, token, job, None):
+                logger.error('Billing event %s held pending configuration or reconciliation', event_id)
             return True, None
+        if not job['attempts'] and self.allow_retries:
+            job['retry_until'] = now + RETRY_WINDOW_SECONDS
         job['attempts'] += 1
         if not self._save(event_id, token, job, now + LEASE_SECONDS, release=False):
             return True, None
@@ -163,11 +205,16 @@ class BillingDelivery:
         except requests.RequestException as error:
             acknowledged = False
             job['last_error'] = type(error).__name__
+        now = time.time()
         if acknowledged:
             job['state'] = 'acknowledged'
-            due = time.time() + job['settle_delay']
+            due = now + job['settle_delay']
         else:
-            due = time.time() + min(300, 2 ** min(job['attempts'], 9)) if self.allow_retries else time.time() + 300
+            due = None
+            if self._can_retry(job, now):
+                due = min(job['retry_until'], now + min(300, 2 ** min(job['attempts'], 9)))
+            else:
+                job['state'] = 'reconciliation'
             logger.error('Billing event %s unacknowledged (%s); credits remain held', event_id, job['last_error'])
         self._save(event_id, token, job, due)
         return True, None
@@ -225,3 +272,34 @@ class BillingDelivery:
         self._wake.set()
         if self._thread:
             self._thread.join(timeout=12)
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Requeue one held billing event in the configured Redis database.')
+    parser.add_argument('event_id')
+    parser.add_argument('--confirm-charged', action='store_true',
+                        help='Settle without sending a webhook after verifying the receiver recorded the charge.')
+    args = parser.parse_args()
+
+    from config import settings
+    from .redis_manager import RedisManager
+
+    manager = RedisManager(settings.redis_url)
+    try:
+        box = BillingDelivery(manager.redis_client, settings.backend_webhook_url, settings.webhook_secret,
+                              allow_retries=settings.billing_webhook_idempotent)
+        try:
+            scheduled = box.requeue(args.event_id, confirm_charged=args.confirm_charged)
+        except ValueError as error:
+            parser.exit(1, f'{error}\n')
+        if not scheduled:
+            parser.exit(1, 'Event is not awaiting reconciliation.\n')
+        print(f'Scheduled billing event {args.event_id} for {"settlement" if args.confirm_charged else "delivery"}.')
+    finally:
+        manager.close()
+
+
+if __name__ == '__main__':
+    main()

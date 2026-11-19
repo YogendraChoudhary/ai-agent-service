@@ -86,8 +86,7 @@ class TestHarnessCleanGeneration:
         assert isinstance(result, DesignDocumentAST)
 
     @pytest.mark.asyncio
-    async def test_prompt_mode_sends_no_image_on_retry(self):
-        """On attempt > 0, image_bytes must be None even if provided initially."""
+    async def test_vision_keeps_reference_image_on_retry(self):
         from src.design_canvas.service import execute_design_canvas_harness
 
         call_images: list[Optional[bytes]] = []
@@ -109,9 +108,7 @@ class TestHarnessCleanGeneration:
             max_repair_attempts=2,
         )
         assert isinstance(result, DesignDocumentAST)
-        # First call got the image; subsequent calls did not
-        assert call_images[0] == fake_bytes
-        assert call_images[1] is None
+        assert call_images == [fake_bytes, fake_bytes]
 
 
 # ===========================================================================
