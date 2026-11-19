@@ -2272,6 +2272,80 @@ def _agent_text(agent, query, images, provider, use_tools, request_id, output_li
                 'The response reached the model output limit and may be incomplete. Request a shorter answer or another passage.'}]}
 
 
+def _enforce_length(spec, reply, agent, model_id, request_id, cancel_event=None, *, task=None, allow_lengthen=True,
+                    guard_query=None, source=None):
+    """
+    Check the streamed text against the asked length. On a miss: one isolated rewrite (no tools, no images), kept only if it
+    lands closer to the window. An 'at most' still over is then trimmed at a sentence boundary, rewrite or not. `task` is the
+    user's request, so a longer version serves it. Draft passes `source` (its document and task, as the first call saw them) so
+    a short or cut-off Draft can be lengthened from the document instead of invented; without a source, `allow_lengthen=False`
+    keeps it from lengthening at all. Texts above LENGTH_REPAIR_MAX_WORDS get a warning instead of a slow full rewrite.
+    `guard_query` runs the rewrite through the same Write output guard as the streamed answer.
+    """
+    from agno.run.base import RunStatus
+    from config import settings
+    from .length_spec import aim_factor, count_words, measure, placeholders, repair_prompt, trim_to
+    from .observability import record_text_usage
+
+    first = delivered = measure(spec, reply)
+    final = reply
+    status = 'ok' if spec.contains(first) else 'outside_window'
+    attempted, skipped = False, None
+    if status != 'ok' and reply.strip():
+        too_short = first < spec.low
+        size = max(count_words(reply), spec.high if spec.unit == 'words' else 0)
+        if not settings.length_repair_enabled:
+            skipped = 'disabled'
+        elif too_short and not (allow_lengthen or source):
+            skipped = 'no_lengthen_without_source'
+        elif size > settings.length_repair_max_words:
+            skipped = 'too_long_to_rewrite'
+        else:
+            try:
+                check_cancelled(cancel_event)
+                check_provider_call()
+                # Reuse the serving model, with an isolated run that has no tools or reference images.
+                repair_agent = Agent(model=agent.model, telemetry=False)
+                attempted = True
+                # The document goes along only to lengthen: shortening needs no new facts, so it is not re-sent (input cost).
+                repaired = repair_agent.run(repair_prompt(spec, reply, first, task, aim=aim_factor(model_id),
+                                                          source=source if too_short else None),
+                                            stream=False, images=None)
+            except ProviderCancelled:
+                return
+            except Exception as error:
+                logger.warning('[%s] Length rewrite failed (%s)', request_id, type(error).__name__)
+            else:
+                record_text_usage(request_id, model_id, getattr(repaired, 'metrics', None), feature='length_repair')
+                if getattr(repaired, 'status', None) != RunStatus.error and getattr(repaired, 'event', None) != RunEvent.run_error:
+                    candidate = getattr(repaired, 'content', None)
+                    if isinstance(candidate, str) and guard_query is not None:
+                        from .output_guard import guard_write
+                        # A request for input or event from the guard means the rewrite is not text to insert.
+                        guarded = list(guard_write(iter([candidate]), guard_query))
+                        candidate = ''.join(guarded) if all(isinstance(c, str) for c in guarded) else None
+                    if isinstance(candidate, str) and candidate.strip() and placeholders(candidate) == placeholders(reply):
+                        count = measure(spec, candidate)
+                        if spec.window_distance(count) < spec.window_distance(first):
+                            final, delivered, status = candidate.strip() + '\n', count, 'repaired'
+
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        # Free and local, so it runs whether or not a rewrite was allowed.
+        if spec.kind == 'at_most' and delivered > spec.high:
+            trimmed = trim_to(spec, final)
+            if trimmed != final:
+                final, delivered, status = trimmed, measure(spec, trimmed), 'trimmed'
+
+    trace_set(request_id, length={'unit': spec.unit, 'asked': spec.describe(), 'first': first, 'delivered': delivered,
+                                  'status': status, 'repair_attempted': attempted, 'repair_skipped': skipped})
+    if final != reply:
+        yield {'__content_replace__': final}
+    if not spec.contains(delivered):
+        yield {'__warnings__': [{'kind': 'length', 'detail':
+                                 f"Asked for {spec.describe()}. The text has {delivered} {spec.unit}."}]}
+
+
 def process_user_query_stream(
     query: str,
     model_provider: str = "openai",
@@ -2596,14 +2670,20 @@ def process_user_query_stream(
         task, intent_attrs = task_for_request(request_type, query, lambda text: classify_intent(
             text, model_provider, api_key, is_byok=is_byok if text_byok is None else text_byok,
             platform_key=platform_classifier_key, request_id=request_id))
+    from .length_spec import aim_factor, parse_length, strip_length
+    length_spec = parse_length(query) if settings.length_contract_enabled and request_type == 'general' else None
+    short_piece = length_spec is not None and (length_spec.unit != 'words' or length_spec.high < settings.blog_min_words)
+    topic = strip_length(query, length_spec) or query
     if task == 'code' and request_type == 'general':
         force_agent_type = 'code_writer'
     elif (request_type == 'general' and not image_urls and settings.blog_ai_enabled and not design_mode and not document_mode
           and not (image_intent and image_intent['kind'] in ('generate', 'edit'))
           and (settings.blog_intent_regex_enabled or settings.blog_intent_shadow_mode)):
         # "write a blog post about ..." in free-form chat: image and code intent were checked first, as for code.
-        from .blog.intent import detect_blog_intent
-        blog_decision = detect_blog_intent(query)
+        from .blog.intent import BRIEF_MAX_CHARS, detect_blog_intent
+        blog_decision = detect_blog_intent(topic if len(query) <= BRIEF_MAX_CHARS else query)
+        if blog_decision['kind'] == 'blog' and short_piece:
+            blog_decision = {'kind': 'other', 'rule': 'length_below_blog'}
         trace_set(request_id, blog_intent=blog_decision['rule'])
         if blog_decision['kind'] == 'blog':
             if settings.blog_intent_shadow_mode:
@@ -2931,7 +3011,14 @@ def process_user_query_stream(
     sent = False
     chunks = []
     validate_output = agent_type == 'code_writer' and settings.code_validation_enabled
+    length_check = length_spec if (
+        document_mode and prepared_context.metadata.action == 'draft'
+        or not document_mode and agent_type == FREE_FORM_AGENT and operation_type == 'general'
+    ) else None
     max_tokens = OUTPUT_TOKENS[prepared_context.metadata.action] if document_mode else refinement_max_tokens(agent_type, query)
+    if document_mode and length_check is not None and length_check.unit == 'words':
+        max_tokens = max(max_tokens, min(8_000, 3 * length_check.high))
+    base_input = prepared_context.prompt if document_mode else (topic if length_check is not None else query)
     for index, candidate in enumerate(candidates):
         if cancel_event is not None and cancel_event.is_set():
             return
@@ -2966,8 +3053,11 @@ def process_user_query_stream(
                 if document_mode:
                     trace_set(request_id, document_model_started=True)
                 output_limit = output_token_budget(model_id, _round_max_tokens(max_tokens)) if document_mode else None
-                stream = _agent_text(agent, prepared_context.prompt if document_mode else query, images, provider, use_tools,
-                                     request_id, output_limit=output_limit)
+                model_input = base_input
+                if length_check is not None:
+                    # Told per model: a model that reliably writes short is told proportionally more (length_spec.AIM_FACTORS).
+                    model_input += '\n\n' + length_check.instruction(aim_factor(model_id))
+                stream = _agent_text(agent, model_input, images, provider, use_tools, request_id, output_limit=output_limit)
                 # Text that goes straight into the document: no requests for input, prefaces or closing notes in Write
                 # mode, and no echoed instruction in Enhance (src/output_guard.py).
                 if agent_type == FREE_FORM_AGENT and not document_mode and operation_type == 'general':
@@ -2979,15 +3069,14 @@ def process_user_query_stream(
                 for chunk in stream:
                     if cancel_event is not None and cancel_event.is_set():
                         return
-                    if document_mode and isinstance(chunk, dict):
-                        chunk['__warnings__'] = prepared_context.warnings + chunk['__warnings__']
+                    if isinstance(chunk, dict) and '__warnings__' in chunk:
                         yield chunk
                         continue
                     if not sent:
                         sent = True
                         if report_model:
                             yield {'__model_used__': (provider, model_id)}
-                    if validate_output:
+                    if validate_output or length_check is not None:
                         chunks.append(chunk)
                     yield chunk
                 if not sent and not any(not str(k).startswith('__') for k in pending_images):
@@ -3059,6 +3148,13 @@ def process_user_query_stream(
 
     if any(not str(k).startswith('__') for k in pending_images):
         yield {'__pending_images__': pending_images}
+
+    if length_check is not None and not (cancel_event is not None and cancel_event.is_set()):
+        reply = ''.join(c for c in chunks if isinstance(c, str))
+        yield from _enforce_length(
+            length_check, reply, agent, model_id, request_id, cancel_event, task=topic, allow_lengthen=not document_mode,
+            source=prepared_context.prompt if document_mode else None,
+            guard_query=None if document_mode else (user_text if user_text is not None else query))
 
 
 _PLACEHOLDER_IMG_RE = re.compile(r"!\[([^\]]*)\]\(placeholder::([0-9A-Za-z-]+)\)")
@@ -3186,7 +3282,9 @@ def process_user_query_with_images(
             pending = chunk["__pending_images__"]
         elif isinstance(chunk, dict) and "__warnings__" in chunk:
             if meta is not None:
-                meta["warnings"] = chunk["__warnings__"]
+                warnings = meta.get("warnings") or []
+                warnings.extend(w for w in chunk["__warnings__"] if w not in warnings)
+                meta["warnings"] = warnings
         elif isinstance(chunk, dict) and "__content_replace__" in chunk:
             chunks = [chunk["__content_replace__"]]
         elif isinstance(chunk, dict) and "__event__" in chunk:

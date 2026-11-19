@@ -141,13 +141,17 @@ _LONGFORM = re.compile(
     r"comprehensive|step[- ]by[- ]step|code|script|function|sql|regex)\b",
     re.I,
 )
-_WORDCOUNT = re.compile(r"\b(\d[\d,]{2,5})[- ]?(?:words?|word\s+count)\b", re.I)
+_LEGACY_WORDCOUNT = re.compile(r"\b(\d[\d,]{2,5})[- ]?(?:words?|word\s+count)\b", re.I)
 
 
 def extract_word_count(text: Optional[str]) -> Optional[int]:
-    """The length the user asked for in their own words ("a 1,500-word post" -> 1500), else None."""
-    m = _WORDCOUNT.search(text or "")
-    return int(m.group(1).replace(",", "")) if m else None
+    """The word target named by the writer, using the legacy parser when the contract is disabled."""
+    if not settings.length_contract_enabled:
+        match = _LEGACY_WORDCOUNT.search(text or "")
+        return int(match.group(1).replace(",", "")) if match else None
+    from src.length_spec import parse_length
+    spec = parse_length(text)
+    return spec.target if spec is not None and spec.unit == "words" else None
 
 
 def needs_advanced_model(text: Optional[str], use_web: bool, image_count: int) -> bool:
@@ -164,10 +168,8 @@ def needs_advanced_model(text: Optional[str], use_web: bool, image_count: int) -
         return True
     if _LONGFORM.search(t):
         return True
-    m = _WORDCOUNT.search(t)
-    if m and int(m.group(1).replace(",", "")) >= 500:
-        return True
-    return False
+    asked = extract_word_count(t)
+    return asked is not None and asked >= 500
 
 
 # ---------------------------------------------------------------------------

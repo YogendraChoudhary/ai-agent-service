@@ -285,6 +285,20 @@ class TestWarnings(unittest.TestCase):
         other = run(*a, **kw)[2]
         return other[0]["__warnings__"] if other else []
 
+    def test_a_declared_blog_under_the_floor_is_compact_and_warns(self):
+        request = BlogRequest.from_options("Write a blog post about tea in 100 words", "", None)
+        with patch.object(settings, "length_contract_enabled", True):
+            plan = plan_blog(request)
+            llm = ScriptedLLM()
+            _, chunks, other = run(llm, plan=plan, request=request)
+        blocks = parse("".join(chunks))
+        self.assertFalse(any(b.kind in ("table", "image", "blockquote") for b in blocks))
+        self.assertEqual(sum(b.kind == "heading" and b.level == 2 for b in blocks), 3)
+        (warning,) = [w for frame in other for w in frame["__warnings__"] if w["kind"] == "length"]
+        self.assertIn("250-word minimum", warning["detail"])
+        for _, messages, _ in llm.calls:
+            self.assertNotIn("in 100 words", messages[0]["content"])
+
     def test_a_picture_that_could_not_start_is_reported_and_not_referenced(self):
         tool = FakeImageTool(fail=lambda p: "Image generation skipped: insufficient credits" if "world map" in p else None)
         events, text, other = run(tool=tool)

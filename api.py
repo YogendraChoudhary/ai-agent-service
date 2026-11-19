@@ -1429,7 +1429,7 @@ async def stream_text(
                 expected_output_chars = 6 * plan_blog(BlogRequest.from_options(
                     request_data.query, request_data.secondary_prompt,
                     request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None),
-                    image_available=False).target_words
+                    image_available=False).visible_words
             upfront_reserved_scaled = design_price_scaled or text_credits_scaled(reservation_input_chars, expected_output_chars)
             if (document_text is not None or prepared_context is not None) and upfront_reserved_scaled > MAX_RESERVATION_PER_REQUEST_SCALED:
                 finish_trace(request_id, 'rejected', error='document request exceeds credit limit', http_status=402)
@@ -1570,7 +1570,7 @@ async def stream_text(
                             yield f"data: {json.dumps(ev)}\n\n"
                         continue
                     if isinstance(chunk, dict) and '__warnings__' in chunk:
-                        stream_warnings = chunk['__warnings__']
+                        stream_warnings.extend(w for w in chunk['__warnings__'] if w not in stream_warnings)
                         continue
                     replacing = isinstance(chunk, dict) and '__content_replace__' in chunk
                     if replacing:

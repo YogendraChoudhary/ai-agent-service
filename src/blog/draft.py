@@ -13,12 +13,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from config import settings
+from src.length_spec import count_words
 from src.longform.markdown_ast import parse
 
 from . import schema as s
 from .llm import LLM, CallSpec
 from .media import Placed
-from .plan import BlogPlan, BlogRequest
+from .plan import TABLE_WORDS, BlogPlan, BlogRequest
 from .prompts import repair_unit_message, section_system_prompt, unit_user_message
 from .sources import WebSources
 from .text import clean_alt, clean_caption
@@ -93,10 +94,12 @@ def unit_request(request: BlogRequest, plan: BlogPlan, outline: s.Outline, unit:
     return _compact({
         "post": _compact({"title": outline.title, "subtitle": outline.subtitle, "parts": parts}),
         "write": _compact({"part": unit.kind, "id": unit.id, "heading": unit.heading, "angle": unit.angle,
-                           "target_words": round(unit.target_words * WRITER_LENGTH_FACTOR)}),
+                           "target_words": round(unit.target_words * WRITER_LENGTH_FACTOR),
+                           "word_tolerance_percent": round(100 * plan.part_tolerance) if plan.part_tolerance is not None else None}),
         "assignments": _compact({
             "table": _compact({"title": unit.table.title, "columns": unit.table.columns,
-                               "rows_hint": unit.table.rows_hint}) if unit.table else None,
+                               "rows_hint": unit.table.rows_hint,
+                               "word_limit": TABLE_WORDS if plan.length_spec is not None else None}) if unit.table else None,
             "quote": True if unit.quote else None,
             "takeaways": unit.takeaways or None,
         }),
@@ -105,7 +108,7 @@ def unit_request(request: BlogRequest, plan: BlogPlan, outline: s.Outline, unit:
         "not_assigned": [name for name, assigned in (("table", unit.table), ("quote", unit.quote)) if not assigned],
         "already_covered": previous_angle,
         "image_follows_first_paragraph": True if unit.image else None,
-        "brief": request.brief,
+        "brief": request.topic,
         "style_notes": request.style_notes,
         "audience": request.audience,
         "tone": request.tone,
@@ -133,7 +136,8 @@ def assemble(unit: Unit, body: str) -> str:
 
 def _lint(text: str, unit: Unit, plan: BlogPlan) -> Lint:
     return lint(text, unit=unit.id, expect_table=unit.table is not None, expect_quotes=1 if unit.quote else 0,
-                target_words=unit.target_words, max_prose_run=plan.max_prose_run)
+                target_words=unit.target_words, max_prose_run=plan.max_prose_run, tolerance=plan.part_tolerance,
+                table_word_limit=TABLE_WORDS if plan.length_spec is not None else None)
 
 
 def _finish(unit: Unit, plan: BlogPlan, reply: str, sources: Optional[WebSources]) -> Tuple[str, Lint, List[str]]:
@@ -166,7 +170,11 @@ def write_unit(llm: LLM, request: BlogRequest, plan: BlogPlan, outline: s.Outlin
             unit, plan, llm(system, messages, CallSpec("unit_repair", UNIT_TEMPERATURE, tokens, unit=unit.id)), sources)
         repaired, fixes = True, fixes + second_fixes
         was_empty = any(e.kind == "empty" for e in found.errors)
-        if was_empty or len(second_found.errors) <= len(found.errors):    # never trade a flawed part for a worse one
+        better = len(second_found.errors) <= len(found.errors)
+        if plan.length_spec is not None and len(second_found.errors) == len(found.errors):
+            expected = unit.target_words + count_words(unit.heading or "") + (TABLE_WORDS if unit.table else 0)
+            better = abs(count_words(second_text) - expected) < abs(count_words(text) - expected)
+        if was_empty or better:
             text, found = second_text, second_found
 
     if any(e.kind == "empty" for e in found.errors):

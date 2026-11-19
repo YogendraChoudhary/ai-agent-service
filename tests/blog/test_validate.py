@@ -211,6 +211,14 @@ class TestLint(unittest.TestCase):
         out = lint(f"{filler(50)}\n\n| A |\n|---|\n| 1 |\n\n{self.TABLE}\n", expect_table=True)
         self.assertEqual(out.errors, [])
 
+    def test_explicit_budget_counts_table_cells_separately_from_prose(self):
+        cell = filler(20)
+        text = f"{filler(100)}\n\n| A | B |\n| --- | --- |\n| {cell} | {cell} |\n| {cell} | {cell} |"
+        self.assertEqual(lint(text, expect_table=True, target_words=100).errors, [])
+        out = lint(text, expect_table=True, target_words=100, tolerance=0.15, table_word_limit=45)
+        self.assertEqual(out.words, 100)
+        self.assertEqual([e.kind for e in out.errors], ["table_length"])
+
     def test_prose_run_counts_paragraphs_until_a_visual_break(self):
         text = f"{filler(120)}\n\n{filler(120)}\n"
         out = lint(text, max_prose_run=220)

@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
+from src.length_spec import count_words
 from src.longform.markdown_ast import Block, parse, prose_words, table_cells, table_shape
 
 from .schema import Issue
@@ -209,7 +210,8 @@ def longest_prose_run(blocks: Sequence[Block]) -> int:
 
 
 def lint(text: str, *, unit: Optional[str] = None, expect_table: bool = False, expect_quotes: int = 0,
-         target_words: int = 0, max_prose_run: int = 220) -> Lint:
+         target_words: int = 0, max_prose_run: int = 220, tolerance: Optional[float] = None,
+         table_word_limit: Optional[int] = None) -> Lint:
     """Check an assembled part (heading and image already in place, as the reader will see it)."""
     blocks = parse(text)
     out = Lint(words=prose_words(blocks), longest_run=longest_prose_run(blocks))
@@ -218,13 +220,19 @@ def lint(text: str, *, unit: Optional[str] = None, expect_table: bool = False, e
         return out
 
     if expect_table:
-        shapes = [table_shape(b) for b in blocks if b.kind == "table"]
+        tables = [b for b in blocks if b.kind == "table"]
+        shapes = [table_shape(b) for b in tables]
         if not shapes:
             out.errors.append(Issue("table_missing", "The assigned table is missing. Write one GitHub-flavoured Markdown "
                                                      "table: a header row, the |---|---| delimiter row, then data rows.", unit))
         elif not any(s and s.consistent and s.header >= 2 and len(s.rows) >= 2 for s in shapes):
             out.errors.append(Issue("table_shape", "The table is malformed: it needs at least 2 columns and 2 data rows, "
                                                    "and every row must have the same number of cells as the header.", unit))
+        elif table_word_limit is not None:
+            shown = sum(count_words(b.text) for b in tables)
+            if shown > table_word_limit:
+                out.errors.append(Issue("table_length", f"The table cells have {shown} words. Keep them within "
+                                                        f"{table_word_limit} words total using short cell entries.", unit))
     if sum(b.kind == "blockquote" for b in blocks) < expect_quotes:
         out.errors.append(Issue("quote_missing", "The assigned pull quote is missing. Add one block quote: a single "
                                                  "line starting with '> '.", unit))
@@ -233,7 +241,8 @@ def lint(text: str, *, unit: Optional[str] = None, expect_table: bool = False, e
                                              "Break it up with a short list, the assigned table or quote, or by tightening "
                                              "the text. Do not add headings.", unit))
     if target_words:
-        low, high = round(target_words * (1 - LENGTH_TOLERANCE)), round(target_words * (1 + LENGTH_TOLERANCE))
+        slack = LENGTH_TOLERANCE if tolerance is None else tolerance
+        low, high = round(target_words * (1 - slack)), round(target_words * (1 + slack))
         if not low <= out.words <= high:
             out.errors.append(Issue("length", f"{out.words} words; this part should be about {target_words} "
                                               f"(between {low} and {high}).", unit))

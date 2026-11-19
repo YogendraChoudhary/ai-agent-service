@@ -380,6 +380,41 @@ def parse(text: str) -> List[Block]:
     return blocks
 
 
+def _italic_caption(children) -> bool:
+    return bool(children and children[0].type == "em_open" and children[-1].type == "em_close"
+                and all(child.level > 0 for child in children[1:-1]))
+
+
+def visible_text(markdown: str) -> str:
+    """The editor's document text. Image alt text and italic captions attached to images live outside it."""
+    parts = []
+    after_image = False
+    tokens = _parser().parse(markdown or "")
+    for i, token in enumerate(tokens):
+        if token.type in ("fence", "code_block"):
+            parts.append(token.content)
+        if token.type != "inline":
+            if token.type in ("fence", "code_block", "hr", "html_block"):
+                after_image = False
+            continue
+
+        children = token.children or []
+        paragraph = i > 0 and tokens[i - 1].type == "paragraph_open"
+        caption_below_image = after_image and paragraph and _italic_caption(children)
+        starts_with_image = paragraph and bool(children) and children[0].type == "image"
+        after_image = starts_with_image and len(children) == 1
+        caption_on_image = (starts_with_image and len(children) > 2 and children[1].type in ("softbreak", "hardbreak")
+                            and _italic_caption(children[2:]))
+        if caption_below_image or caption_on_image:
+            continue
+        text = "".join(child.content if child.type in ("text", "code_inline")
+                       else "\n" if child.type in ("softbreak", "hardbreak") else "" for child in children)
+        if i > 1 and tokens[i - 2].type == "list_item_open":
+            text = _TASK_CONTENT.sub("", text, count=1).lstrip()
+        parts.append(text)
+    return "\n".join(parts)
+
+
 def heading_lines(text: str) -> List[Tuple[int, str]]:
     """
     (level, first source line) of every top-level heading: the same as

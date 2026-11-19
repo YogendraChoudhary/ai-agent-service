@@ -64,7 +64,7 @@ class OutlineResult:
 def outline_request(request: BlogRequest, plan: BlogPlan) -> dict:
     """The outline call's user data. Plan numbers are what the model must follow."""
     return {
-        "brief": request.brief,
+        "brief": request.topic,
         "style_notes": request.style_notes,
         "audience": request.audience,
         "tone": request.tone,
@@ -173,7 +173,8 @@ def plan_issues(o: s.Outline, plan: BlogPlan, *, prompts: bool = True) -> List[s
     if abs(total - want) > 0.15 * want:
         errs.append(s.Issue("words_total", f"The sections' target_words add up to {total}; they must add up to "
                                            f"about {want} (within 15%)."))
-    for kind, need, extra in (("table", plan.tables, MAX_EXTRA_VISUALS), ("quote", plan.quotes, MAX_EXTRA_VISUALS),
+    extra_visuals = 0 if plan.length_spec is not None else MAX_EXTRA_VISUALS
+    for kind, need, extra in (("table", plan.tables, extra_visuals), ("quote", plan.quotes, extra_visuals),
                               ("image", plan.images, 0)):
         found = o.count(kind)
         if found < need or found > need + extra:
@@ -188,10 +189,11 @@ def plan_issues(o: s.Outline, plan: BlogPlan, *, prompts: bool = True) -> List[s
             for problem in image_prompt_problems(img.prompt):
                 errs.append(s.Issue("image_prompt", f"Image prompt in {sec.id}: {problem}. Describe only the "
                                                     "scene: no text, letters, numbers, logos or real people.", sec.id))
-    for a, b in zip(o.sections, o.sections[1:]):
-        if not a.visuals and not b.visuals:
-            errs.append(s.Issue("visual_gap", f"Sections {a.id} and {b.id} follow each other with no visual. "
-                                              "Give one of them a visual.", b.id))
+    if plan.length_spec is None:
+        for a, b in zip(o.sections, o.sections[1:]):
+            if not a.visuals and not b.visuals:
+                errs.append(s.Issue("visual_gap", f"Sections {a.id} and {b.id} follow each other with no visual. "
+                                                  "Give one of them a visual.", b.id))
     return errs
 
 
@@ -212,6 +214,15 @@ def validate_outline(raw: Any, plan: BlogPlan) -> OutlineCheck:
         outline = s.Outline.model_validate(normalise(data))
     except ValidationError as e:
         return OutlineCheck(errors=_schema_issues(e))
+    if plan.length_spec is None:
+        errors = []
+        if len(outline.sections) < 3:
+            errors.append(s.Issue("schema", "The outline needs at least 3 sections.", field="sections"))
+        for name in ("intro", "conclusion"):
+            if getattr(outline, name).target_words < 40:
+                errors.append(s.Issue("schema", "The target needs at least 40 words.", field=f"{name}.target_words"))
+        if errors:
+            return OutlineCheck(errors=errors)
     return OutlineCheck(outline=outline, errors=plan_issues(outline, plan))
 
 
@@ -317,13 +328,14 @@ def finalize(outline: s.Outline, plan: BlogPlan) -> Tuple[s.Outline, List[str]]:
     added = _add_images(secs, plan.images - _count(secs, "image"))
     if added:
         notes.append(f"added {added} image(s)")
+    extra_visuals = 0 if plan.length_spec is not None else MAX_EXTRA_VISUALS
     for kind, need, adder in (("table", plan.tables, _add_tables), ("quote", plan.quotes, _add_quotes)):
-        trim(kind, need + MAX_EXTRA_VISUALS)
+        trim(kind, need + extra_visuals)
         added = adder(secs, need - _count(secs, kind))
         if added:
             notes.append(f"added {added} {kind}(s)")
     gaps = 0
-    for a, b in zip(secs, secs[1:]):
+    for a, b in zip(secs, secs[1:]) if extra_visuals else ():
         if not a["visuals"] and not b["visuals"]:
             pick = a if a["target_words"] >= b["target_words"] else b
             # a table or image would cost more than the cap allows; a quote is the cheapest visual, so it is the
@@ -339,9 +351,16 @@ def finalize(outline: s.Outline, plan: BlogPlan) -> Tuple[s.Outline, List[str]]:
         notes.append(f"added {gaps} quote(s) to close gaps between visuals")
 
     total, want = sum(sec["target_words"] for sec in secs), plan.section_words
-    if total and abs(total - want) > 0.15 * want:
+    if total and abs(total - want) > (0 if plan.length_spec is not None else 0.15 * want):
         for sec in secs:
             sec["target_words"] = max(s.SECTION_WORDS[0], min(s.SECTION_WORDS[1], round(sec["target_words"] * want / total)))
+        if plan.length_spec is not None:
+            remaining = want - sum(sec["target_words"] for sec in secs)
+            for sec in secs:
+                words = sec["target_words"]
+                change = max(s.SECTION_WORDS[0] - words, min(s.SECTION_WORDS[1] - words, remaining))
+                sec["target_words"] += change
+                remaining -= change
         notes.append("rescaled section lengths to the plan")
     for i, sec in enumerate(secs, 1):                  # code-owned
         sec["id"] = f"s{i}"
@@ -350,6 +369,8 @@ def finalize(outline: s.Outline, plan: BlogPlan) -> Tuple[s.Outline, List[str]]:
                 v["position"] = s.IMAGE_POSITION
     data["intro"]["target_words"] = plan.intro_words
     data["conclusion"]["target_words"] = plan.conclusion_words
+    if plan.length_spec is not None and plan.conclusion_words <= 50:
+        data["conclusion"]["takeaways"] = 1
     return s.Outline.model_validate(data), notes
 
 
@@ -436,7 +457,7 @@ def build_outline(llm: LLM, request: BlogRequest, plan: BlogPlan, request_id: Op
     `on_title(title, subtitle)` is called once, from the thread making the model call, as soon as the model has written both
     (the call is streamed); the outline returned then carries exactly those two strings.
     """
-    system = outline_system_prompt(plan.length)
+    system = outline_system_prompt(plan.length, plan.length_spec is not None)
     messages = [{"role": "user", "content": outline_user_message(outline_request(request, plan))}]
     watcher = TitleWatcher(on_title) if on_title is not None else None
     listen = watcher.feed if watcher else None

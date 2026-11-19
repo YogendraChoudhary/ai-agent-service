@@ -352,6 +352,14 @@ class Settings(BaseSettings):
     blog_stream_title: bool = Field(True, alias="BLOG_STREAM_TITLE")
     blog_intent_regex_enabled: bool = Field(True, alias="BLOG_INTENT_REGEX_ENABLED")  # promote "write a blog post about..." from general
     blog_intent_shadow_mode: bool = Field(False, alias="BLOG_INTENT_SHADOW_MODE")  # log the promotion decision only
+    # On for every provider since 2026-11-19 (live: OpenAI 27/27, Claude 26/27, Gemini 23-24/27; a miss carries a `length` warning).
+    length_contract_enabled: bool = Field(True, alias="LENGTH_CONTRACT_ENABLED")
+    length_repair_enabled: bool = Field(True, alias="LENGTH_REPAIR_ENABLED")  # one text-only rewrite on a miss
+    # A named word range ending below this is written in one call, not by the staged blog pipeline. Live, a 600-word blog on
+    # gpt-5.2 came out at 760 words (small parts overshoot their targets), while one call landed in range on every provider.
+    blog_min_words: int = Field(1000, ge=250, le=4000, alias="BLOG_MIN_WORDS")
+    # No full rewrite above this many words: live 1,450-word rewrites took ~60 s and still missed. Those get a warning instead.
+    length_repair_max_words: int = Field(1000, ge=100, le=4000, alias="LENGTH_REPAIR_MAX_WORDS")
 
     # ------------------------------------------------------------------
     # Structure-preserving refinement of long documents (src/longform) for enhance_with_ai, fix_grammar, change_tone and

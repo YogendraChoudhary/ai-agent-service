@@ -171,6 +171,76 @@ def test_large_draft_exposes_partial_coverage_warning_on_both_endpoints(runtime)
     assert events[-1]['data']['warnings'] == process['warnings']
 
 
+def test_draft_preserves_context_and_model_warnings_when_length_misses(runtime, monkeypatch):
+    client, state = runtime
+    monkeypatch.setattr(settings, 'length_contract_enabled', True)
+    monkeypatch.setattr(settings, 'length_repair_enabled', False)
+    state['output_tokens'] = 9000
+    request = body(query='Draft a paragraph about seeds in 100 words.', document_action='draft',
+                   document_context={'text': 'word ' * 8000})
+    process = client.post('/agent/process', json=request).json()
+    events = parse_sse_events(client.post('/agent/stream', json=request).text)
+    assert events[-1]['data']['warnings'] == process['warnings']
+    assert [w['kind'] for w in process['warnings']] == ['partial_document_context', 'output_limit_reached', 'length']
+
+
+def test_draft_replacement_reaches_both_endpoints_and_uses_larger_budget(runtime, monkeypatch):
+    from tests.blog.fakes import filler
+
+    client, state = runtime
+    monkeypatch.setattr(settings, 'length_contract_enabled', True)
+    monkeypatch.setattr(settings, 'length_repair_enabled', True)
+    monkeypatch.setattr(settings, 'length_repair_max_words', 2000)
+    correction = filler(900)
+
+    def run(agent, prompt, **kwargs):
+        if kwargs['stream']:
+            def stream():
+                state['calls'].append({'prompt': prompt, 'output_limit': getattr(agent.model, 'max_completion_tokens', None)})
+                yield SimpleNamespace(event=RunEvent.run_content, content=filler(1100), metrics=None)
+                yield SimpleNamespace(event=RunEvent.run_completed, content=None, metrics={'output_tokens': 4})
+            return stream()
+        assert not agent.tools and kwargs['images'] is None
+        assert SOURCE not in prompt and 'cutting words' in prompt
+        return SimpleNamespace(content=correction, metrics=None)
+
+    monkeypatch.setattr(tpa.Agent, 'run', run)
+    request = body(query='Draft a passage about the launch in 900 words.', document_action='draft',
+                   document_context={'text': SOURCE, 'cursor_utf16': len(SOURCE)})
+    result = client.post('/agent/process', json=request).json()
+    events = parse_sse_events(client.post('/agent/stream', json=request).text)
+    expected = correction + '\n'
+    assert result['markdown_response'] == expected
+    assert events[-2]['data'] == {'type': 'content_replace', 'content': expected}
+    assert all(c['output_limit'] > 5120 and 'LENGTH:' in c['prompt'] for c in state['calls'])
+    assert not result['warnings']
+
+
+def test_short_draft_is_lengthened_from_its_document(runtime, monkeypatch):
+    from tests.blog.fakes import filler
+
+    client, state = runtime
+    monkeypatch.setattr(settings, 'length_contract_enabled', True)
+    monkeypatch.setattr(settings, 'length_repair_enabled', True)
+    first_run, prompts = tpa.Agent.run, []
+
+    def run(agent, prompt, **kwargs):
+        if kwargs['stream']:
+            return first_run(agent, prompt, **kwargs)
+        prompts.append(prompt)
+        return SimpleNamespace(content=filler(100), metrics=None)
+
+    monkeypatch.setattr(tpa.Agent, 'run', run)
+    request = body(query='Draft a passage about the launch in 100 words.', document_action='draft',
+                   document_context={'text': SOURCE, 'cursor_utf16': len(SOURCE)})
+    result = client.post('/agent/process', json=request).json()
+    assert result['markdown_response'] == filler(100) + '\n'
+    assert not result['warnings']
+    (prompt,) = prompts
+    # The rewrite sees the document it drafts from, so it can lengthen without inventing.
+    assert 'SOURCE' in prompt and 'Velvet Mango' in prompt and 'only facts from SOURCE' in prompt
+
+
 def paid(runtime, monkeypatch, *, allow=True):
     _, state = runtime
     monkeypatch.setattr(api, 'async_validate_and_get_api_key', AsyncMock(return_value=('provider-key', {

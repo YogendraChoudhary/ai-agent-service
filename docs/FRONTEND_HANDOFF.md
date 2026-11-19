@@ -87,7 +87,9 @@ production environment may override them. Confirm with whoever deploys.
 | Charts | `CHART_SUGGESTIONS_ENABLED` | **on** | No `graph_suggestion` or `graph_suggestion_unavailable` after Enhance, even when the instruction asks for a chart |
 | Document context | `DOCUMENT_CONTEXT_ENABLED` | **on** | `document_context` → HTTP 503 `DOCUMENT_CONTEXT_DISABLED`; legacy edits unchanged |
 | Long-form | `LONGFORM_REFINE_ENABLED` | **on** | The four text types run as one call, as before |
-| Streaming code repair | `CODE_REPAIR_STREAM_EVENT` | **on** | `content_replace` is never sent |
+| Streaming code repair | `CODE_REPAIR_STREAM_EVENT` | **on** | Code repair does not emit `content_replace` |
+| Length contract | `LENGTH_CONTRACT_ENABLED` | **on** | Uses the previous length parsing and blog planning ("in 100 words" can become a 4-section blog post) |
+| Write and Draft length repair | `LENGTH_REPAIR_ENABLED` | **on** | Length checks report warnings without rewriting the answer |
 | Task routing | `TASK_ROUTING_ENABLED` | on | Provider chosen as submitted |
 | Blog promotion | `BLOG_INTENT_REGEX_ENABLED` | **on** | "Write a blog post about …" in `general` is answered by the free-form writer instead of the blog pipeline |
 
@@ -152,7 +154,7 @@ So dispatch on `event ?? payload.type`.
 | `start` | `{type, request_id}` | First frame, always | **Keep `request_id`**; it is what `/agent/abort` needs |
 | `highlight_ready` *(named)* | `{source_sha256, lead, key_points, summary_markdown, evidence}` | `highlight_key_points`, after validation | Structured summary metadata; use normal content output for lead + bullets ([handoff](KEY_POINTS_API_HANDOFF.md)) |
 | `content` | `{type, content}` | Text chunk | Append Markdown at the insertion point |
-| `content_replace` | `{type, content}` | Streaming code repair (flag off by default) | **Replace everything streamed so far** with `content` (§5) |
+| `content_replace` | `{type, content}` | Code repair or a Write or Draft length correction | Replace the current request's streamed answer with `content` (§5) |
 | `outline` | `{type, title, sections: [{id, heading}]}` | `generate_blog`, once the structure is valid | Draw a skeleton / progress list (§7) |
 | `refine_progress` | `{type, chunk, of}` | Long-form refinement, after each passage | Progress "2 of 6" (§6) |
 | `init` *(named)* | `{request_id, model, provider, mode: "design_canvas"}` | Design only, immediately | Show a "designing…" state. **`model`/`provider` are the first candidate, not necessarily the one that answered**; do not display them as fact |
@@ -288,6 +290,12 @@ data: {"requested_action":"auto","action":"edit","source":"rules","reason":"exis
 **Draft returns the exact text it was given.** "add Acme Inc. below the Contact heading" now inserts `Acme Inc.` and nothing else. When
 this was recognised without a model, `document_context_ready.source` is `"literal"` (new, additive; `"model"` when a model writes the draft, `null` for Ask and for answers with no draft), the reply is
 one `content` frame, and nothing is charged. No frontend change is required.
+
+**Draft length repair.** Track the document range filled by the current Draft stream. When `content_replace` arrives, replace
+that inserted range with the revised Markdown. Before enabling length repair, confirm this in the editor with pre-existing text
+on either side of the Draft. `done.warnings` can carry `{kind: "length", detail}` along with context and output limit warnings.
+A Draft that is too long is shortened; one that is too short (or cut off) is rewritten once from the same document and task, using
+only facts from them. Answers above `LENGTH_REPAIR_MAX_WORDS` (1,000) are not rewritten either: they get the `length` warning.
 
 **Placement words.** Draft placement now understands "next to", "beside" and "alongside" (the draft goes after that block), an unnamed
 "below the heading" (the heading the cursor is under; send `cursor_utf16` so it can be found; with several headings and no cursor you
@@ -784,6 +792,11 @@ On by default (`LONGFORM_REFINE_ENABLED`). Frontend work is small but easy to mi
 
 On by default (`BLOG_AI_ENABLED`; when set to `false`, HTTP 503). With `BLOG_INTENT_REGEX_ENABLED` (also on), "write a blog post about …" typed in Write mode (`general`) is answered by this pipeline too. Full contract: `API_DOCUMENTATION.md` § Visually rich blog generation.
 
+With `LENGTH_CONTRACT_ENABLED`, Write uses the general writer when the request specifies another unit or when the word range ends
+below `BLOG_MIN_WORDS` (1,000 by default). A declared `generate_blog` plans for 250–4,000 words. For explicit word targets, the
+budget includes title, subtitle, headings and table cells. The live demo also counts hyphenated words as single words and
+excludes image alt text and captions attached to images.
+
 * Send `type: "generate_blog"`, `query` = topic/brief (3–5,000 chars), optional `blog_options`, `document_id`.
 * Order of frames: `start → content (title block) → outline → content… → done → image_ready/image_failed… → stream_end`.
   Use `outline` to draw a skeleton immediately.
@@ -794,7 +807,7 @@ On by default (`BLOG_AI_ENABLED`; when set to `false`, HTTP 503). With `BLOG_INT
 * Pictures arrive **after** `done`. A post can finish text in ~30 s and pictures 20+ s later; do not mark the action
   complete on `done` if `pending_images > 0`.
 * `done.warnings[].kind`: `unit_lint` `outline_filled` `outline_rules` `quota_tables` `quota_quotes` `heading_mismatch`
-  `image_skipped` `images_limited`. Show as an info panel, not an error.
+  `image_skipped` `images_limited` `length`. A `length` warning explains a missed request or a clamped blog target.
 * Cost: text is billed per character, plus per picture (reserved after the outline).
 
 ---

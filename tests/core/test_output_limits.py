@@ -19,10 +19,10 @@ def limit_of(model):
 class TestBudgetMaths(unittest.TestCase):
 
     def test_reasoning_models_get_headroom_others_do_not(self):
-        for model_id in ("gpt-5.2", "gpt-5", "o3-mini", "grok-4.6", "claude-opus-5-5", "claude-sonnet-5-5"):
+        for model_id in ("gpt-5.2", "gpt-5", "o3-mini", "grok-4.6", "claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.8-flash"):
             with self.subTest(model=model_id):
                 self.assertEqual(reasoning_headroom(model_id), REASONING_HEADROOM_TOKENS)
-        for model_id in ("gpt-4o-mini", "claude-opus-5", "claude-sonnet-5", "gemini-3.8-flash", "deepseek-chat",
+        for model_id in ("gpt-4o-mini", "claude-opus-5", "claude-sonnet-5", "gemini-3.5-flash-lite", "deepseek-chat",
                          "deepseek-reasoner", "grok-4.20-0309-non-reasoning", ""):
             with self.subTest(model=model_id):
                 self.assertEqual(reasoning_headroom(model_id), 0)
@@ -51,7 +51,9 @@ class TestGetModel(unittest.TestCase):
         # the advanced Claude tier is claude-opus-5-5, which always thinks; thinking counts against max_tokens, so it gets headroom
         self.assertEqual(limit_of(self.model("claude", max_tokens=700)), {"max_tokens": 1024 + REASONING_HEADROOM_TOKENS})
         self.assertEqual(limit_of(self.model("claude", advanced=False, max_tokens=700)), {"max_tokens": 1024 + REASONING_HEADROOM_TOKENS})
-        self.assertEqual(limit_of(self.model("gemini", max_tokens=700)), {"max_output_tokens": 1024})
+        # the advanced Gemini tier is gemini-3.8-flash, which still thinks with thinking_budget=0 (measured live), so it gets headroom
+        self.assertEqual(limit_of(self.model("gemini", max_tokens=700)), {"max_output_tokens": 1024 + REASONING_HEADROOM_TOKENS})
+        self.assertEqual(limit_of(self.model("gemini", advanced=False, max_tokens=700)), {"max_output_tokens": 1024})
         self.assertEqual(limit_of(self.model("openai", max_tokens=700))["max_completion_tokens"], 1024 + REASONING_HEADROOM_TOKENS)
         self.assertIsNone(limit_of(self.model("openai", max_tokens=700))["max_tokens"])     # gpt-5 rejects max_tokens
         self.assertEqual(limit_of(self.model("openai", advanced=False, max_tokens=700))["max_tokens"], 1024)

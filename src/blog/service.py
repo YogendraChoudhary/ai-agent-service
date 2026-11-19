@@ -25,6 +25,7 @@ from functools import partial
 from typing import Iterator, Optional, Union
 
 from config import settings
+from src.length_spec import count_words
 from src.longform.markdown_ast import parse
 from src.longform.ordered_stream import run_ordered
 from src.provider_work import check_cancelled
@@ -154,6 +155,17 @@ def generate_blog_stream(
     warnings.extend(article_warnings(
         document, tables=plan.tables, quotes=plan.quotes,
         headings=[u.heading for u in units if u.heading]))
+    spec = plan.length_spec
+    if spec is not None:
+        shown = count_words(document)
+        if spec.target != plan.visible_words:
+            warnings.append({"kind": "length", "detail": f"Asked for {spec.describe()}. The blog planner used its "
+                             f"{plan.visible_words}-word {'minimum' if spec.target < plan.visible_words else 'maximum'}. "
+                             f"The post has {shown} words."})
+        elif not spec.contains(shown):
+            warnings.append({"kind": "length", "detail": f"Asked for {spec.describe()}. The post has {shown} words."})
+        trace_set(request_id, length={"unit": spec.unit, "asked": spec.describe(), "planned": plan.visible_words,
+                                      "first": shown, "delivered": shown, "repair_attempted": False})
     blocks = parse(document)
     fixes = Counter(f for part in drafted for f in part.fixes)
     trace_set(request_id, blog={

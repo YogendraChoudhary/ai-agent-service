@@ -7,8 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from config import settings
+from src.blog import schema
 from src.blog.plan import (
-    BRIEF_MAX_CHARS, LENGTH_WORDS, MAX_WORDS, MIN_WORDS, BlogRequest, length_bucket, plan_blog, section_count,
+    BRIEF_MAX_CHARS, HEADING_WORDS, LENGTH_WORDS, MAX_WORDS, MIN_WORDS, TABLE_WORDS, TITLE_WORDS, BlogRequest,
+    length_bucket, plan_blog, section_count,
 )
 from src.request_plan import extract_word_count
 
@@ -17,10 +19,14 @@ def plan_for(brief="Write a blog post about remote team meetings", options=None,
     return plan_blog(BlogRequest.from_options(brief, "", options), **kw)
 
 
+@patch.object(settings, "length_contract_enabled", True)
 class TestLength(unittest.TestCase):
 
     def test_default_is_standard(self):
-        self.assertEqual(plan_for().target_words, LENGTH_WORDS["standard"])
+        plan = plan_for()
+        self.assertEqual((plan.target_words, plan.sections, plan.intro_words, plan.conclusion_words), (1450, 5, 120, 120))
+        self.assertEqual((plan.tables, plan.quotes, plan.images), (1, 2, 3))
+        self.assertIsNone(plan.part_tolerance)
 
     def test_option_picks_the_bucket(self):
         for name, words in LENGTH_WORDS.items():
@@ -29,14 +35,42 @@ class TestLength(unittest.TestCase):
 
     def test_the_briefs_own_number_wins_over_the_option(self):
         p = plan_for("Write a 2,500-word guide to solar panels", {"length": "short"})
-        self.assertEqual((p.target_words, p.length), (2500, "long"))
+        self.assertEqual((p.visible_words, p.length), (2500, "long"))
 
     def test_absurd_lengths_are_clamped_and_the_reason_says_so(self):
         for brief, want in (("Write a 90000 word novel", MAX_WORDS), ("Write a 120 word note", MIN_WORDS)):
             with self.subTest(brief=brief):
                 p = plan_for(brief)
-                self.assertEqual(p.target_words, want)
+                self.assertEqual(p.visible_words, want)
                 self.assertIn("clamped", p.reasons["length"])
+
+    def test_compact_plans_keep_the_prose_above_the_section_floor(self):
+        for target in (250, 300):
+            with self.subTest(target=target):
+                p = plan_for(f"Write a blog post about tea in {target} words")
+                self.assertEqual((p.sections, p.tables, p.quotes, p.images), (2, 0, 0, 0))
+                self.assertEqual(p.section_words, target - 37 - 60)
+                self.assertGreaterEqual(p.section_words // p.sections, schema.SECTION_WORDS[0])
+
+    def test_explicit_six_hundred_words_budgets_headings_and_tables(self):
+        p = plan_for("Write a blog post about tea in 600 words")
+        self.assertEqual((p.sections, p.tables, p.quotes), (3, 1, 1))
+        self.assertEqual(p.target_words + TITLE_WORDS + HEADING_WORDS * (p.sections + 1) + TABLE_WORDS, 600)
+        self.assertEqual(p.part_tolerance, 0.15)
+
+    def test_size_word_and_option_precedence(self):
+        self.assertEqual(plan_for("Write a short article about the long run").target_words, 800)
+        self.assertEqual(plan_for("Write a short article about tea", {"length": "long"}).target_words, 2200)
+        self.assertEqual(plan_for("Write an article about short-term memory").target_words, 1450)
+
+    def test_disabled_contract_restores_the_legacy_plan_and_topic(self):
+        brief = "Write an article on weather in 100 words"
+        with patch.object(settings, "length_contract_enabled", False):
+            request = BlogRequest.from_options(brief, "", None)
+            p = plan_blog(request)
+            self.assertEqual(request.topic, brief)
+            self.assertEqual((p.target_words, p.sections, p.intro_words, p.tables, p.quotes, p.images), (300, 4, 80, 1, 2, 1))
+            self.assertIsNone(p.words_asked)
 
     def test_extract_word_count(self):
         self.assertEqual(extract_word_count("a 1,500-word post"), 1500)

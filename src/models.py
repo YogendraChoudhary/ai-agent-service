@@ -100,7 +100,9 @@ def reasoning_headroom(model_id: str) -> int:
     well-sized answer can be cut off before the first visible word.
     """
     mid = (model_id or "").lower()
-    reasons = (mid.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4", "claude-opus-5-5", "claude-sonnet-5-5"))
+    # gemini-3.8-flash is built with thinking_budget=0, but it still thinks: live 2026-11-19, a 300-word Draft spent 982 reasoning
+    # tokens of its 1,000-token limit and stopped after 36 words (reasoning_tokens in the usage, not output_tokens).
+    reasons = (mid.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4", "claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.8-flash"))
                or (mid.startswith("grok-4") and "non-reasoning" not in mid))
     return REASONING_HEADROOM_TOKENS if reasons else 0
 
