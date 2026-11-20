@@ -200,6 +200,7 @@ def plan_design_request(
     operation_type: str = "general",
     has_image_attachment: bool = False,
     has_existing_design_ast: bool = False,
+    existing_design_ast=None,
 ) -> Optional[RequestPlan]:
     """
     Mode 8 Design Canvas plan, or None when this is not a design request (or the engine is off).
@@ -216,6 +217,7 @@ def plan_design_request(
         operation_type=operation_type,
         has_image_attachment=has_image_attachment,
         has_existing_design_ast=has_existing_design_ast,
+        existing_design_ast=existing_design_ast,
     )
     if not decision.is_design_request:
         return None
@@ -244,13 +246,15 @@ def plan_smart_request(
     operation_type: str = "general",
     has_image_attachment: bool = False,
     has_existing_design_ast: bool = False,
+    existing_design_ast=None,
 ) -> RequestPlan:
     """
     Deterministic request plan.
 
     Priority 1 (before any other gate): Mode 8 Design Canvas detection (plan_design_request).
     """
-    design = plan_design_request(user_text, operation_type, has_image_attachment, has_existing_design_ast)
+    design = plan_design_request(user_text, operation_type, has_image_attachment, has_existing_design_ast,
+                                 existing_design_ast)
     if design is not None:
         return design
 

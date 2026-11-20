@@ -1774,6 +1774,14 @@ AGENT_CONFIGS = {
         "use_advanced": True,
         "temperature": 0.0,
     },
+    "design_text_editor": {
+        "name": "Design Text Editor",
+        "role": "Change only the wording of a design's text items",
+        "instructions": ["Return only the JSON this stage asks for."],
+        "use_tools": False,
+        "use_advanced": True,
+        "temperature": 0.2,
+    },
     "document_analyst": {
         "name": "Document Analyst",
         "role": "Analyze read-only source evidence without changing the document",
@@ -1939,7 +1947,7 @@ def _image_tool_available(model_provider, api_key, is_byok, image_ctx) -> bool:
 
 def _effective_plan(plan, agent_type, model_provider, api_key, is_byok, image_ctx):
     """The plan only applies to the free-form agents, and images are dropped from it if none can be made."""
-    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor", "document_editor", "document_analyst", "key_point_highlighter"):
+    if plan is None or agent_type not in ("smart_global", "code_writer", "blog_writer", "longform_refiner", "chart_extractor", "document_editor", "document_analyst", "key_point_highlighter", "design_text_editor"):
         return None
     if plan.image_count > 0 and not _image_tool_available(model_provider, api_key, is_byok, image_ctx):
         from dataclasses import replace
@@ -2042,7 +2050,7 @@ def create_agent(
         "instructions": instructions,
         # The blog writer returns JSON (outline) or exactly the Markdown its prompt describes, and the long-form refiner
         # returns the passage it was given, polished; agno's "use markdown" nudge would only fight those prompts.
-        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor", "document_editor", "document_analyst", "key_point_highlighter"),
+        "markdown": agent_type not in ("blog_writer", "longform_refiner", "chart_extractor", "document_editor", "document_analyst", "key_point_highlighter", "design_text_editor"),
         # Server-side service: disable agno's anonymous usage telemetry so we
         # don't make an outbound call on every agent run.
         "telemetry": False,
@@ -2521,7 +2529,8 @@ def process_user_query_stream(
         smart_plan = RequestPlan(execution_mode='document_context', advanced_model=True)
     elif force_agent_type in (None, FREE_FORM_AGENT):
         from src.request_plan import plan_smart_request
-        smart_plan = plan_smart_request(query, operation_type, bool(image_urls), bool(existing_design_ast))
+        smart_plan = plan_smart_request(query, operation_type, bool(image_urls), bool(existing_design_ast),
+                                        existing_design_ast)
     design_mode = smart_plan is not None and smart_plan.execution_mode == "design_canvas"
 
     # Regex image routing (general chat only)
@@ -2877,6 +2886,10 @@ def process_user_query_stream(
                         check_cancelled(cancel_event)
                         logger.warning(f"{log_prefix}Design canvas runner attempt failed on {cand.provider}: {err}")
                         _design_failure_kind(cand.provider, design_model_id(cand.provider, cand.provider), err, is_byok)
+                        if _DESIGN_TRUNCATED in str(err):
+                            # Every provider has the same output cap: the next one would spend as long and be cut off too
+                            # (2026-11-20: a rename of one word on a 43 KB design ran for minutes this way).
+                            raise
                         last_err = err
                         continue
                 if last_err:
@@ -2886,7 +2899,7 @@ def process_user_query_stream(
         runner = _DesignCanvasRunner()
         harness_report: dict = {}
 
-        async def _harness_unless_aborted(user_query=query, mode=sub_mode):
+        async def _harness_unless_aborted(user_query=query, mode=sub_mode, existing=None):
             # The stream yields nothing until the design is ready, so the API's per-chunk abort check cannot see an
             # abort here: watch the event and cancel the harness, which then makes no further model calls.
             harness = asyncio.ensure_future(execute_design_canvas_harness(
@@ -2895,7 +2908,7 @@ def process_user_query_stream(
                 sub_mode=mode,
                 reference_image_bytes=reference_image_bytes,
                 measure_image_bytes=measure_image_bytes,
-                existing_ast_json=existing_ast_str,
+                existing_ast_json=existing if existing is not None else existing_ast_str,
                 report=harness_report,
                 schema_version=schema_version,
             ))
@@ -2927,6 +2940,38 @@ def process_user_query_stream(
             raw_fill = fill_ast.model_dump()
             targets, fill_summary = design_images.fill_targets(raw_fill, query, settings.design_max_fill_images)
             fill_warnings = []
+            prompt_failed = False
+            if targets and design_images.needs_prompt_rewrite(query):
+                # The request says what the new photos should show ("replace this image with a pizza", "brighter"):
+                # their prompts are rewritten from it first, or the old prompt would draw the old subject again.
+                t0_prompts = _time.perf_counter()
+                rewritten = None
+                try:
+                    photo_llm = _design_text_llm(list(candidates)[:1], key_resolver if routed else (lambda _provider: api_key),
+                                                 is_byok, user_id, request_id, cancel_event)
+                    rewritten = design_images.rewrite_photo_prompts(raw_fill, targets, query, photo_llm)
+                except ProviderCancelled:
+                    trace_mark(request_id, 'design_canvas_aborted')
+                    return
+                except Exception as prompt_exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        trace_mark(request_id, 'design_canvas_aborted')
+                        return
+                    logger.warning(f"{log_prefix}Design photo prompts failed ({type(prompt_exc).__name__}: {str(prompt_exc)[:160]})")
+                fill_summary["prompts_rewritten"] = rewritten is not None
+                fill_summary["prompt_seconds"] = round(_time.perf_counter() - t0_prompts, 2)
+                if rewritten is None:
+                    # Drawing the old prompts would charge for photos of the old subject: make none and say so.
+                    prompt_failed = True
+                    fill_warnings.append({"kind": "photo_prompt_failed", "detail": (
+                        "The new photo could not be described from your request, so no photo was made. Please try "
+                        "again, or say what the photo should show.")})
+                    targets = []
+                else:
+                    for node in targets:
+                        node["prompt"] = rewritten[node["id"]]["prompt"]
+                        if rewritten[node["id"]]["alt"]:
+                            node["alt"] = rewritten[node["id"]]["alt"]
             image_provider = _dc_candidate.provider
             image_key = key_resolver(image_provider) if routed else api_key
             image_budget = ToolBudget(len(targets), "image")
@@ -2953,7 +2998,7 @@ def process_user_query_stream(
                 fill_warnings.append({"kind": "image_limit", "detail": (
                     f"{fill_summary['over_cap']} more photo slot(s) were left empty: at most "
                     f"{settings.design_max_fill_images} photos are made per request. Ask again to fill the rest.")})
-            if not targets:
+            if not targets and not prompt_failed:
                 fill_warnings.append({"kind": "no_image_slots", "detail": (
                     "This design has no empty photo slots." if fill_summary["slots"] else
                     "This design has no photo slots to fill.")})
@@ -2977,8 +3022,46 @@ def process_user_query_stream(
             return
 
         t0_design = _time.perf_counter()
+        edit_path = None
         try:
-            design_ast = asyncio.run(_harness_unless_aborted())
+            design_ast = None
+            if sub_mode == 'edit_existing_ast' and existing_ast_str and settings.design_text_edit_enabled:
+                # Wording-only edits ("make this shorter", "change the name to Pizza") patch the design's text in code
+                # from one small call; anything else (or any doubt) runs the full edit below, as before.
+                edit_path = 'full'
+                design_ast = _design_text_edit(existing_ast_str, query, candidates, key_resolver if routed else (lambda _provider: api_key),
+                                               is_byok, user_id, request_id, cancel_event, schema_version, runner, harness_report)
+                if design_ast is not None:
+                    edit_path = 'text_only'
+            if design_ast is None and edit_path == 'full' and settings.design_section_edit_enabled:
+                # A style or layout change of the selected section: the model edits that section alone and it is spliced
+                # back (src/design_canvas/section_edit.py). Anything that does not hold runs the full edit below.
+                from .design_canvas.section_edit import prepare_section_edit, section_query, splice_section
+                section = prepare_section_edit(existing_ast_str, query, schema_version=schema_version,
+                                               max_fraction=settings.design_section_edit_max_fraction)
+                if section is not None:
+                    t0_section = _time.perf_counter()
+                    try:
+                        edited_section = asyncio.run(_harness_unless_aborted(section_query(section), 'edit_existing_ast',
+                                                                             section.section_json))
+                        design_ast = splice_section(section, edited_section)
+                        outcome = 'applied' if design_ast is not None else 'did_not_fit'
+                    except (asyncio.CancelledError, ProviderCancelled):
+                        raise
+                    except Exception as section_exc:
+                        check_cancelled(cancel_event)
+                        logger.warning(f"{log_prefix}Design section edit failed ({type(section_exc).__name__}: "
+                                       f"{str(section_exc)[:160]}); running the full edit")
+                        outcome = 'error'
+                    trace_set(request_id, design_section_edit={
+                        "outcome": outcome, "scope": section.selected_id, "section_bytes": len(section.section_json),
+                        "seconds": round(_time.perf_counter() - t0_section, 2)})
+                    if design_ast is not None:
+                        edit_path = 'section'
+                    else:
+                        logger.info(f"{log_prefix}Design section edit not used ({outcome}); running the full edit")
+            if design_ast is None:
+                design_ast = asyncio.run(_harness_unless_aborted())
         except (asyncio.CancelledError, ProviderCancelled):
             logger.info(f"{log_prefix}Design canvas stopped by client abort after {_time.perf_counter() - t0_design:.2f}s")
             trace_mark(request_id, 'design_canvas_aborted')
@@ -2990,7 +3073,7 @@ def process_user_query_stream(
         elapsed = round(_time.perf_counter() - t0_design, 3)
         attempts = harness_report.get("attempts", [])
         trace_set(request_id, design_elapsed_seconds=elapsed, design_attempts=attempts,
-                  design_auto_healed=harness_report.get("auto_healed", False))
+                  design_auto_healed=harness_report.get("auto_healed", False), design_edit_path=edit_path)
         trace_mark(request_id, 'design_canvas_done')
         from .observability import get_trace
         _trace = get_trace(request_id)
@@ -3022,6 +3105,7 @@ def process_user_query_stream(
             "total_tokens": total_tokens, "elapsed_seconds": elapsed, "mode": "design_canvas",
             "warnings": link_warnings + fidelity_warnings,
             "attempts": len(attempts), "auto_healed": harness_report.get("auto_healed", False),
+            **({"edit_path": edit_path} if edit_path else {}),
         }}}
         return
 
@@ -3573,6 +3657,7 @@ def _get_cached_gemini_client(api_key: str, *, timeout=MODEL_CALL_TIMEOUT_SECOND
 
 
 _DESIGN_MAX_OUTPUT_TOKENS = 8192
+_DESIGN_TRUNCATED = "Design output truncated"    # the start of every truncation error _run_design_json_completion raises
 _DESIGN_IMAGE_FORMATS = ("PNG", "JPEG", "WEBP")   # accepted as-is by Claude, OpenAI and Gemini alike
 _DESIGN_ABORT_POLL_SECONDS = 0.1
 MAX_DESIGN_IMAGE_DIMENSION = 1500
@@ -3645,6 +3730,60 @@ def _design_measure_image(image_bytes: bytes) -> Optional[bytes]:
             return out.getvalue()
     except Exception:
         return None
+
+
+def _design_text_llm(candidates, key_for, is_byok, user_id, request_id, cancel_event):
+    """The model call of the design text lane: the design route's providers, with the usual fallback and usage records."""
+    from config import settings
+    from src.longform.llm import AgnoLLM
+    return AgnoLLM(candidates, key_for, is_byok=is_byok, user_id=user_id, request_id=request_id,
+                   agent_type="design_text_editor", timeout=float(settings.design_text_edit_timeout_seconds),
+                   cancel_event=cancel_event)
+
+
+def _design_text_edit(existing_ast_str, query, candidates, key_for, is_byok, user_id, request_id, cancel_event,
+                      schema_version, runner, harness_report):
+    """
+    The edited design from the text lane (src/design_canvas/text_edit.py), or None to run the full edit path.
+    Fills harness_report and runner.used the way the harness would, so the events and billing that follow are the same.
+    Cancellation propagates; any other failure is logged and falls back.
+    """
+    import time as _time
+    from src.design_canvas.text_edit import split_selection, try_text_edit, wants_text_lane
+
+    log_prefix = f"[{request_id}] " if request_id else ""
+    instruction, selected_id = split_selection(query)
+    if not wants_text_lane(instruction, selected_id is not None):
+        trace_set(request_id, design_text_edit={"outcome": "not_eligible", "seconds": 0.0})
+        return None
+    started = _time.perf_counter()
+    # The first provider only: a provider that fails here goes to the full edit, which has its own fallback chain.
+    llm = _design_text_llm(list(candidates)[:1], key_for, is_byok, user_id, request_id, cancel_event)
+    try:
+        result = try_text_edit(existing_ast_str, query, llm, schema_version=schema_version)
+    except ProviderCancelled:
+        raise
+    except Exception as exc:
+        check_cancelled(cancel_event)
+        logger.warning(f"{log_prefix}Design text edit failed ({type(exc).__name__}: {str(exc)[:160]}); running the full edit")
+        trace_set(request_id, design_text_edit={"outcome": "error", "error": type(exc).__name__,
+                                                "seconds": round(_time.perf_counter() - started, 2)})
+        return None
+    seconds = round(_time.perf_counter() - started, 2)
+    if result is None:
+        outcome = "declined" if llm.used else "not_eligible"
+        trace_set(request_id, design_text_edit={"outcome": outcome, "seconds": seconds})
+        if llm.used:
+            logger.info(f"{log_prefix}Design text edit declined after {seconds:.2f}s; running the full edit")
+        return None
+    logger.info(f"{log_prefix}Design text edit: {len(result.changed_ids)} item(s) changed in {seconds:.2f}s "
+                f"(scope={result.scope_id or 'design'})")
+    trace_set(request_id, design_text_edit={"outcome": "applied", "seconds": seconds, "changed": result.changed_ids,
+                                            "scope": result.scope_id})
+    harness_report.update(attempts=[{"attempt": 0, "outcome": "text_edit", "errors": []}], auto_healed=False)
+    if llm.used:
+        runner.used = llm.used
+    return result.ast
 
 
 def _run_design_json_completion(

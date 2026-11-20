@@ -26,6 +26,7 @@ from src.design_canvas.schema_v11 import DesignDocumentASTV11, Version, downgrad
 from src.design_canvas.reference import ReferenceSpec, check_fidelity, description_coverage, heal_reference_details
 from src.design_canvas.typography_match import match_typography
 from src.design_canvas.validate import auto_heal_design_ast, validate_design_ast
+from src.design_canvas.patch import compact_design_json
 from src.design_canvas.prompts import (
     DESIGN_SYSTEM_PROMPT,
     DESIGN_SYSTEM_PROMPT_V11,
@@ -245,7 +246,7 @@ async def execute_design_canvas_harness(
                 user_query=user_query,
                 sub_mode=sub_mode,
                 vision_meta=vision_meta,
-                existing_ast_json=existing_ast_json,
+                existing_ast_json=compact_design_json(existing_ast_json) if existing_ast_json else None,
                 reference_spec=spec,
                 schema_version=version,
                 measured_typography=measured_prompt,

@@ -144,6 +144,15 @@ _PHOTO_FILL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "change this image to a pizza", "make the photos brighter": a new photo for a slot, drawn by the image flow.
+_PHOTO_CHANGE_RE = re.compile(
+    r"\b(?:change|edit|update|modify|turn|alter|adjust|tweak|fix|improve|enhance|brighten|darken|lighten|recolou?r)\b"
+    r"[^.?!]{0,60}?\b(?:photos?|images?|pictures?|pics|photographs?|imagery)\b"
+    r"|\b(?:photos?|images?|pictures?|pics|photographs?)\b[^.?!]{0,40}?\b(?:brighter|darker|lighter|warmer|cooler"
+    r"|sharper|more\s+\w+|less\s+\w+)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class DesignIntentDecision:
@@ -160,6 +169,7 @@ def detect_design_intent(
     operation_type: str = "general",
     has_image_attachment: bool = False,
     has_existing_design_ast: bool = False,
+    existing_design_ast=None,
 ) -> DesignIntentDecision:
     """
     Deterministic, zero-LLM intent classifier for Mode 8 Editable UI Design.
@@ -179,6 +189,9 @@ def detect_design_intent(
         has_image_attachment:   True when the request includes an attached image.
         has_existing_design_ast: True when the request body includes an existing
                                  DesignDocumentAST for iterative editing.
+        existing_design_ast:    That design itself (dict or JSON), when the caller has it: a selected photo
+                                 ("make it a pizza") is then a photo request, and a selected section without photos
+                                 is not ("add a photo here" adds a slot: a layout edit).
 
     Returns:
         DesignIntentDecision (frozen dataclass).
@@ -189,8 +202,18 @@ def detect_design_intent(
     # Rule F: a selected design + a request for photos. Checked before every edit rule: "add real photos" would
     # otherwise be a layout edit. Questions ("can you add photos?") are answered as chat like other questions.
     # ------------------------------------------------------------------
-    if has_existing_design_ast and _PHOTO_FILL_RE.search(clean_q) and not _QUESTION_RE.search(clean_q):
-        return DesignIntentDecision(True, "fill_design_images", "design_photo_fill_wording")
+    if has_existing_design_ast and not _QUESTION_RE.search(clean_q):
+        from src.design_canvas.images import is_photo_layout_wording, selected_photo_scope
+        from src.design_canvas.text_edit import split_selection
+        instruction, _ = split_selection(clean_q)
+        _, holds = selected_photo_scope(existing_design_ast, clean_q) if existing_design_ast is not None else (None, None)
+        # Size, crop, corners or position of a photo ("make the image bigger") is a layout edit, and so is a photo
+        # request on a selected section that has no photo slot ("add a photo here" adds one).
+        if not is_photo_layout_wording(instruction) and holds != "no_images":
+            if _PHOTO_FILL_RE.search(instruction) or _PHOTO_CHANGE_RE.search(instruction):
+                return DesignIntentDecision(True, "fill_design_images", "design_photo_fill_wording")
+            if holds == "image":
+                return DesignIntentDecision(True, "fill_design_images", "design_selected_photo")
 
     # ------------------------------------------------------------------
     # Rule 0: Explicit operation override or active AST selection in the editor

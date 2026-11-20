@@ -1450,7 +1450,8 @@ async def stream_text(
         if document_text is None and prepared_context is None and agent_for_request_type(agent_type) == FREE_FORM_AGENT:
             from src.request_plan import plan_design_request
             design_plan = plan_design_request(
-                request_data.query, agent_type, bool(image_urls), bool(request_data.existing_design_ast))
+                request_data.query, agent_type, bool(image_urls), bool(request_data.existing_design_ast),
+                request_data.existing_design_ast)
         design_price_scaled = 0
         if design_plan:
             from src.design_canvas.images import has_image_slots

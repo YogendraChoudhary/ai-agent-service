@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     # ImageNode and applies image_ready by placeholder_id.
     design_image_fill_enabled: bool = Field(True, alias="DESIGN_IMAGE_FILL_ENABLED")
     design_max_fill_images: int = Field(12, ge=1, le=24, alias="DESIGN_MAX_FILL_IMAGES")
+    # Wording-only edits of a design ("make this shorter", "change the name to Pizza"; src/design_canvas/text_edit.py)
+    # send only the selected section's text and patch the answer into the design: seconds instead of a full rewrite.
+    # The model may decline (a colour or layout change) and the full edit path runs as before.
+    design_text_edit_enabled: bool = Field(True, alias="DESIGN_TEXT_EDIT_ENABLED")
+    design_text_edit_timeout_seconds: int = Field(20, ge=5, le=120, alias="DESIGN_TEXT_EDIT_TIMEOUT_SECONDS")
+    # Style or layout edits of a selected section (src/design_canvas/section_edit.py): the model edits that section alone and
+    # it is spliced back, instead of rewriting the whole design. Skipped when the section is over this share of the design.
+    design_section_edit_enabled: bool = Field(True, alias="DESIGN_SECTION_EDIT_ENABLED")
+    design_section_edit_max_fraction: float = Field(0.6, ge=0.1, le=1.0, alias="DESIGN_SECTION_EDIT_MAX_FRACTION")
     # How hard Claude's advanced tier (claude-opus-5-5) thinks: low | medium | high | xhigh | max. Thinking cannot be switched off on
     # this model and is billed as output, so this is the speed/cost/quality dial. "low" measured as good as "medium" on writing, design
     # canvas and code, and faster and cheaper (docs/MODEL_UPGRADE_BENCHMARK.md, section 12). The model's own default would be medium.

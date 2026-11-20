@@ -88,3 +88,42 @@ def _splice_in_dict(node: Any, target_id: str, replacement: dict) -> bool:
             if _splice_in_dict(child, target_id, replacement):
                 return True
     return False
+
+
+def compact_design_json(design_json: str) -> str:
+    """
+    The design without the fields that only repeat their default value, for the edit prompt. The editor sends every field
+    back (a saved 43 KB burger design held 631 nulls); the model was asked to copy all of them, which pushed a full edit
+    past the 8,192-token output cap. Unset fields mean their defaults, so the compact form validates to the same design;
+    that is checked, and the input is returned unchanged when it does not hold (or does not parse).
+    """
+    from src.design_canvas.schema_v11 import DesignDocumentASTV11
+
+    try:
+        raw = json.loads(design_json)
+        model = DesignDocumentASTV11 if isinstance(raw, dict) and raw.get("version") == "1.1" else DesignDocumentAST
+        design = model.model_validate(raw)
+        full = design.model_dump(mode="json")
+        compact = design.model_dump(mode="json", exclude_defaults=True)
+        compact = {"block_type": full["block_type"], "version": full["version"], **compact}
+        _keep_node_types(full["root"], compact["root"])
+        if model.model_validate(compact) != design:
+            return design_json
+        return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return design_json
+
+
+def _keep_node_types(full: Any, compact: Any) -> None:
+    """node_type has a default, but it is the union's discriminator: every node keeps it."""
+    if isinstance(full, dict) and isinstance(compact, dict):
+        if "node_type" in full and "node_type" not in compact:
+            items = list(compact.items())
+            compact.clear()
+            compact.update([("node_type", full["node_type"])] + items)
+        for key, value in compact.items():
+            if key in full:
+                _keep_node_types(full[key], value)
+    elif isinstance(full, list) and isinstance(compact, list):
+        for full_item, compact_item in zip(full, compact):
+            _keep_node_types(full_item, compact_item)

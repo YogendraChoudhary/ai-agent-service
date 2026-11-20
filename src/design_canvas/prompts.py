@@ -225,6 +225,8 @@ def build_initial_design_prompt(
             "Preserve all sibling node `id` values that are not being changed.\n"
             "Keep every field of unchanged nodes exactly as given, including button `href` and grid `columns`, "
             "unless the user asks to change them.\n"
+            "Fields left out of existing_design_ast have their default values; leave them out of your answer too "
+            "unless you change them.\n"
         )
     elif sub_mode == "create_from_vision":
         adapt = reference_use == "adapt"
