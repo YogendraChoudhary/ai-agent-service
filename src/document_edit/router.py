@@ -3,8 +3,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import Field, field_validator
 
 from .blocks import document_blocks, fingerprint
-from .schema import DocumentPatch, StrictModel
-from .service import apply_document_patches
+from .schema import DocumentInsertion, DocumentPatch, StrictModel
+from .service import apply_document_edits
 
 router = APIRouter(prefix="/agent/documents", tags=["Document edits"])
 
@@ -13,6 +13,9 @@ class ApplyRequest(StrictModel):
     document_text: str = Field(min_length=1, max_length=100_000)
     base_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     patches: list[DocumentPatch] = Field(max_length=12)
+    # Photos proposed with an Edit (additive): each one image line at the end of the block it names. The markdown may carry
+    # the placeholder or, once image_ready arrived, the photo's CDN URL.
+    insertions: list[DocumentInsertion] = Field(default_factory=list, max_length=8)
 
     @field_validator("document_text")
     @classmethod
@@ -24,7 +27,7 @@ class ApplyRequest(StrictModel):
 @router.post("/apply")
 def apply(request: ApplyRequest):
     try:
-        result = apply_document_patches(request.document_text, request.base_sha256, request.patches)
+        result = apply_document_edits(request.document_text, request.base_sha256, request.patches, request.insertions)
     except ValueError as error:
         raise HTTPException(status_code=409 if fingerprint(request.document_text) != request.base_sha256 else 400,
                             detail=str(error)) from error

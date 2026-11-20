@@ -38,6 +38,18 @@ class DocumentPatch(StrictModel):
     reason: str = Field(min_length=1, max_length=300)
 
 
+class DocumentInsertion(StrictModel):
+    """A new block proposed beside the patches: today only a photo, one Markdown image line after a block (photos.py)."""
+    kind: Literal["image"] = "image"
+    after_block_id: str = Field(pattern=r"^b[0-9]+_[a-f0-9]{12}$")
+    at_utf16: int = Field(ge=0, le=200_000)          # the end of that block in the source
+    markdown: str = Field(min_length=6, max_length=2_300)
+    placeholder_id: str = Field(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    alt: str = Field(min_length=1, max_length=120)
+    prompt: str = Field(min_length=1, max_length=700)
+    reason: str = Field(min_length=1, max_length=300)
+
+
 class DocumentEditResult(StrictModel):
     status: Literal["proposed", "needs_clarification", "no_change", "failed"]
     base_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -45,3 +57,4 @@ class DocumentEditResult(StrictModel):
     message: str = Field(min_length=1, max_length=500)
     targets: list[Target] = Field(default_factory=list, max_length=12)
     patches: list[DocumentPatch] = Field(default_factory=list, max_length=12)
+    insertions: list[DocumentInsertion] = Field(default_factory=list, max_length=8)

@@ -256,7 +256,8 @@ no `design_ready`. Call `/agent/abort` *and* abort the fetch.
   pieces at the start and end.
 * Charts stay a ```` ```mermaid xychart-beta ```` block, as today.
 * A prompt that refers to a document that was not sent ("rewrite this", "continue my draft", "summarise the document",
-  "fix the grammar in this paragraph") is not answered. The stream sends one named event, no `content`, then `done`;
+  "fix the grammar in this paragraph", and since 2026-11-20 "make it more appealing", "add some photos to it", "make the blog more
+  fun") is not answered. The stream sends one named event, no `content`, then `done`;
   no model runs and nothing is charged. `/agent/process` returns it as `needs_context` with an empty `markdown_response`.
 
 ```text
@@ -319,6 +320,33 @@ proposed as ordinary patches instead of "use Draft". A named detail without a va
 ("make the title shorter", "rename the Contact heading", "shorten the quote"); their patches have the same shape as paragraph patches
 (`before`/`after` are the whole block, a quote including its `>` markers). New blocks ("add a FAQ below Pricing") still return the
 "use Draft" message. `/agent/documents/apply` accepts these patches; nothing to change in how you call it.
+
+**Edit with photos (new, 2026-11-20).** "Make it more appealing to the users, add some photos" on an open document now proposes the
+text changes **and** photos placed after the paragraphs they illustrate, each described from that part of the document (live on a
+"Truth or Dare with parents" blog: 8 rewritten paragraphs and 3 family game-night photos in ~11 s). Before, this request could only run
+in Write, which never sees the document, and came back as a generic page with unrelated photos.
+
+* **Send the document when nothing is selected.** Use `document_context` with `document_action: "auto"` (or `"edit"`). Auto picks Edit for
+  photo requests on an open document (`document_action_resolved.reason: "document_photos"`). Sent as plain Write, such prompts now get
+  `needs_context` (2.7) instead of a blind answer.
+* `document_edit_ready` has a new additive field, **`insertions`** (empty for every other edit):
+
+  ```json
+  {"kind": "image", "after_block_id": "b4_54df076dd4f1", "at_utf16": 512,
+   "markdown": "\n![Parents and children laugh together during a game night.](placeholder::529080e4-a34d-42e4-a35c-17d3f006d653)\n",
+   "placeholder_id": "529080e4-a34d-42e4-a35c-17d3f006d653", "alt": "Parents and children laugh…", "prompt": "…", "reason": "…"}
+  ```
+
+  `markdown` goes in at `at_utf16` (the end of that block in the document you sent). The snapshot already contains it. Show each photo
+  in the review like a patch; the user may keep or drop it.
+* Photos stream exactly as in Write: after `done` (`pending_images` > 0), one `image_ready` (`placeholder_id`, `url`, size) or
+  `image_failed` per photo. Replace `placeholder::<id>` with `url`; drop the insertion on `image_failed`.
+* `/agent/documents/apply` takes an optional `insertions` list next to `patches`. Each must be one image line at the end of a paragraph
+  or list, with the placeholder or the photo's CDN URL; anything else is a 400. `/agent/process` waits for the photos and returns
+  `insertions` and the snapshot with URLs already in (a photo that failed is left out).
+* Billing: the text part is billed as an Edit; each photo as an image (reserved per photo). At most 4 photos per request
+  (`DOCUMENT_EDIT_MAX_PHOTOS`); the message says so when more were asked for. A vague "make it more appealing" is applied to the
+  opening paragraph and the first paragraph of each section; the message says what was changed.
 
 ---
 
@@ -540,6 +568,20 @@ start → init → [silent while the model works: 9.5–47 s observed] → desig
 * Billing, platform keys only: reserved up front (**3.0 credits** for a new design, **0.5** for an edit; 402
   `INSUFFICIENT_CREDITS` if short), charged only when `design_ready` is delivered, released on error. BYOK users are not charged.
   Show the cost before the user submits if the product wants that.
+
+#### Edits of a selected section (2026-11-20)
+
+The editor's selection sentence ("(Apply this to the selected section, id header. Keep everything else unchanged.)") is now used by the
+backend; no frontend change is needed. `complete.edit_path` (additive) says which path ran:
+
+| `edit_path` | When | Live |
+|---|---|---|
+| `text_only` | wording only ("change the name to Pizza", "make this shorter", "translate"): only the section's text changes | 1.2–1.8 s |
+| `section` | style or layout of the selection ("make the heading green", "add a button below"): only that section is sent and spliced back | 3.8–5.7 s |
+| `full` | nothing selected, or the selection is most of the design: the whole design is rewritten, as before (now sent compact) | ~45 s |
+
+A selected photo ("replace this image with a pizza", "make this photo brighter") goes to photo fill and redraws **only** that photo,
+from a description rewritten from the user's words. Size, crop, corners or position of a photo stay layout edits.
 
 ### 4.3 Endpoint parity
 

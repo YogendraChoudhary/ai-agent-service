@@ -17,7 +17,7 @@ from src.document_intent import (asks_for_new_facts, asks_for_small_addition, as
                                  has_work_beyond_small_addition)
 from .blocks import DocumentBlock, allowed_targets, document_blocks, fingerprint, requote, unquote, utf16_length
 from .in_place import InPlace, in_place_request, safe_replacement
-from .schema import DocumentEditResult, DocumentPatch, EditPlan, Target
+from .schema import DocumentEditResult, DocumentInsertion, DocumentPatch, EditPlan, Target
 
 INSERT_MESSAGE = "Edit only rewrites existing text; use Draft to add new content."
 NO_CHANGE_MESSAGE = ("No changes were proposed: the text may already fit, or the request needs new material, which "
@@ -296,6 +296,48 @@ def apply_document_patches(source: str, base_sha256: str, patches: list[Document
     return "".join(result)
 
 
+def apply_document_edits(source: str, base_sha256: str, patches: list[DocumentPatch],
+                         insertions: list[DocumentInsertion] = ()) -> str:
+    """
+    The patches (verified as before) and the inserted blocks together. An insertion must sit exactly at the end of the block it
+    names and hold one image line (photos.valid_insertion_markdown); nothing else can be inserted.
+    """
+    from .photos import valid_insertion_markdown
+
+    patched = apply_document_patches(source, base_sha256, list(patches))
+    if not insertions:
+        return patched
+    blocks = {b.id: b for b in document_blocks(source)}
+    if len({i.after_block_id for i in insertions}) != len(insertions):
+        raise ValueError("Duplicate insertion target")
+    edits = []
+    for patch in patches:
+        block = blocks[patch.block_id]
+        start = block.start + source_index(block.text, patch.start_utf16 - utf16_length(source[:block.start]))
+        end = block.start + source_index(block.text, patch.end_utf16 - utf16_length(source[:block.start]))
+        edits.append((start, end, patch.after))
+    for insertion in insertions:
+        block = blocks.get(insertion.after_block_id)
+        if block is None or block.kind not in ("paragraph", "list") or insertion.at_utf16 != utf16_length(source[:block.end]):
+            raise ValueError("Insertion does not match the end of a paragraph or list in the source")
+        if not valid_insertion_markdown(insertion.markdown) or "\x00" in insertion.markdown:
+            raise ValueError("Insertion must be one image line")
+        edits.append((block.end, block.end, insertion.markdown))
+    result, at = [], 0
+    for start, end, text in sorted(edits, key=lambda e: (e[0], e[1])):
+        if start < at:
+            raise ValueError("Edits overlap")
+        result.extend([source[at:start], text])
+        at = end
+    result.append(source[at:])
+    result = "".join(result)
+    # Each insertion must stand as its own image block, not run into the text around it.
+    images = lambda text: sum(1 for b in document_blocks(text) if b.kind == "image")
+    if images(result) != images(patched) + len(insertions):
+        raise ValueError("Insertion must be one image line")
+    return result
+
+
 def _edit_in_place(source, instruction, llm, blocks, request: InPlace, selection, base, unchanged, cancel_event):
     start, end = 0, len(source)
     if selection is not None:
@@ -366,12 +408,113 @@ def _edit_in_place(source, instruction, llm, blocks, request: InPlace, selection
 
 
 def edit_document(source: str, instruction: str, llm: LLM, *, cancel_event=None, match_style=False,
-                  selection: ContextRange | None = None) -> tuple[str, DocumentEditResult]:
-    text, result = _edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style, selection=selection)
-    return text, _readable_result(result, document_blocks(source))
+                  selection: ContextRange | None = None, photo_tool=None,
+                  max_photos: int = 0) -> tuple[str, DocumentEditResult]:
+    """
+    photo_tool(prompt) starts one photo in the image flow and returns its placeholder id (or None); with it, a request that asks for
+    photos ("make it more appealing and add some photos") also gets photos placed through the document (photos.py).
+    """
+    from .photos import photo_request
+    blocks = document_blocks(source)
+    has_selection = selection is not None and selection.start_utf16 < selection.end_utf16
+    photos = (photo_request(instruction, blocks, max_photos)
+              if photo_tool is not None and not has_selection and len(instruction) <= 2000 else None)
+    if photos is not None:
+        text, result = _edit_with_photos(source, instruction, photos, llm, photo_tool, blocks,
+                                         cancel_event=cancel_event, match_style=match_style)
+    else:
+        text, result = _edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style,
+                                      selection=selection)
+    return text, _readable_result(result, blocks)
 
 
-def _edit_document(source, instruction, llm, *, cancel_event=None, match_style=False, selection=None):
+def _edit_with_photos(source, instruction, photos, llm, photo_tool, blocks, *, cancel_event=None, match_style=False):
+    """
+    The text part of the request through the normal Edit (in parallel), and the photos placed and started. Either may come back
+    empty: the proposal then has the other, and says what is missing. Nothing at all: the reason, unchanged document.
+    """
+    import contextvars
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+    from src.provider_work import ProviderCancelled
+    from .photos import PHOTO_STYLE, insertion_for, plan_photos
+
+    base = fingerprint(source)
+    text_result = None
+    with ThreadPoolExecutor(1) as pool:
+        future = None
+        if photos.text_instruction:
+            ctx = contextvars.copy_context()
+            future = pool.submit(ctx.run, _edit_document, source, photos.text_instruction, llm,
+                                 cancel_event=cancel_event, match_style=match_style, parallel=True)
+        try:
+            spots = plan_photos(instruction, blocks, photos.count, llm)
+        except (EditCancelled, ProviderCancelled):
+            raise
+        except Exception as error:          # the text part may still be proposed
+            _check_cancel(cancel_event)
+            logging.getLogger(__name__).warning("Document photo planning failed (%s)", type(error).__name__)
+            spots = []
+        _check_cancel(cancel_event)
+        insertions = []
+        for spot in spots:
+            placeholder = photo_tool(f"{spot.prompt.rstrip(' .')}. {PHOTO_STYLE}")
+            if not placeholder:
+                continue
+            at, markdown = insertion_for(source, spot.block, spot.alt, placeholder)
+            insertions.append(DocumentInsertion(after_block_id=spot.block.id, at_utf16=at, markdown=markdown,
+                                                placeholder_id=placeholder, alt=spot.alt, prompt=spot.prompt,
+                                                reason="A photo that illustrates this part of the document."))
+        if future is not None:
+            try:
+                _, text_result = future.result()
+            except (EditCancelled, ProviderCancelled):
+                raise
+            except Exception as error:      # the photos may still be proposed
+                _check_cancel(cancel_event)
+                logging.getLogger(__name__).warning("Document text edit beside photos failed (%s)", type(error).__name__)
+                text_result = DocumentEditResult(status="failed", base_sha256=base, result_sha256=base,
+                                                 message="The wording could not be changed safely.")
+    _check_cancel(cancel_event)
+    proposed_text = text_result is not None and text_result.status == "proposed"
+    patches = list(text_result.patches) if proposed_text else []
+    targets = list(text_result.targets) if proposed_text else []
+    if not insertions and not patches:
+        message = "No photos could be added to this document."
+        if text_result is not None and text_result.message:
+            message = f"{message} {text_result.message}"
+        return source, DocumentEditResult(status="failed" if spots else "no_change", base_sha256=base, result_sha256=base,
+                                          message=message[:500])
+    try:
+        result = apply_document_edits(source, base, patches, insertions)
+    except ValueError:
+        # Photos already started (and reserved credits): never drop them for a text patch that does not fit with them.
+        if not insertions:
+            return source, DocumentEditResult(status="failed", base_sha256=base, result_sha256=base,
+                                              message="The proposed changes did not fit the document. No edits were applied.")
+        result, patches, targets, proposed_text = apply_document_edits(source, base, [], insertions), [], [], False
+        text_result = DocumentEditResult(status="failed", base_sha256=base, result_sha256=base,
+                                         message="The rewritten text did not fit beside the photos.")
+    parts = []
+    if proposed_text:
+        parts.append(text_result.message.rstrip(".") + ".")
+    if insertions:
+        made = len(insertions)
+        parts.append(f"Added {made} photo{'s' if made != 1 else ''} that illustrate{'s' if made == 1 else ''} the document; "
+                     "each appears when it is ready.")
+        if photos.requested > made:
+            parts.append(f"{photos.requested} were asked for; at most {photos.count} are added per request." if
+                         photos.requested > photos.count else "")
+    elif spots:
+        parts.append("The photos could not be started.")
+    if photos.text_instruction and not proposed_text and text_result is not None:
+        parts.append(f"The wording was not changed: {text_result.message}")
+    message = " ".join(p for p in parts if p)[:500]
+    return result, DocumentEditResult(status="proposed", base_sha256=base, result_sha256=fingerprint(result),
+                                     message=message, targets=targets, patches=patches, insertions=insertions)
+
+
+def _edit_document(source, instruction, llm, *, cancel_event=None, match_style=False, selection=None, parallel=False):
     base = fingerprint(source)
 
     def unchanged(status, message):
@@ -420,13 +563,15 @@ def _edit_document(source, instruction, llm, *, cancel_event=None, match_style=F
     by_id, patches = {b.id: b for b in blocks}, []
     style_allowed = allowed_targets('Throughout the document; ' + instruction, blocks)[0] if match_style else set()
     target_ids = {t.block_id for t in plan.targets}
-    for target in sorted(plan.targets, key=lambda t: by_id[t.block_id].start):
+
+    def rewrite(target):
+        """(patch or None, failure message or None) for one target block."""
         _check_cancel(cancel_event)
         block = by_id[target.block_id]
         quote = block.kind == "blockquote"
         body, _ = normalise(unquote(block.text)[0] if quote else block.text)
         if collides(body):
-            return unchanged("failed", "A target contains reserved refinement tokens; the document was kept unchanged.")
+            return None, "A target contains reserved refinement tokens; the document was kept unchanged."
         frozen, _ = freeze_blocks(parse(body))
         data = {"USER_INSTRUCTION": instruction,
                      "requested_part": target.request_quote, "section": block.section,
@@ -456,10 +601,33 @@ def _edit_document(source, instruction, llm, *, cancel_event=None, match_style=F
             _check_cancel(cancel_event)
             replacement, issues = _validated_replacement(block, reply, typed_numbers, only_insert)
         if issues:
-            return unchanged("failed", "A replacement changed protected content or structure. No edits were applied.")
-        if replacement != block.text:
-            patches.append(DocumentPatch(block_id=block.id, start_utf16=utf16_length(source[:block.start]),
-                           end_utf16=utf16_length(source[:block.end]), before=block.text, after=replacement, reason=target.reason))
+            return None, "A replacement changed protected content or structure. No edits were applied."
+        if replacement == block.text:
+            return None, None
+        return DocumentPatch(block_id=block.id, start_utf16=utf16_length(source[:block.start]),
+                             end_utf16=utf16_length(source[:block.end]), before=block.text, after=replacement,
+                             reason=target.reason), None
+
+    ordered = sorted(plan.targets, key=lambda t: by_id[t.block_id].start)
+    if parallel and len(ordered) > 1:
+        # Each block is its own call: run them together (the photo path, where a whole-document polish otherwise took ~3 s
+        # per paragraph, one after another). The outcome is the same as in order: any failure fails the whole proposal.
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(min(6, len(ordered))) as pool:
+            futures = [pool.submit(contextvars.copy_context().run, rewrite, t) for t in ordered]
+            outcomes = [f.result() for f in futures]
+    else:
+        outcomes = []
+        for target in ordered:
+            outcomes.append(rewrite(target))
+            if outcomes[-1][1]:
+                break
+    for patch, failure in outcomes:
+        if failure:
+            return unchanged("failed", failure)
+        if patch is not None:
+            patches.append(patch)
     if not patches:
         # The rewrite came back identical. That can mean the text already fits, or that the request needs material
         # Edit may not invent (live: "expand the conclusion"); say both rather than claim it already fits.

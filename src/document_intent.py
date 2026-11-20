@@ -234,7 +234,28 @@ _REFERS_TO_DOCUMENT = re.compile(
     r"^(?:add|append|insert|summari[sz]e|rewrite|rephrase|shorten|fix|edit|update|translate|expand|continue|proofread|"
     r"improve|polish|condense|reformat|format|sort|reorder|turn|convert|clean\s+up|tidy|finish|complete|extend)\b"
     r"[^.;!?\n]{0,60}?\bthe\s+(?:\w+\s+)?(?:list|notes|meeting\s+notes|minutes|transcript|text|paragraph|section|table|"
-    r"draft|document|doc|email|letter|essay|article|story|poem|outline|bullets|bullet\s+points|items|slides?)\b",
+    r"draft|document|doc|email|letter|essay|article|story|poem|outline|bullets|bullet\s+points|items|slides?)\b|"
+    # Added 2026-11-20 (live: "Make it more appealing to the users, add some photos and other aspects" with no document
+    # was answered by a generic page and three unrelated photos). "it"/"this" with no text in the prompt is the document.
+    # "Make it more appealing", "make this more engaging" (anchored: "write a story and make it funny" is self-contained).
+    # A prompt that goes on after a sentence break carries its own material ("Make it bullets. First, review Q3. ...").
+    r"^make\s+(?:it|this|that|them|these)\b(?!\s*:)(?![^\n]*[.!?:;]\s+\S)|"
+    # "spice it up", "jazz this up"
+    r"^(?:spice|jazz|liven|spruce|punch|dress|beef|tidy|clean|smarten)\s+(?:it|this|that|them|these)\s+up\b|"
+    # More verbs that only work on existing text: "enhance it", "revise this", "rework that".
+    r"^(?:enhance|refine|revise|rework|redo|reword|restructure|revamp|beautify|modernize|modernise|personali[sz]e|"
+    r"update|reformat|format|restyle|illustrate|lengthen|elaborate\s+on)\s+(?:this|it|that|them|these)\b|"
+    # "add some photos to it", "insert a table in this" (the pronoun ends the phrase: "add a twist to this recipe for
+    # brownies" names something new and is answered).
+    r"^(?:add|insert|put|include|attach|append|throw\s+in|sprinkle)\b[^.;!?\n]{0,60}?\b(?:to|in|into|on|onto|inside|"
+    r"within|throughout)\s+(?:it|this|that|them|these)(?=\s*(?:$|[.,;:!?]|(?:and|too|as\s+well|please)\b))|"
+    # "make the blog more appealing", "make my email sound friendlier"
+    r"^make\s+(?:the|my|our|this)\s+(?:\w+\s+){0,2}?(?:blog(?:\s+post)?|post|article|essay|document|doc|draft|text|"
+    r"content|page|story|email|letter|report|intro|introduction|conclusion|section|paragraph|copy|write-?up|newsletter|"
+    r"title|heading|headline)\s+(?:more|less|better|worse|shorter|longer|clearer|simpler|easier|punchier|friendlier|"
+    r"appealing|engaging|interesting|attractive|professional|formal|casual|fun|sound|look|read|feel|flow)\b|"
+    # "this blog", "the current blog post" ("my blog" is usually the user's site: "a post for my blog about dogs").
+    r"\b(?:this|the\s+(?:current|existing|above|attached|whole|entire|same))\s+(?:blog(?:\s+post)?|write-?up)\b",
     re.I)
 def refers_to_document(query: str) -> bool:
     """True when the wording points at the open document ("this paragraph", "my draft", "the section above")."""
@@ -243,6 +264,8 @@ def refers_to_document(query: str) -> bool:
 
 _MODE_HINT = {"edit": "Use Edit to change existing text.", "draft": "Use Draft to add new content to it.",
               "ask": "Use Ask to ask about it."}
+# Wording that fits several modes ("make it more appealing and add some photos"): name them instead of only Ask.
+_MIXED_HINT = "Use Edit to change existing text, Draft to add new content to it, or Ask to ask about it."
 
 
 def write_needs_document(query: str) -> dict | None:
@@ -254,7 +277,13 @@ def write_needs_document(query: str) -> dict | None:
     text = re.sub(r'^(?:(?:please|can you|could you|would you|kindly)\s+)+', '', query.strip(), flags=re.I)
     if not text or "\n" in text or len(text) > 300 or not _REFERS_TO_DOCUMENT.search(text):
         return None
+    # "make it night", "restyle this picture into watercolor": the edit of the user's previous image when there is one.
+    # This check runs before the user is known, so it cannot look; the image router decides after login.
+    from .intent import detect_image_intent
+    if detect_image_intent(text, has_previous_image=True)["kind"] != "none":
+        return None
     suggestion = suggest_document_intent(text)
     action = suggestion.suggested_action
     return {"status": "needs_context", "suggested_action": action, "ambiguous": suggestion.ambiguous,
-            "message": "This refers to your document, which wasn't included. " + _MODE_HINT[action]}
+            "message": "This refers to your document, which wasn't included. " + (
+                _MIXED_HINT if suggestion.ambiguous else _MODE_HINT[action])}

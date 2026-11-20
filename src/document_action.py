@@ -103,6 +103,10 @@ def decide_by_rules(query: str, document_text: str, *, scope: str = "document", 
         if (in_place is not None and (in_place.phrase is not None or in_place.replacement is not None or in_place.ambiguous)
                 and not _question_shaped(task)):
             return ActionDecision("edit", "rules", _REASON["edit"])
+    if not blank and settings.document_edit_photos_enabled and _asks_for_document_photos(task):
+        # "make it more appealing and add some photos": Edit places photos that illustrate the document (document_edit/photos).
+        # Write would draw them blind: it never sees the document (live 2026-11-20: three photos unrelated to the blog).
+        return ActionDecision("edit", "rules", "document_photos")
     points_at_document = refers_to_document(task) or asks_to_insert(task) or bool(_DOCUMENT_PART.search(task))
     if not points_at_document and _standalone_task(task):
         return ActionDecision("write", "rules", "standalone_task")
@@ -125,6 +129,12 @@ def decide_by_rules(query: str, document_text: str, *, scope: str = "document", 
 
 _POLITE_LEAD = re.compile(r"(?:please\b|(?:can|could|would|will)\s+you\b|i\s+(?:want|need|would\s+like)\b)", re.I)
 _GENERATIVE_LEAD = re.compile(r"(?:(?:please|kindly)\s+)?(?:suggest|brainstorm|come\s+up\s+with)\b", re.I)
+
+
+def _asks_for_document_photos(task: str) -> bool:
+    """Photos to add to the open document ("add some photos", "include pictures throughout"), not a question about photos."""
+    from .document_edit.photos import photo_request
+    return not _question_shaped(task) and photo_request(task, [], 1) is not None
 
 
 def _question_shaped(task: str) -> bool:

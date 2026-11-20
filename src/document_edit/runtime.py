@@ -15,13 +15,20 @@ logger = logging.getLogger(__name__)
 
 
 def stream_document_edit(source, instruction, *, candidates, key_for, is_byok, user_id=None,
-                         request_id=None, report_model=False, cancel_event=None, match_style=False, selection=None):
+                         request_id=None, report_model=False, cancel_event=None, match_style=False, selection=None,
+                         photo_tool=None, pending_images=None):
+    """
+    photo_tool(prompt) -> placeholder id or None starts one photo in the image flow; the photos it started are handed to the
+    caller as {"__pending_images__": pending_images} after the snapshot, so they stream as image_ready events like Write's.
+    """
     llm = AgnoLLM(candidates, key_for, is_byok=is_byok, user_id=user_id, request_id=request_id,
                   agent_type="document_editor", timeout=float(settings.longform_call_timeout_seconds) or None,
                   cancel_event=cancel_event)
     trace_set(request_id, mode="document_edit", agent_type="document_editor")
     try:
-        text, result = edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style, selection=selection)
+        text, result = edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style, selection=selection,
+                                     photo_tool=photo_tool if settings.document_edit_photos_enabled else None,
+                                     max_photos=min(settings.document_edit_max_photos, settings.image_max_per_request))
     except (EditCancelled, ProviderCancelled):
         return
     except Exception as error:
@@ -33,7 +40,10 @@ def stream_document_edit(source, instruction, *, candidates, key_for, is_byok, u
         return
     if report_model and (llm.used or llm.drafting_model()):
         yield {"__model_used__": llm.used or llm.drafting_model()}
-    trace_set(request_id, document_edit_status=result.status, edited_blocks=len(result.patches))
+    trace_set(request_id, document_edit_status=result.status, edited_blocks=len(result.patches),
+              **({"document_edit_photos": len(result.insertions)} if result.insertions else {}))
     yield {"__event__": {"event": "document_edit_ready", "data": result.model_dump(mode="json")}}
     # A complete verified snapshot, never a partially generated replacement. The frontend buffers this mode.
     yield text
+    if pending_images is not None and any(not str(k).startswith("__") for k in pending_images):
+        yield {"__pending_images__": pending_images}

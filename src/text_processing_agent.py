@@ -2510,10 +2510,29 @@ def process_user_query_stream(
         candidates = resolve_route('writing', model_provider, model_source, key_resolver.available_providers, True) if routed else [Candidate(model_provider, True)]
         if not candidates:
             raise ValueError('No API key configured for an eligible provider')
-        yield from stream_document_edit(document_text, user_text if user_text is not None else query,
-            candidates=candidates, key_for=key_resolver if routed else (lambda _provider: api_key),
+        edit_instruction = user_text if user_text is not None else query
+        edit_key_for = key_resolver if routed else (lambda _provider: api_key)
+        edit_images = {"__completion_callback__": image_completion_callback}
+        _tools = {}
+
+        def edit_photo_tool(prompt):
+            # One image tool for the request: its budget caps the photos, credits are reserved per photo as for Write.
+            if "tool" not in _tools:
+                from .request_plan import ToolBudget
+                provider = candidates[0].provider
+                _tools["tool"] = _build_image_tool(
+                    provider, edit_key_for(provider), edit_images, request_id, user_id, credit_manager, is_byok,
+                    {"document_id": document_id, "user_query": edit_instruction,
+                     "explicit_params": {**(image_params or {}), "aspect_ratio": "16:9"}},
+                    ToolBudget(settings.document_edit_max_photos, "image"))
+            from .design_canvas.images import placeholder_id
+            return placeholder_id(_tools["tool"](prompt))
+
+        yield from stream_document_edit(document_text, edit_instruction,
+            candidates=candidates, key_for=edit_key_for,
             is_byok=is_byok, user_id=user_id, request_id=request_id, report_model=report_model, cancel_event=cancel_event,
-            match_style=match_document_style, selection=document_edit_selection)
+            match_style=match_document_style, selection=document_edit_selection,
+            photo_tool=edit_photo_tool, pending_images=edit_images)
         return
 
     query_lower = query.lower()
@@ -3281,6 +3300,30 @@ def _wait_for_images(pending: dict, done_event: threading.Event, timeout: float,
         done_event.clear()
 
 
+def _finish_edit_photos(source: str, edit: dict, pending: dict) -> tuple[str, dict]:
+    """(snapshot, document_edit_ready) for /agent/process once the photos are done: URLs in, failed photos out."""
+    from .document_edit.blocks import fingerprint
+    from .document_edit.schema import DocumentInsertion, DocumentPatch
+    from .document_edit.service import apply_document_edits
+
+    kept = []
+    for raw in edit["insertions"]:
+        entry = (pending or {}).get(raw["placeholder_id"]) or {}
+        if entry.get("status") == "done" and entry.get("cdn_url"):
+            kept.append({**raw, "markdown": raw["markdown"].replace(f"placeholder::{raw['placeholder_id']}", entry["cdn_url"])})
+    patches = [DocumentPatch.model_validate(p) for p in edit.get("patches", [])]
+    try:
+        text = apply_document_edits(source, edit["base_sha256"], patches, [DocumentInsertion.model_validate(i) for i in kept])
+    except ValueError:
+        kept, text = [], apply_document_edits(source, edit["base_sha256"], patches)
+    dropped = len(edit["insertions"]) - len(kept)
+    message = edit["message"] + (f" {dropped} photo{'s' if dropped != 1 else ''} could not be made." if dropped else "")
+    if not kept and not patches:
+        return source, {**edit, "status": "failed", "insertions": [], "result_sha256": edit["base_sha256"],
+                        "message": "The photos could not be made. Your document was kept unchanged."}
+    return text, {**edit, "insertions": kept, "result_sha256": fingerprint(text), "message": message[:500]}
+
+
 def resolve_image_placeholders(text: str, pending: dict) -> str:
     """
     Swap placeholder::{id} for the real image URL. An image that failed or never finished is replaced
@@ -3413,6 +3456,12 @@ def process_user_query_with_images(
     text = "".join(chunks)
     if any(not str(k).startswith("__") for k in pending):
         _wait_for_images(pending, done_event, wait_seconds, cancel_event)
+        edit = meta.get("document_edit_ready") if meta is not None else None
+        if isinstance(edit, dict) and edit.get("insertions") and document_text is not None:
+            # Edit with photos: each finished photo's URL goes into its insertion; one that failed is left out entirely,
+            # never a note inside the user's document.
+            text, meta["document_edit_ready"] = _finish_edit_photos(document_text, edit, pending)
+            return text, pending
         text = resolve_image_placeholders(text, pending)
         if design_data:
             # A photo fill: the design is returned whole, so put each finished photo into its slot.

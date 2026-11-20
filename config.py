@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # it is spliced back, instead of rewriting the whole design. Skipped when the section is over this share of the design.
     design_section_edit_enabled: bool = Field(True, alias="DESIGN_SECTION_EDIT_ENABLED")
     design_section_edit_max_fraction: float = Field(0.6, ge=0.1, le=1.0, alias="DESIGN_SECTION_EDIT_MAX_FRACTION")
+    # Edit with photos ("make it more appealing and add some photos"; src/document_edit/photos.py): photos are placed after the
+    # paragraphs they illustrate, described from the document, and drawn by the image flow (credits, CDN, image_ready).
+    document_edit_photos_enabled: bool = Field(True, alias="DOCUMENT_EDIT_PHOTOS_ENABLED")
+    document_edit_max_photos: int = Field(4, ge=1, le=8, alias="DOCUMENT_EDIT_MAX_PHOTOS")
     # How hard Claude's advanced tier (claude-opus-5-5) thinks: low | medium | high | xhigh | max. Thinking cannot be switched off on
     # this model and is billed as output, so this is the speed/cost/quality dial. "low" measured as good as "medium" on writing, design
     # canvas and code, and faster and cheaper (docs/MODEL_UPGRADE_BENCHMARK.md, section 12). The model's own default would be medium.

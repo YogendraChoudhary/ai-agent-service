@@ -64,3 +64,46 @@ def test_write_prompt_forbids_notes_and_questions_and_keeps_mermaid_charts(plan)
     prompt = "\n".join(tpa.build_smart_global_instructions(plan))
     assert "GOES STRAIGHT INTO THE USER'S DOCUMENT" in prompt
     assert "Never ask the user to paste" in prompt and "mermaid xychart-beta" in prompt
+
+
+# 2026-11-20: "Make it more appealing to the users, add some photos and other aspects" with no document was answered by a
+# generic page and three unrelated photos. "it"/"this" with nothing else in the prompt is the user's document.
+USER_PROMPT = "Make it more appealing to the users, add some photos and other aspects"
+
+
+@pytest.mark.parametrize("query", [
+    USER_PROMPT, "make it better", "Please make it more fun for kids.", "make this more engaging", "spice it up",
+    "jazz this up", "add some photos to it", "add images to this, please", "enhance it", "revise this", "update it",
+    "make the blog more appealing", "make my email sound friendlier", "make this blog better", "Can you make the intro shorter?",
+    "what's the weakest part of this write-up",
+])
+def test_improve_it_wording_without_a_document_is_stopped(query):
+    result = write_needs_document(query)
+    assert result is not None and "wasn't included" in result["message"]
+
+
+@pytest.mark.parametrize("query", [
+    "Write a story about a dragon and make it funny", "Make the best list of 10 hiking trails",
+    "Write a blog post for my blog about dogs", "Add a twist to this classic recipe for brownies",
+    "Make it bullets. First, review Q3. Second, finalize the plan.", "make it a pie chart: apples 30, pears 20",
+    "Make a bar chart of US GDP", "Make me a logo for a bakery",
+    # image follow-ups: the router edits the previous image when there is one, so the guard must not stop them
+    "make it night", "make it darker and rainier", "make it look like an oil painting", "restyle this picture into watercolor",
+])
+def test_self_contained_and_image_follow_up_prompts_are_still_answered(query):
+    assert write_needs_document(query) is None
+
+
+def test_mixed_wording_names_every_mode():
+    result = write_needs_document(USER_PROMPT)
+    assert result["ambiguous"] is True and result["suggested_action"] == "ask"
+    assert result["message"] == ("This refers to your document, which wasn't included. Use Edit to change existing text, "
+                                 "Draft to add new content to it, or Ask to ask about it.")
+
+
+def test_the_reported_prompt_runs_no_model_and_makes_no_photo(runtime):  # noqa: F811
+    client, state = runtime
+    events = parse_sse_events(client.post("/agent/stream", json=write(query=USER_PROMPT)).text)
+    assert next(e["data"] for e in events if e["event"] == "needs_context")["status"] == "needs_context"
+    assert not any(e["data"].get("type") == "content" for e in events)
+    assert not state["calls"] and not state["charges"]
