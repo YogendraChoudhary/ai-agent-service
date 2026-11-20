@@ -49,7 +49,8 @@ Browser (Eddyter UI) ──► Agent service  /agent/email/*      (same contract
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/agent/email/categories` | Email types to offer in the type picker |
-| POST | `/agent/email/generate` | Generate 1–3 template variants from a brief |
+| POST | `/agent/email/generate` | Generate 1–3 template variants from a brief (optionally into a fixed `layout`) |
+| POST | `/agent/email/rewrite` | Rewrite an existing template from an instruction, keeping its design |
 | POST | `/agent/email/image` | Crop and compress an uploaded image to an email image slot; returns a CDN URL |
 
 All error bodies are `{"error": "<readable message>"}`; a 422 adds `issues` (§7).
@@ -94,6 +95,7 @@ type that isn't listed is a 400. Add an **"Auto-detect"** option that omits `cat
 | `sign_off` | string | no | `signature` \| `none`. Omit = type default. See §5.3 |
 | `social_links` | object | no | `{platform: url}`, ≤ 4, **in display order**. Platforms: `linkedin`, `x`, `facebook`, `instagram`, `youtube` (https), `email` (`mailto:`) |
 | `theme` | object | no | §5.4. Chosen by the user, passed through unchanged |
+| `layout` | string[] | no | Fixed blocks, in order (§3.2.1). Omit = the email type's usual structure |
 
 **Unknown fields are rejected** (400), so typos like `socialLinks` fail loudly instead of being ignored.
 
@@ -142,7 +144,111 @@ Only link **keys** and asset **descriptions** reach the AI. URLs never do.
 timeout, show a progress state, and disable the Generate button while a request is in flight (there is no
 idempotency key; a double click costs two generations).
 
-### 3.3 `POST /agent/email/image`
+#### 3.2.1 Custom layout (`layout`)
+
+Send the exact blocks you want, in order, and the AI writes the copy inside them:
+
+```json
+"layout": ["header", "hero", "paragraph", "button", "footer"]
+```
+
+* Entries are block types from §4.2. Aliases: `hero`/`banner` = `hero_banner`, `cta` = `button`,
+  `hero_image`, `inline_image`. A plain `image` is the **hero** slot when it opens the email (first, or right after
+  the header or hero banner), otherwise the **inline** slot.
+* The response's `templates[].template.blocks` have exactly these types in this order, and the response echoes the
+  canonical list: `"layout": ["header", "hero_banner", "paragraph", "button", "footer"]`.
+* The layout replaces the email type's structure (its required/allowed blocks and order). The type still sets the
+  default tone and the bulk-mail footer rule (`unsubscribe: true`), and every content rule still applies.
+* 400 when: fewer than 3 or more than 20 entries, an unknown type, more than one of `header`, `footer`,
+  `hero_banner`, `greeting`, `notice`, `signature`, `features`, `button`, or of each image slot; `header` not first;
+  `footer` not last; `hero_banner` not first/right after the header; a `signature` entry with `sign_off: "none"`
+  or `social_links` (or `sign_off: "signature"` without one).
+* At most one call to action: with a `button` entry the hero banner gets no button; without one it may carry it.
+* Image entries always produce an image block (empty slot with a `generation_prompt`), without "add an image" in
+  the brief.
+
+### 3.3 `POST /agent/email/rewrite`
+
+Rewrites an existing email ("Make this a Black Friday sale email", "Make it shorter and friendlier"). **Only the
+words change.** The server rebuilds every block from your original by `id` and takes only the readable text from
+the AI, so these are always kept exactly:
+
+* block order, `id`s and `type`s; heading levels, list styles, notice variants, spacer sizes;
+* button and hero-banner links, header logo, every **image block** (slot, source, asset, alt, prompt);
+* footer `unsubscribe`, `social` and `address`; header `org_name`; signature `name`, `title`, `org`, `contact`;
+* the `theme` (unless you send a new one), the number of feature columns and key/value rows, and which optional
+  fields each block has (no new eyebrow, no hero button appearing).
+
+The AI must also keep every merge tag and every inline link `[text](link:key)` a block has (it may reword the link
+text); if it drops one, it gets the usual single repair pass, then 422.
+
+**Adding or removing blocks** happens only when the author asks:
+* in the instruction ("add a notice that the sale ends Sunday", "remove the features section", "drop the second
+  paragraph"): detected by the server;
+* or explicitly with `allow_block_changes: true` (`false` forbids it whatever the instruction says);
+* or via `sign_off` / `social_links`, which add or remove only the signature, as on `/generate`.
+
+Kept blocks stay in their original order. Added blocks get new ids (`n1`, `n2`, … when the AI's id clashes) and
+follow the normal rules (header first, footer last, one call to action unless the email already had more).
+
+#### Request
+
+Same fields and rules as `/generate` (§3.2), **minus** `brief` and `layout`, **plus**:
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `instruction` | string | yes | 3–2000 chars after trimming. What to change, in the author's words |
+| `template` | object | yes | The template to rewrite: one `templates[].template` from `/generate` (or the editor's edited copy). Must be a valid schema-v1 template (§4); ≤ 100 KB |
+| `allow_block_changes` | bool | no | Omit = only when the instruction asks; `true` = allowed; `false` = never |
+
+Defaults that differ from `/generate`:
+* `category`: omitted = the template's `meta.category` (falls back to `general` if that type is not enabled).
+* `tone`: omitted = from the instruction when it asks ("friendlier"/"warmer"/"less formal" → `professional_warm`,
+  "more formal" → `formal`, "more professional" → `professional`), else the template's `meta.tone`.
+* `language`: omitted = the template's `meta.language`. A different language translates the email.
+* `length`: omitted = no target. "shorter"/"longer" in the instruction is **checked**: the block text must end up at
+  least 15% shorter/longer, else one repair pass; if it still misses, the email is returned with a `not_shorter` /
+  `not_longer` warning (not a 422).
+* `allowed_merge_tags`, `links`, `assets`: the ones the template already uses are allowed automatically; send only
+  new ones (e.g. a link key for an added button). URLs still never reach the AI.
+* `theme` / `brand_kit_id` / `social_links`: omitted = kept from the template.
+* `meta.subject` keeps the author's pick by position (if they chose option 2, the new option 2).
+
+#### Example request
+
+```json
+{
+  "model": "openai",
+  "api_key": "<Eddyter licence key>",
+  "instruction": "Make this a Black Friday sale email",
+  "template": { "schema_version": 1, "meta": {...}, "theme": {...}, "blocks": [...] }
+}
+```
+
+#### Response 200
+
+The `/generate` response (§3.2) plus:
+
+```json
+{
+  "block_changes": "none",              // "none" | "allowed" | "signature": what this request permitted
+  "templates": [
+    { "template": {...}, "warnings": [...], "fill_slots": [...],
+      "added_blocks": [], "removed_blocks": [] }   // ids, so the editor can highlight changes
+  ]
+}
+```
+
+Facts the instruction does not give (a discount, an end date) come back as `[[fill: …]]` slots, as on `/generate`.
+
+**Errors and billing:** exactly as `/generate` (§7). A `template` that is not a valid template is **400** with
+`issues` (no model call, nothing charged). Billing is `text`: `input_chars` is the instruction plus the free-text
+fields **plus the readable text of the template sent**; `output_chars` the readable text returned. The reservation
+uses `max(1,500, the template's readable text)` output characters per variant. Any failure releases it in full.
+
+**Latency (live, 2026-11-20):** 3.5–8 s with OpenAI and Claude; ~7.5 s when the repair pass runs.
+
+### 3.4 `POST /agent/email/image`
 
 Turns any user image into the exact file an image slot needs, then uploads it.
 
@@ -375,7 +481,8 @@ Show them in a review panel, not as errors. Each may carry `block_id`/`field` so
 
 | Status | When | Body | Suggested UX |
 |---|---|---|---|
-| 400 | Bad request (any field rule in §3), unknown/disabled `category`, signature + social together, unknown field | `{"error"}` | Fix the form; message is safe to show |
+| 400 | Bad request (any field rule in §3), unknown/disabled `category`, signature + social together, bad `layout`, unknown field | `{"error"}` | Fix the form; message is safe to show |
+| 400 | `/rewrite`: `template` is not a valid schema-v1 template | `{"error", "issues": Issue[]}` | Should not happen for templates from `/generate`; log `issues` |
 | 400 | BYOK user has no key for the chosen `model` | `{"error": "No API key configured for …"}` | Send them to their API key settings |
 | 402 | Past-due managed plan | `{"error": "Your payment is past due…"}` | Billing prompt |
 | 402 | Not enough credits for the reservation (before any model call) | `{"error": "Insufficient credits", "code": "INSUFFICIENT_CREDITS", "available", "needed"}` | Same UX as `/agent/stream` |
@@ -391,7 +498,7 @@ Show them in a review panel, not as errors. Each may carry `block_id`/`field` so
 
 ### 7.1 Billing
 
-Non-BYOK `generate` calls send one credit webhook, the same message `/agent/stream` sends for text:
+Non-BYOK `generate` and `rewrite` calls send one credit webhook, the same message `/agent/stream` sends for text:
 
 ```json
 {"user_id": "…", "operation_type": "text", "input_chars": 412, "output_chars": 1180, "image_count": 0,
@@ -470,7 +577,7 @@ Images (`TestImageEndpoint`, `tests/email/test_email_images.py`):
 - [ ] HTML-escape every text field, then apply §4.4 placeholders and markup.
 - [ ] `hero_banner` on `theme.hero` background; eyebrow in `accent_color`; button centred.
 - [ ] `features`: 2–3 columns on desktop, stacked on mobile.
-- [ ] Images: exact `width`/`height` attributes from §3.3; `alt` always set.
+- [ ] Images: exact `width`/`height` attributes from §3.4; `alt` always set.
 - [ ] Footer: `theme.footer` background; social PNG icons (40 × 40, alt text) in `social` order; address;
       "Unsubscribe" when `unsubscribe` is true.
 - [ ] Hidden preheader text right after `<body>`.
@@ -491,7 +598,8 @@ email-safe HTML. Previews of eight real responses are in `local_run/email_previe
 |---|---|
 | No endpoint to re-validate a template after the user edits it | Check fill-ins and empty image slots client-side (§4.4, §5.2). A `/validate` endpoint is a candidate for Phase 2 |
 | No AI image generation or refine yet | Phase 2 (`/agent/email/image` `action: generate \| refine`) |
-| No "rewrite this block" / "change tone" for one block | Phase 2 (`/refine`, `/block-action`) |
+| `/rewrite` works on the whole email; no "rewrite only this block" yet | Phase 2 (`/block-action`) |
+| `/rewrite` detects add/remove requests in English only | Send `allow_block_changes: true` from a UI control for other languages |
 | Type detection and tone checks are English-only | Let users pick the type for other languages |
 | Not streamed | Show a progress state; 90 s timeout |
 | Routes have no auth; key travels in the body | Call only from Eddyter's backend (§2) |

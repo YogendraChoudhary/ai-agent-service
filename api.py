@@ -686,17 +686,15 @@ class EmailThemeRequest(BaseModel):
         return SectionTheme.model_validate(v).model_dump(exclude_none=True)
 
 
-class EmailGenerateRequest(BaseModel):
+class _EmailOptions(BaseModel):
+    """Options shared by /agent/email/generate and /agent/email/rewrite."""
     model_config = {'extra': 'forbid'}   # a misspelt field (socialLinks) is an error, not silently ignored
     model: str = Field(..., min_length=1)
     model_source: Literal['default', 'user'] = 'user'
     api_key: str = Field(..., min_length=1)
-    brief: str = Field(..., min_length=3, max_length=5000)
-    category: Optional[str] = Field(None, max_length=40)       # omitted -> routed from the brief
+    category: Optional[str] = Field(None, max_length=40)       # omitted -> routed from the brief / the template's
     tone: Optional[str] = Field(None, pattern=r'^(formal|professional|professional_warm)$')
     audience: Optional[str] = Field(None, max_length=300)
-    language: str = Field('en-GB', pattern=r'^[a-z]{2,3}(-[A-Z]{2})?$')
-    length: str = Field('standard', pattern=r'^(short|standard|detailed)$')
     allowed_merge_tags: List[str] = Field(default_factory=list, max_length=50)
     links: Dict[str, str] = Field(default_factory=dict)        # key -> https URL; only keys reach the model
     assets: Dict[str, str] = Field(default_factory=dict)       # key -> short description
@@ -708,14 +706,6 @@ class EmailGenerateRequest(BaseModel):
     sign_off: Optional[str] = Field(None, pattern=r'^(signature|none)$')
     social_links: Dict[str, str] = Field(default_factory=dict)            # platform -> URL, max 4, footer order
     theme: Optional[EmailThemeRequest] = None                             # chosen by the user, never the model
-
-    @field_validator('brief')
-    @classmethod
-    def validate_brief(cls, v):
-        v = v.strip()
-        if len(v) < 3:
-            raise ValueError('brief must contain at least 3 characters of text')
-        return v
 
     @field_validator('social_links')
     @classmethod
@@ -777,6 +767,55 @@ class EmailGenerateRequest(BaseModel):
         allowed = {'name', 'title', 'org', 'contact'}
         if set(v) - allowed or any(len(x) > 120 for x in v.values()):
             raise ValueError(f"sender may only contain {sorted(allowed)}, each <= 120 chars")
+        return v
+
+
+
+class EmailGenerateRequest(_EmailOptions):
+    brief: str = Field(..., min_length=3, max_length=5000)
+    language: str = Field('en-GB', pattern=r'^[a-z]{2,3}(-[A-Z]{2})?$')
+    length: str = Field('standard', pattern=r'^(short|standard|detailed)$')
+    # Fixed blocks, in order (e.g. ["header", "hero", "paragraph", "button", "footer"]); the AI writes the copy.
+    layout: Optional[List[str]] = Field(None, max_length=40)
+
+    @field_validator('brief')
+    @classmethod
+    def validate_brief(cls, v):
+        v = v.strip()
+        if len(v) < 3:
+            raise ValueError('brief must contain at least 3 characters of text')
+        return v
+
+    @field_validator('layout')
+    @classmethod
+    def validate_layout(cls, v):
+        if v is None:
+            return v
+        from src.email_template.layout import parse_layout
+        return list(parse_layout(v))
+
+
+class EmailRewriteRequest(_EmailOptions):
+    instruction: str = Field(..., min_length=3, max_length=2000)    # "Make this a Black Friday sale email"
+    template: Dict[str, Any]                                        # a template from /generate (or edited since)
+    language: Optional[str] = Field(None, pattern=r'^[a-z]{2,3}(-[A-Z]{2})?$')   # omitted -> the template's
+    length: Optional[str] = Field(None, pattern=r'^(short|standard|detailed)$')  # omitted -> about as now
+    # None: blocks are added/removed only when the instruction asks ("add a button"). False: never. True: allowed.
+    allow_block_changes: Optional[bool] = None
+
+    @field_validator('instruction')
+    @classmethod
+    def validate_instruction(cls, v):
+        v = v.strip()
+        if len(v) < 3:
+            raise ValueError('instruction must contain at least 3 characters of text')
+        return v
+
+    @field_validator('template')
+    @classmethod
+    def validate_template_size(cls, v):
+        if len(json.dumps(v, ensure_ascii=False)) > 100_000:
+            raise ValueError('template is too large (over 100 KB of JSON)')
         return v
 
 
@@ -2080,14 +2119,24 @@ def backend_secret_valid(request: Request) -> bool:
 
 
 def email_input_chars(request_data) -> int:
-    """The user's own text the model reads: the brief and the free-text fields around it."""
-    texts = [request_data.brief, request_data.audience or '', request_data.org_name or '',
+    """
+    The user's own text the model reads: the brief (or the rewrite instruction plus the readable text of the template
+    being rewritten) and the free-text fields around it.
+    """
+    texts = [getattr(request_data, 'brief', None) or getattr(request_data, 'instruction', ''),
+             request_data.audience or '', request_data.org_name or '',
              *request_data.sender.values(), *request_data.assets.values()]
-    return sum(len(t) for t in texts)
+    template = getattr(request_data, 'template', None)
+    return sum(len(t) for t in texts) + (email_readable_chars(template) if isinstance(template, dict) else 0)
 
 
 def email_output_chars(result: dict) -> int:
     """Characters of readable text in the returned templates (subjects, headings, body, buttons), not the JSON around it."""
+    return sum(email_readable_chars(t.get('template', {})) for t in result.get('templates', []))
+
+
+def email_readable_chars(template) -> int:
+    """Readable text in one template: keys, references, URLs and colours are not counted."""
     def walk(value, key=''):
         if isinstance(value, dict):
             return sum(walk(v, k) for k, v in value.items())
@@ -2097,7 +2146,7 @@ def email_output_chars(result: dict) -> int:
                 and not re.match(r'^(?:asset:|link:|https?://|mailto:|#[0-9A-Fa-f]{3,8}$)', value):
             return len(value)
         return 0
-    return sum(walk(t.get('template', {})) for t in result.get('templates', []))
+    return walk(template)
 
 
 async def resolve_email_caller(request: Request, request_data, request_id: str, background_tasks: BackgroundTasks) -> dict:
@@ -2147,21 +2196,24 @@ async def email_categories() -> JSONResponse:
     ]})
 
 
-@app.post('/agent/email/generate')
-async def email_generate(request_data: EmailGenerateRequest, request: Request,
-                         background_tasks: BackgroundTasks) -> JSONResponse:
-    from src.email_template.service import (
-        EmailGenerationError, EmailProviderError, GenerateRequest, generate, make_routed_llm,
-    )
+async def run_email_model_route(route: str, request_data, request: Request, background_tasks: BackgroundTasks,
+                                run, reserve_output_chars: int) -> JSONResponse:
+    """
+    The /agent/email/* routes that call a model (generate, rewrite): licence check, credit reservation, the model
+    work (`run(llm)` in a worker thread), and billing on success only. Any failure releases the reservation and
+    charges nothing, as on /agent/stream.
+    """
+    from src.email_template.rewrite import EmailTemplateInputError
+    from src.email_template.service import EmailGenerationError, EmailProviderError, make_routed_llm
     from src.models import ADVANCED_MODEL_IDS
 
     request_id = str(uuid.uuid4())[:8]
     headers = {"X-Request-ID": request_id}
     if not settings.email_ai_enabled:
         return JSONResponse(status_code=503, content={'error': 'AI email templates are disabled'}, headers=headers)
-    start_trace(request_id, '/agent/email/generate', chat_model=request_data.model,
-                query_chars=len(request_data.brief))
-    log_request_body(request_id, '/agent/email/generate', request_data.model_dump())
+    start_trace(request_id, route, chat_model=request_data.model,
+                query_chars=len(getattr(request_data, 'brief', None) or getattr(request_data, 'instruction', '')))
+    log_request_body(request_id, route, request_data.model_dump())
     start_time = time.time()
     try:
         caller = await resolve_email_caller(request, request_data, request_id, background_tasks)
@@ -2175,7 +2227,7 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
     input_chars = email_input_chars(request_data)
     reserved_scaled = 0
     if billed and CREDIT_PRECHECK_ENABLED and credit_manager is not None:
-        reserved_scaled = text_credits_scaled(input_chars, EMAIL_OUTPUT_CHARS_PER_VARIANT * request_data.variants)
+        reserved_scaled = text_credits_scaled(input_chars, reserve_output_chars)
         ok, available_scaled = await run_credit_io(credit_manager.reserve, user_id, reserved_scaled)
         if not ok:
             finish_trace(request_id, 'rejected', error='insufficient credits', http_status=402)
@@ -2187,24 +2239,20 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
         if reserved_scaled:
             credit_manager.schedule_release(user_id, reserved_scaled, delay_seconds=0)
 
-    req = GenerateRequest(
-        brief=request_data.brief, category=request_data.category, tone=request_data.tone,
-        audience=request_data.audience, language=request_data.language, length=request_data.length,
-        allowed_merge_tags=tuple(request_data.allowed_merge_tags), links=request_data.links,
-        assets=request_data.assets, sender=request_data.sender, org_name=request_data.org_name,
-        brand_kit_id=request_data.brand_kit_id, variants=request_data.variants,
-        sign_off=request_data.sign_off, social_links=request_data.social_links,
-        theme=request_data.theme.model_dump(exclude_none=True) if request_data.theme else None,
-    )
     stop_event = threading.Event()
     llm = make_routed_llm(caller['candidates'], caller['key_for'], request_id=request_id,
                           is_byok=caller['text_byok'], cancel_event=stop_event)
     try:
-        result = await run_provider_work(generate, req, llm, request_id, stop_event=stop_event)
+        result = await run_provider_work(run, llm, request_id, stop_event=stop_event)
     except (HTTPException, asyncio.CancelledError) as error:
         release_reservation()
         finish_trace(request_id, 'aborted' if isinstance(error, asyncio.CancelledError) else 'rejected')
         raise
+    except EmailTemplateInputError as e:
+        release_reservation()
+        finish_trace(request_id, 'rejected', error=str(e), http_status=400)
+        return JSONResponse(status_code=400, content={'error': str(e), 'issues': [i.as_dict() for i in e.errors]},
+                            headers=headers)
     except ValueError as e:
         release_reservation()   # a failed generation is not charged, as on /agent/stream
         finish_trace(request_id, 'rejected', error=str(e), http_status=400)
@@ -2220,12 +2268,12 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
         )
     except EmailProviderError as e:
         release_reservation()
-        logger.error(f"[{request_id}] email generate provider error — {e}")
+        logger.error(f"[{request_id}] {route} provider error — {e}")
         finish_trace(request_id, 'error', error=str(e), http_status=502)
         return JSONResponse(status_code=502, content={'error': str(e)}, headers=headers)
     except Exception as e:
         release_reservation()
-        logger.error(f"[{request_id}] email generate FAILED — {e}")
+        logger.error(f"[{request_id}] {route} FAILED — {e}")
         finish_trace(request_id, 'error', error=str(e), http_status=500)
         return JSONResponse(status_code=500, content={'error': str(e)}, headers=headers)
 
@@ -2235,8 +2283,8 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
     trace_set(request_id, model_used=f'{provider}/{model_id}', email_output_chars=output_chars,
               email_billed=billed)
     if billed:
-        # operation_type "text", priced by characters like any text request: the brief and its fields in, the
-        # templates' readable text out (all variants). BYOK and backend-secret calls are not billed here.
+        # operation_type "text", priced by characters like any text request: the user's text the model read in,
+        # the templates' readable text out (all variants). BYOK and backend-secret calls are not billed here.
         duration_ms = int((time.time() - start_time) * 1000)
         if CREDIT_PRECHECK_ENABLED and credit_manager is not None:
             await run_credit_io(
@@ -2249,9 +2297,58 @@ async def email_generate(request_data: EmailGenerateRequest, request: Request,
             await run_credit_io(fire_credit_deduction, user_id, input_chars, output_chars, 'text', 0,
                                 provider=provider, model=model_id, duration_ms=duration_ms, success=True)
 
-    log_response_body(request_id, '/agent/email/generate', result)
+    log_response_body(request_id, route, result)
     finish_trace(request_id, 'ok', http_status=200)
     return JSONResponse(status_code=200, content={'success': True, **result}, headers=headers)
+
+
+@app.post('/agent/email/generate')
+async def email_generate(request_data: EmailGenerateRequest, request: Request,
+                         background_tasks: BackgroundTasks) -> JSONResponse:
+    from src.email_template.service import GenerateRequest, generate
+
+    req = GenerateRequest(
+        brief=request_data.brief, category=request_data.category, tone=request_data.tone,
+        audience=request_data.audience, language=request_data.language, length=request_data.length,
+        allowed_merge_tags=tuple(request_data.allowed_merge_tags), links=request_data.links,
+        assets=request_data.assets, sender=request_data.sender, org_name=request_data.org_name,
+        brand_kit_id=request_data.brand_kit_id, variants=request_data.variants,
+        sign_off=request_data.sign_off, social_links=request_data.social_links,
+        theme=request_data.theme.model_dump(exclude_none=True) if request_data.theme else None,
+        layout=tuple(request_data.layout) if request_data.layout else None,
+    )
+    return await run_email_model_route(
+        '/agent/email/generate', request_data, request, background_tasks,
+        lambda llm, request_id: generate(req, llm, request_id),
+        EMAIL_OUTPUT_CHARS_PER_VARIANT * request_data.variants)
+
+
+@app.post('/agent/email/rewrite')
+async def email_rewrite(request_data: EmailRewriteRequest, request: Request,
+                        background_tasks: BackgroundTasks) -> JSONResponse:
+    """
+    Rewrite an existing template from an instruction. Only the copy changes: block order, types, ids, links, merge
+    tags, image slots and the theme are kept; blocks are added or removed only when the author asks. Same options,
+    response, validation and billing as /generate (nothing is charged when it fails).
+    """
+    from src.email_template.rewrite import RewriteRequest, rewrite
+
+    req = RewriteRequest(
+        instruction=request_data.instruction, template=request_data.template, category=request_data.category,
+        tone=request_data.tone, audience=request_data.audience, language=request_data.language,
+        length=request_data.length, allowed_merge_tags=tuple(request_data.allowed_merge_tags),
+        links=request_data.links, assets=request_data.assets, sender=request_data.sender,
+        org_name=request_data.org_name, brand_kit_id=request_data.brand_kit_id, variants=request_data.variants,
+        sign_off=request_data.sign_off, social_links=request_data.social_links,
+        theme=request_data.theme.model_dump(exclude_none=True) if request_data.theme else None,
+        allow_block_changes=request_data.allow_block_changes,
+    )
+    # The rewrite is about as long as the template, so the reservation follows its size (at least the generate one).
+    per_variant = max(EMAIL_OUTPUT_CHARS_PER_VARIANT, email_readable_chars(request_data.template))
+    return await run_email_model_route(
+        '/agent/email/rewrite', request_data, request, background_tasks,
+        lambda llm, request_id: rewrite(req, llm, request_id),
+        per_variant * request_data.variants)
 
 
 @app.post('/agent/email/image')

@@ -58,6 +58,7 @@ class GenerateRequest:
     sign_off: Optional[str] = None                             # "signature" | "none" | None (category default)
     social_links: dict[str, str] = field(default_factory=dict)  # platform -> URL, shown in the footer in this order
     theme: Optional[dict] = None                                # accent_color, hero / footer section styles
+    layout: Optional[tuple[str, ...]] = None                    # fixed blocks, in order (layout.parse_layout)
 
 
 # "a banner image" is one picture, but the shared counter sees two image nouns.
@@ -90,6 +91,7 @@ def requested_image_slots(brief: str, category: Category) -> tuple[str, ...]:
 
 def _model_request(req: GenerateRequest, image_slots: tuple[str, ...], sign_off: Optional[str]) -> dict:
     data = {
+        "layout": list(req.layout) if req.layout else None,
         "brief": req.brief,
         "audience": req.audience,
         "language": req.language,
@@ -177,17 +179,22 @@ def make_routed_llm(candidates, key_for, request_id: Optional[str] = None, is_by
     return call
 
 
-def _generate_one(llm: LLM, system: str, first_user: str, ctx: Context, request_id: Optional[str]) -> Result:
-    """One variant. Provider errors propagate; generate() decides whether other variants can carry on."""
+def _generate_one(llm: LLM, system: str, first_user: str, ctx: Context, request_id: Optional[str],
+                  check: Optional[Callable[[str], Result]] = None) -> Result:
+    """
+    One variant: call, validate (`check`, default validate(reply, ctx)), and one repair pass on errors.
+    Provider errors propagate; the caller decides whether other variants can carry on.
+    """
+    check = check or (lambda reply: validate(reply, ctx))
     messages = [{"role": "user", "content": first_user}]
     reply = llm(system, messages)
-    result = validate(reply, ctx)
+    result = check(reply)
     if result.ok or not settings.email_ai_repair_enabled:
         return result
     logger.info(f"[{request_id}] email template needs repair: {[e.kind for e in result.errors]}")
     messages += [{"role": "assistant", "content": reply},
                  {"role": "user", "content": repair_message(reply, format_errors(result.errors))}]
-    repaired = validate(llm(system, messages), ctx)
+    repaired = check(llm(system, messages))
     fixed = ", ".join(sorted({e.kind for e in result.errors}))
     repaired.warnings.append(Issue("repaired", f"The first draft was corrected automatically ({fixed})."))
     return repaired
@@ -205,46 +212,59 @@ def effective_sign_off(req: GenerateRequest) -> Optional[str]:
     return req.sign_off
 
 
+def run_variants(n: int, one: Callable[[int], Result]) -> list[Result]:
+    """
+    n attempts in parallel (one thread each). A provider error in one variant does not stop the others; when every
+    variant failed at the provider, that error is raised rather than reported as a validation failure.
+    """
+    def guarded(i):
+        try:
+            return one(i)
+        except EmailProviderError as e:
+            return e
+
+    if n == 1:
+        outcomes = [guarded(0)]
+    else:
+        with ThreadPoolExecutor(max_workers=n, thread_name_prefix="email_variant") as pool:
+            futures = [pool.submit(copy_context().run, guarded, i) for i in range(n)]
+            outcomes = [future.result() for future in futures]
+    results = [o for o in outcomes if isinstance(o, Result)]
+    if not results:
+        raise next(o for o in outcomes if isinstance(o, EmailProviderError))
+    return results
+
+
 def generate(req: GenerateRequest, llm: LLM, request_id: Optional[str] = None) -> dict:
     """Validated templates for the request. Raises ValueError (bad input) or EmailGenerationError."""
+    from .layout import check_sign_off, image_slots as layout_image_slots
+
     sign_off = effective_sign_off(req)
     category, routing = resolve_category(req.brief, req.category)
     tone = req.tone or category.default_tone
-    image_slots = requested_image_slots(req.brief, category)
+    if req.layout:
+        check_sign_off(req.layout, sign_off)
+        image_slots = layout_image_slots(req.layout)
+    else:
+        image_slots = requested_image_slots(req.brief, category)
     ctx = Context(
         category=category, routing=routing, tone=tone, language=req.language,
         allowed_merge_tags=frozenset(req.allowed_merge_tags), link_keys=frozenset(req.links),
         asset_keys=frozenset(req.assets), image_slots=image_slots, brand_kit_id=req.brand_kit_id,
         source_texts=_source_texts(req), sign_off=sign_off,
-        social=tuple(req.social_links)[:SOCIAL_MAX], theme=req.theme,
+        social=tuple(req.social_links)[:SOCIAL_MAX], theme=req.theme, layout=req.layout or None,
     )
-    system = system_prompt(category, tone)
+    system = system_prompt(category, tone, fixed_layout=bool(req.layout))
     first_user = user_message(_model_request(req, image_slots, sign_off))
     n = max(1, min(req.variants, settings.email_ai_max_variants))
-
-    def one(_):
-        try:
-            return _generate_one(llm, system, first_user, ctx, request_id)
-        except EmailProviderError as e:
-            return e
-
-    if n == 1:
-        outcomes = [one(0)]
-    else:
-        with ThreadPoolExecutor(max_workers=n, thread_name_prefix="email_variant") as pool:
-            futures = [pool.submit(copy_context().run, one, i) for i in range(n)]
-            outcomes = [future.result() for future in futures]
-    results = [o for o in outcomes if isinstance(o, Result)]
-    provider_errors = [o for o in outcomes if isinstance(o, EmailProviderError)]
-    if not results:  # every variant failed at the provider: report that, not a validation failure
-        raise provider_errors[0]
+    results = run_variants(n, lambda _i: _generate_one(llm, system, first_user, ctx, request_id))
 
     good = [r for r in results if r.ok]
     logger.info(f"[{request_id}] email templates: category={category.id} routing={routing} tone={tone} "
-                f"ok={len(good)}/{n}")
+                f"layout={'fixed' if req.layout else 'category'} ok={len(good)}/{n}")
     if not good:
         raise EmailGenerationError(results[0].errors)
-    return {
+    out = {
         "resolved_category": category.id,
         "routing": routing,
         "tone": tone,
@@ -253,3 +273,6 @@ def generate(req: GenerateRequest, llm: LLM, request_id: Optional[str] = None) -
             for r in good
         ],
     }
+    if req.layout:
+        out["layout"] = list(req.layout)
+    return out

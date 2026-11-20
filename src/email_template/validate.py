@@ -45,6 +45,11 @@ class Context:
     sign_off: Optional[str] = None             # "signature" | "none" | None (category default)
     social: tuple[str, ...] = ()               # platforms with a link in the request, in display order
     theme: Optional[dict] = None               # user-chosen look (accent, hero/footer style)
+    # A caller-fixed layout ("header", "image:hero", ...): it replaces the category's structure rules.
+    layout: Optional[tuple[str, ...]] = None
+    # Rewrite only: inline link targets and raw URLs the original template already had (kept, not invented).
+    known_link_targets: frozenset[str] = frozenset()
+    known_urls: frozenset[str] = frozenset()
 
     @property
     def signature_rule(self) -> Optional[str]:
@@ -128,15 +133,63 @@ def _normalise_image_positions(blocks: list[dict]) -> list[dict]:
     return rest + hero[1:] + inline[1:]
 
 
+def _apply_layout_slots(blocks: list[dict], layout: tuple[str, ...]) -> None:
+    """With a fixed layout the slot of each image is the layout's, not the model's (when the blocks line up)."""
+    from .layout import block_type, image_slot
+
+    if [b["type"] for b in blocks] == [block_type(e) for e in layout]:
+        for b, entry in zip(blocks, layout):
+            if b["type"] == "image":
+                b["slot"] = image_slot(entry)
+
+
 def _rule_errors(t: dict, ctx: Context) -> list[Issue]:
+    errs = _duplicate_id_errors(t["blocks"])
+    errs += _layout_errors(t, ctx) if ctx.layout else _structure_errors(t, ctx)
+    errs += content_errors(t, ctx)
+    return errs
+
+
+def _duplicate_id_errors(blocks: list[dict]) -> list[Issue]:
+    ids = [b["id"] for b in blocks]
+    return [Issue("duplicate_id", f"Block id '{dup}' is used more than once.", dup)
+            for dup in sorted({i for i in ids if ids.count(i) > 1})]
+
+
+def cta_count(blocks: list[dict]) -> int:
+    return sum(1 for b in blocks if b["type"] == "button") + \
+        sum(1 for b in blocks if b["type"] == "hero_banner" and b.get("button"))
+
+
+_ONE_CTA = ("Exactly one call to action in the whole email (a button block or the hero_banner button). "
+            "Put any other links inline in a paragraph.")
+
+
+def _layout_errors(t: dict, ctx: Context) -> list[Issue]:
+    """A fixed layout: the blocks are exactly the layout, in order. The layout was checked at request time."""
+    from .layout import block_type
+
+    blocks = t["blocks"]
+    want = [block_type(e) for e in ctx.layout]
+    got = [b["type"] for b in blocks]
+    errs: list[Issue] = []
+    if got != want:
+        errs.append(Issue("layout", "Use exactly these blocks, in this order, one block per entry: "
+                                    f"{', '.join(ctx.layout)}. Your blocks were: {', '.join(got)}."))
+    if cta_count(blocks) > 1:
+        errs.append(Issue("too_many_buttons", _ONE_CTA))
+    footer = next((b for b in blocks if b["type"] == "footer"), None)
+    if ctx.category.bulk and footer is not None and not footer.get("unsubscribe"):
+        errs.append(Issue("unsubscribe", "Bulk emails must set unsubscribe: true in the footer.", footer["id"]))
+    return errs
+
+
+def _structure_errors(t: dict, ctx: Context) -> list[Issue]:
+    """The category's structure: allowed and required blocks, positions, one call to action, image slots."""
     cat = ctx.category
     blocks = t["blocks"]
     types = [b["type"] for b in blocks]
     errs: list[Issue] = []
-
-    ids = [b["id"] for b in blocks]
-    for dup in sorted({i for i in ids if ids.count(i) > 1}):
-        errs.append(Issue("duplicate_id", f"Block id '{dup}' is used more than once.", dup))
 
     for b in blocks:
         if b["type"] not in cat.allowed:
@@ -154,10 +207,9 @@ def _rule_errors(t: dict, ctx: Context) -> list[Issue]:
             errs.append(Issue("too_many", f"At most one '{single}' block."))
     if "hero_banner" in types and types.index("hero_banner") != 1:
         errs.append(Issue("hero_banner_position", "The hero_banner block comes directly after the header."))
-    ctas = types.count("button") + sum(1 for b in blocks if b["type"] == "hero_banner" and b.get("button"))
+    ctas = cta_count(blocks)
     if ctas > 1:
-        errs.append(Issue("too_many_buttons", "Exactly one call to action in the whole email (a button block or "
-                                              "the hero_banner button). Put any other links inline in a paragraph."))
+        errs.append(Issue("too_many_buttons", _ONE_CTA))
     if cat.needs_button and ctas == 0:
         errs.append(Issue("missing_block", f"{cat.id} emails need one button for the main action."))
     if ctx.signature_rule == "required" and "signature" not in types:
@@ -183,12 +235,31 @@ def _rule_errors(t: dict, ctx: Context) -> list[Issue]:
         if slot in seen_slots:
             errs.append(Issue("image_slot", f"Only one '{slot}' image per email.", b["id"]))
         seen_slots.append(slot)
-        if b.get("source") not in (None, "asset"):
-            errs.append(Issue("image_source", "Leave source null; the file is attached after generation.", b["id"]))
-        if b.get("source") == "asset" and b.get("asset", "").removeprefix("asset:") not in ctx.asset_keys:
-            errs.append(Issue("unknown_asset", "Use only the asset keys listed in the request.", b["id"]))
-        if b.get("source") is None and not b.get("generation_prompt"):
-            errs.append(Issue("image_prompt", "An empty image slot needs a generation_prompt.", b["id"]))
+    return errs
+
+
+def image_block_errors(b: dict, ctx: Context) -> list[Issue]:
+    """An image block written by the model: empty slot with a prompt, or one of the request's assets."""
+    errs = []
+    if b.get("source") not in (None, "asset"):
+        errs.append(Issue("image_source", "Leave source null; the file is attached after generation.", b["id"]))
+    if b.get("source") == "asset" and b.get("asset", "").removeprefix("asset:") not in ctx.asset_keys:
+        errs.append(Issue("unknown_asset", "Use only the asset keys listed in the request.", b["id"]))
+    if b.get("source") is None and not b.get("generation_prompt"):
+        errs.append(Issue("image_prompt", "An empty image slot needs a generation_prompt.", b["id"]))
+    return errs
+
+
+def content_errors(t: dict, ctx: Context, image_blocks: Optional[Iterable[dict]] = None) -> list[Issue]:
+    """
+    References in the copy: merge tags, links and assets must be ones the request (or, on a rewrite, the original
+    template) supplies, and no raw URLs. image_blocks: the image blocks to check (default all).
+    """
+    blocks = t["blocks"]
+    errs: list[Issue] = []
+    images = [b for b in blocks if b["type"] == "image"] if image_blocks is None else list(image_blocks)
+    for b in images:
+        errs += image_block_errors(b, ctx)
 
     header = blocks[0] if blocks and blocks[0]["type"] == "header" else None
     if header and header.get("logo_asset") and header["logo_asset"].removeprefix("asset:") not in ctx.asset_keys:
@@ -204,9 +275,10 @@ def _rule_errors(t: dict, ctx: Context) -> list[Issue]:
             if tag not in ctx.allowed_merge_tags:
                 errs.append(Issue("unknown_merge_tag", f"'{{{{{tag}}}}}' is not an allowed merge tag.", bid, fld))
         for target in _ANY_INLINE_LINK_RE.findall(text):
-            if not target.startswith("link:") or target.removeprefix("link:") not in ctx.link_keys:
+            known = target.startswith("link:") and target.removeprefix("link:") in ctx.link_keys
+            if not known and target not in ctx.known_link_targets:
                 errs.append(Issue("unknown_link", f"Inline link '{target}' is not one of the links supplied.", bid, fld))
-        if _RAW_URL_RE.search(INLINE_LINK_RE.sub("", text)):
+        if any(m.group(0) not in ctx.known_urls for m in _RAW_URL_RE.finditer(INLINE_LINK_RE.sub("", text))):
             errs.append(Issue("raw_url", "Do not write URLs; use the link keys supplied.", bid, fld))
     return errs
 
@@ -263,7 +335,10 @@ def validate(raw: Any, ctx: Context) -> Result:
     opts = template["meta"]["subject_options"]
     if template["meta"].get("subject") not in opts:
         template["meta"]["subject"] = opts[0]
-    template["blocks"] = _normalise_image_positions(template["blocks"])
+    if ctx.layout:
+        _apply_layout_slots(template["blocks"], ctx.layout)
+    else:
+        template["blocks"] = _normalise_image_positions(template["blocks"])
 
     res.errors.extend(_rule_errors(template, ctx))
     tone = lint(template, ctx.tone, ctx.source_texts)
