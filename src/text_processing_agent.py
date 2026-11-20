@@ -19,7 +19,9 @@ from .models import (
     ensure_allowed_model,
     claude_accepts_temperature,
     advanced_model_id,
+    claude_effort_kwargs,
     claude_effort_params,
+    claude_light_kwargs,
     claude_light_request_params,
     openai_effort_params,
     openai_reasoning_family,
@@ -375,6 +377,24 @@ def _output_limit_kwargs(model_provider: str, model_id: str, max_tokens: Optiona
         return {'max_completion_tokens': limit}   # gpt-5.x and gpt-6.x reject max_tokens
     return {'max_tokens': limit}                  # Claude, Grok, DeepSeek and the older OpenAI models
 
+
+
+def design_openai_kwargs(provider: str, model_id: str, output_cap: int, temperature: float, has_image: bool) -> dict:
+    """
+    Optional arguments of the design canvas's OpenAI-compatible call (OpenAI, Grok, DeepSeek): output cap, effort or temperature,
+    JSON mode. One builder for the call site and src/sdk_contracts.py.
+    """
+    from config import settings
+    from src.models import OPENAI_DESIGN_EFFORT
+    kwargs = dict(_output_limit_kwargs(provider, model_id, output_cap))   # gpt-5.x / gpt-6.x reject max_tokens
+    if provider == "openai" and openai_reasoning_family(model_id):
+        effort = settings.design_vision_openai_effort if has_image else OPENAI_DESIGN_EFFORT
+        kwargs.update(openai_effort_params(model_id, effort))      # no temperature: a 400 unless effort is "none"
+    else:
+        kwargs["temperature"] = temperature
+    if provider == "openai":
+        kwargs["response_format"] = {"type": "json_object"}
+    return kwargs
 
 def _warm_client(model) -> None:
     """
@@ -3005,7 +3025,7 @@ def process_user_query_stream(
         }}}
         return
 
-    from .provider_errors import can_fall_back, is_provider_unusable, is_rate_limit, retry_delay, status_code
+    from .provider_errors import can_fall_back, is_provider_unusable, is_sdk_contract_error, is_rate_limit, retry_delay, status_code
     from .models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, DEEPSEEK_TOOL_MODEL_ID, output_token_budget
     fallbacks = []
     sent = False
@@ -3091,7 +3111,11 @@ def process_user_query_stream(
                 has_images_started = any(not str(k).startswith('__') for k in pending_images)
                 if sent or has_images_started or not settings.provider_fallback_enabled or not can_fall_back(error):
                     raise
-                if is_provider_unusable(error):
+                if is_sdk_contract_error(error):
+                    # A wrong SDK version on this server, not the user or the provider. provider_health already logged the CRITICAL
+                    # alert; this line ties it to the request.
+                    logger.critical('%sevent=sdk_contract_mismatch %s: %s; falling back', log_prefix, provider, error)
+                elif is_provider_unusable(error):
                     # The request still succeeds on the next provider, so this log is the only sign of a dead key.
                     logger.error('%s%s key or model unusable (%s); falling back', log_prefix, provider,
                                  status_code(error) or type(error).__name__)
@@ -3106,7 +3130,7 @@ def process_user_query_stream(
                     continue
                 if index + 1 == len(candidates):
                     raise
-                reason = str(status_code(error) or type(error).__name__)
+                reason = 'sdk_contract_mismatch' if is_sdk_contract_error(error) else str(status_code(error) or type(error).__name__)
                 HEALTH.record_fallback(provider, candidates[index + 1].provider, reason)
                 fallbacks.append({'from': provider, 'to': candidates[index + 1].provider, 'error': reason})
                 trace_set(request_id, fallbacks=fallbacks)
@@ -3677,10 +3701,8 @@ def _run_design_json_completion(
             else:
                 anthropic_messages.append({"role": role, "content": content})
 
-        claude_kwargs = {"temperature": temperature} if claude_accepts_temperature(model_id) else {}   # Opus 5 and newer: 400
-        effort = claude_effort_params(model_id, settings.claude_advanced_effort)
-        if effort:
-            claude_kwargs["output_config"] = effort
+        # temperature only where the model takes it (Opus 5 and newer: 400); output_config carries the effort dial
+        claude_kwargs = claude_effort_kwargs(model_id, temperature, settings.claude_advanced_effort)
         # Opus 5.5 always thinks and thinking counts against max_tokens, so the cap leaves room for it on top of the JSON.
         claude_cap = output_token_budget(model_id, output_cap)
         resp = client.messages.create(
@@ -3719,18 +3741,8 @@ def _run_design_json_completion(
             else:
                 openai_messages.append({"role": role, "content": content})
 
-        kwargs = {
-            "model": model_id,
-            "messages": openai_messages,
-            **_output_limit_kwargs(provider, model_id, output_cap),  # gpt-5.x / gpt-6.x reject max_tokens
-        }
-        if provider == "openai" and openai_reasoning_family(model_id):
-            effort = settings.design_vision_openai_effort if image_bytes else OPENAI_DESIGN_EFFORT
-            kwargs.update(openai_effort_params(model_id, effort))      # no temperature: a 400 unless effort is "none"
-        else:
-            kwargs["temperature"] = temperature
-        if provider == "openai":
-            kwargs["response_format"] = {"type": "json_object"}
+        kwargs = {"model": model_id, "messages": openai_messages,
+                  **design_openai_kwargs(provider, model_id, output_cap, temperature, bool(image_bytes))}
         resp = client.chat.completions.create(**kwargs)
         record_provider_usage(request_id, 'design_canvas', provider, model_id, resp)
         choices = getattr(resp, "choices", None)
@@ -3871,8 +3883,7 @@ def get_autocomplete_suggestion(
 
         elif model_provider == 'claude':
             client = _get_cached_anthropic_client(api_key, timeout=AUTOCOMPLETE_TIMEOUT_SECONDS)
-            claude_kwargs = {"temperature": 0.3} if claude_accepts_temperature(model_id) else {}   # Haiku 5.5 and newer: 400
-            claude_kwargs.update(claude_light_request_params(model_id))                            # Haiku 5.x: thinking off, effort low
+            claude_kwargs = claude_light_kwargs(model_id, 0.3)   # no temperature on Haiku 5.5+; thinking off, effort low
             response = client.messages.create(
                 model=model_id,
                 system=[

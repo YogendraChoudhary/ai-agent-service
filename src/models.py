@@ -197,6 +197,25 @@ def claude_light_request_params(model_id: str) -> dict:
     return {}
 
 
+def claude_light_kwargs(model_id: str, temperature: float) -> dict:
+    """
+    Optional arguments of a direct light-tier Claude call (autocomplete, voice formatter): temperature where the model takes it,
+    plus claude_light_request_params. One builder for the call sites and src/sdk_contracts.py, which checks the installed SDK takes them.
+    """
+    extra = {"temperature": temperature} if claude_accepts_temperature(model_id) else {}
+    extra.update(claude_light_request_params(model_id))
+    return extra
+
+
+def claude_effort_kwargs(model_id: str, temperature: float, effort: str) -> dict:
+    """Optional arguments of a direct advanced-tier Claude call (design canvas): temperature where taken, output_config for effort."""
+    extra = {"temperature": temperature} if claude_accepts_temperature(model_id) else {}
+    output_config = claude_effort_params(model_id, effort)
+    if output_config:
+        extra["output_config"] = output_config
+    return extra
+
+
 # Inline autocomplete fires on almost every keystroke, and the user is charged a
 # flat AUTOCOMPLETE_CREDITS_SCALED rate regardless of which model serves it — so
 # the model's cost comes straight out of our margin. Always the cheapest usable

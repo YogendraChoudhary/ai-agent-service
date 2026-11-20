@@ -24,12 +24,45 @@ def is_retryable(err):
                            'resource_exhausted', 'rate limit', 'ratelimit'))
 
 
+# Our code and the installed SDK disagree about a call (an argument the SDK version does not have, ...). agno turns the TypeError into
+# its run's error text, so this is matched on text too. Nothing the user did; another provider's SDK can still serve the request.
+_SDK_CONTRACT_RE = re.compile(r"unexpected keyword argument|missing \d+ required (?:keyword-only |positional )?argument"
+                              r"|takes \d+ positional arguments? but \d+ (?:were|was) given")
+_PROVIDER_PREFIX_RE = re.compile(r"^(openai|claude|gemini|grok|deepseek) request failed:", re.IGNORECASE)
+# Python errors from our own code: their text means nothing to a user and can reveal internals.
+_INTERNAL_ERRORS = (TypeError, AttributeError, KeyError, NameError, IndexError, AssertionError, UnboundLocalError,
+                    ZeroDivisionError, ImportError, NotImplementedError)
+
+
+def is_sdk_contract_error(err):
+    return bool(_SDK_CONTRACT_RE.search(str(err)))
+
+
+def public_error_message(err, provider=None):
+    """
+    What a user may see for an error. Errors they can act on (bad key, rate limit, bad input, provider outage) keep their text; an SDK
+    mismatch or a Python error from our own code gets a plain message instead. Log the real error yourself (with the request id).
+    """
+    text = str(err)
+    match = _PROVIDER_PREFIX_RE.match(text)
+    provider = provider or (match.group(1).lower() if match else None)
+    if is_sdk_contract_error(err):
+        name = {'claude': 'Claude', 'openai': 'OpenAI', 'gemini': 'Gemini', 'grok': 'Grok', 'deepseek': 'DeepSeek'}.get(provider or '')
+        return (f"The {name} model is temporarily unavailable because of a problem on our side. Please try again shortly or choose "
+                "another model." if name else "The AI service ran into a problem on our side. Please try again shortly.")
+    if isinstance(err, _INTERNAL_ERRORS):
+        return "Something went wrong on our side. Please try again."
+    return text
+
+
 def is_provider_unusable(err):
     """A broken key, missing permission or retired model: this provider cannot serve, but another one can."""
     status = status_code(err)
     text = (type(err).__name__ + ' ' + str(err)).lower()
     if any(s in text for s in ('safety', 'content_filter')):
         return False
+    if is_sdk_contract_error(err):
+        return True
     return status in (401, 403, 404) or any(
         s in text for s in ('invalid api key', 'invalid x-api-key', 'authentication', 'permission denied',
                            'model not found', 'model_not_found'))

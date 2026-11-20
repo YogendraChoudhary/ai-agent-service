@@ -24,7 +24,7 @@ ALERT_LOG_INTERVAL = 60 * 60
 _MAX_EVENTS = 20_000
 
 # kinds where the call produced no answer at all (truncated / refused / empty have their own alerts)
-HARD_FAILURE_KINDS = ("key_rejected", "model_missing", "request_rejected", "rate_limited", "server_error")
+HARD_FAILURE_KINDS = ("key_rejected", "model_missing", "request_rejected", "rate_limited", "server_error", "sdk_contract_mismatch")
 
 _KEY = re.compile(r"(sk-[A-Za-z0-9_\-]{6})[A-Za-z0-9_\-]+|(AIza[A-Za-z0-9_\-]{4})[A-Za-z0-9_\-]+|(xai-[A-Za-z0-9]{4})[A-Za-z0-9]+")
 
@@ -35,7 +35,9 @@ def _scrub(text: str, limit: int = 160) -> str:
 
 def classify_error(error: BaseException) -> str:
     """What a provider error means for the rollout, from its status and text."""
-    from .provider_errors import is_rate_limit, status_code
+    from .provider_errors import is_rate_limit, is_sdk_contract_error, status_code
+    if is_sdk_contract_error(error):
+        return "sdk_contract_mismatch"               # our code and the installed SDK disagree: every call on this path fails
     status = status_code(error)
     text = (type(error).__name__ + " " + str(error)).lower()
     if any(s in text for s in ("model_not_found", "does not exist", "model not found", "no longer available", "decommissioned")) or status == 404:
@@ -60,12 +62,16 @@ class ProviderHealth:
         self._lock = threading.Lock()
         self._alerted: Dict[Tuple[str, str, str], float] = {}
         self.preflight: Optional[Dict[str, Any]] = None
+        self.sdk_contracts: Optional[Dict[str, Any]] = None       # src/sdk_contracts.run_startup_check
 
     # ------------------------------------------------------------------ recording
     def record(self, provider: str, model: str, kind: str, *, byok: bool = False, detail: str = "") -> None:
         now = time.time()
         with self._lock:
             self._events.append((now, str(provider), str(model), kind, bool(byok), _scrub(detail) if detail else ""))
+        if kind == "sdk_contract_mismatch":
+            self._log_alert(kind, provider, model, detail, now)         # the server's SDK, whoever's key: alert on the first one
+            return
         if byok:
             return
         if kind in ("key_rejected", "model_missing"):
@@ -93,6 +99,10 @@ class ProviderHealth:
             if now - self._alerted.get(key, 0) < ALERT_LOG_INTERVAL:
                 return
             self._alerted[key] = now
+        if kind == "sdk_contract_mismatch":
+            logger.critical("ROLLOUT_ALERT event=sdk_contract_mismatch %s provider=%s model=%s %s", _ALERT_TEXT[kind], provider, model,
+                            _scrub(detail, 200))
+            return
         logger.error("ROLLOUT_ALERT %s provider=%s model=%s %s", _ALERT_TEXT[kind], provider, model, _scrub(detail, 200))
 
     # ------------------------------------------------------------------ reading
@@ -121,11 +131,12 @@ class ProviderHealth:
         for _, a, b, reason in fallbacks:
             pairs[f"{a}->{b} ({reason})"] += 1
         return {"window_seconds": self.window, "models": models, "fallbacks": dict(pairs), "alerts": self.alerts(events),
-                "preflight": self.preflight}
+                "preflight": self.preflight, "sdk_contracts": self.sdk_contracts}
 
     def alerts(self, events=None) -> List[Dict[str, Any]]:
         events = self._window(time.time()) if events is None else events
-        platform = [e for e in events if not e[4]]                 # a user's own (BYOK) key failing is their problem, not a rollout alert
+        # a user's own (BYOK) key failing is their problem, not a rollout alert; an SDK mismatch is ours whoever's key it was
+        platform = [e for e in events if not e[4] or e[3] == "sdk_contract_mismatch"]
         out: List[Dict[str, Any]] = []
         by_model: Dict[Tuple[str, str], List[Tuple[float, str, str, str, bool, str]]] = defaultdict(list)
         for e in platform:
@@ -141,6 +152,8 @@ class ProviderHealth:
                 out.append({"code": code, "severity": severity, "provider": provider, "model": model, "count": count, "calls": calls,
                             "what": _ALERT_TEXT.get(code, code), "sample": sample})
 
+            if kinds["sdk_contract_mismatch"]:
+                alert("sdk_contract_mismatch", "critical", kinds["sdk_contract_mismatch"])
             if kinds["key_rejected"]:
                 alert("key_rejected", "critical", kinds["key_rejected"])
             if kinds["model_missing"]:
@@ -154,23 +167,31 @@ class ProviderHealth:
             if calls >= 20 and kinds["empty"] / calls > 0.05:
                 alert("empty", "warning", kinds["empty"])
             failed = sum(kinds[k] for k in HARD_FAILURE_KINDS)
-            if calls >= 10 and failed / calls > 0.2 and not {"key_rejected", "model_missing", "request_rejected"} & set(k for k, v in kinds.items() if v):
+            if calls >= 10 and failed / calls > 0.2 and not {"key_rejected", "model_missing", "request_rejected", "sdk_contract_mismatch"} & set(k for k, v in kinds.items() if v):
                 alert("high_failure_rate", "warning", failed)
         if self.preflight and not self.preflight.get("ok", True):
             for problem in self.preflight.get("problems", []):
                 out.append({"code": "preflight", "severity": "critical", "provider": problem.get("provider"), "model": problem.get("model"),
                             "count": 1, "calls": 0, "what": "failed the startup check", "sample": problem.get("detail", "")})
+        if self.sdk_contracts and not self.sdk_contracts.get("ok", True):
+            for finding in self.sdk_contracts.get("findings", []):
+                out.append({"code": "sdk_contract_mismatch", "severity": "critical", "provider": None, "model": None,
+                            "count": 1, "calls": 0, "what": _ALERT_TEXT["sdk_contract_mismatch"],
+                            "sample": finding.get("message", "")})
         return out
 
     def reset(self) -> None:
         with self._lock:
             self._events.clear(); self._fallbacks.clear(); self._alerted.clear(); self.preflight = None
+            self.sdk_contracts = None
 
 
 _ALERT_TEXT = {
     "key_rejected": "the platform key was rejected or cannot spend (401/403/402); requests silently fall back to another provider",
     "model_missing": "the model no longer exists (404 / does not exist)",
     "request_rejected": "the model rejects our request shape (400); a parameter or setting it no longer accepts",
+    "sdk_contract_mismatch": "the installed provider SDK does not accept an argument we send (wrong SDK version deployed: install "
+                             "requirements.lock); every call on this path fails, requests fall back to another provider where allowed",
     "truncated": "answers are being cut off at max_tokens",
     "refused": "the model is refusing requests",
     "empty": "the model returns empty answers",

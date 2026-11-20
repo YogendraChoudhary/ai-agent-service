@@ -59,6 +59,7 @@ from src.credit_manager import (
 from src.redis_manager import get_redis_manager
 from src.provider_work import AUTOCOMPLETE_TIMEOUT_SECONDS, iterate_provider, run_provider_work
 from src.image_gen import sanitize_image_params
+from src.provider_errors import public_error_message
 from src.text_processing_agent import (
     FREE_FORM_AGENT,
     VISION_CAPABLE_PROVIDERS,
@@ -253,6 +254,10 @@ async def lifespan(app: FastAPI):
         logger.info(f"✅ Pre-warmed {prewarm_count} model configurations")
     except Exception as e:
         logger.warning(f"Model pre-warming encountered an issue (non-fatal): {e}")
+
+    # Before serving: do the installed provider SDKs take every argument we send? (offline; see src/sdk_contracts.py)
+    from src.sdk_contracts import run_startup_check
+    run_startup_check(settings.sdk_contract_on_mismatch)
 
     from src.models import MODEL_ENV_OVERRIDES
     if MODEL_ENV_OVERRIDES:
@@ -1737,7 +1742,9 @@ async def stream_text(
                 trace_status, trace_error = 'error', CONTEXT_ERROR if had_document_context else str(e)
                 error_code = type(e).__name__
                 logger.error(f"[{request_id}] STREAM FAILED — {trace_error}")
-                yield f"data: {json.dumps({'type': 'error', 'error': trace_error})}\n\n"
+                # The log and trace keep the real error; the user gets text they can act on (src/provider_errors.public_error_message).
+                client_error = CONTEXT_ERROR if had_document_context else public_error_message(e)
+                yield f"data: {json.dumps({'type': 'error', 'error': client_error})}\n\n"
 
             except GeneratorExit:
                 trace_status = 'aborted'
@@ -2033,7 +2040,7 @@ async def autocomplete_text(
         finish_trace(request_id, 'error', error=type(e).__name__, http_status=500)
         return JSONResponse(
             status_code=500,
-            content={'error': str(e)},
+            content={'error': public_error_message(e)},
             headers={"X-Request-ID": request_id},
         )
 
@@ -2270,12 +2277,12 @@ async def run_email_model_route(route: str, request_data, request: Request, back
         release_reservation()
         logger.error(f"[{request_id}] {route} provider error — {e}")
         finish_trace(request_id, 'error', error=str(e), http_status=502)
-        return JSONResponse(status_code=502, content={'error': str(e)}, headers=headers)
+        return JSONResponse(status_code=502, content={'error': public_error_message(e)}, headers=headers)
     except Exception as e:
         release_reservation()
         logger.error(f"[{request_id}] {route} FAILED — {e}")
         finish_trace(request_id, 'error', error=str(e), http_status=500)
-        return JSONResponse(status_code=500, content={'error': str(e)}, headers=headers)
+        return JSONResponse(status_code=500, content={'error': public_error_message(e)}, headers=headers)
 
     output_chars = email_output_chars(result)
     provider = llm.used.get('provider') or request_data.model
@@ -2382,7 +2389,7 @@ async def email_image(request_data: EmailImageRequest, request: Request,
         return JSONResponse(status_code=413, content={'error': str(e)}, headers=headers)
     except Exception as e:
         logger.error(f"[{request_id}] email image FAILED — {e}")
-        return JSONResponse(status_code=500, content={'error': str(e)}, headers=headers)
+        return JSONResponse(status_code=500, content={'error': public_error_message(e)}, headers=headers)
 
     return JSONResponse(
         status_code=200,

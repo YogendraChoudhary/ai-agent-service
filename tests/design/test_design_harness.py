@@ -86,8 +86,12 @@ class TestHarnessCleanGeneration:
         assert isinstance(result, DesignDocumentAST)
 
     @pytest.mark.asyncio
-    async def test_vision_keeps_reference_image_on_retry(self):
+    async def test_vision_keeps_reference_image_on_retry(self, monkeypatch):
+        from config import settings
         from src.design_canvas.service import execute_design_canvas_harness
+
+        # The single-pass build-and-retry path; the two-pass describe call (on by default) is covered by its own tests.
+        monkeypatch.setattr(settings, "design_vision_two_pass", False)
 
         call_images: list[Optional[bytes]] = []
 

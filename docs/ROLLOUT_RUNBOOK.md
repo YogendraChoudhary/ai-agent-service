@@ -5,7 +5,13 @@ Measurements behind every choice: `docs/MODEL_UPGRADE_BENCHMARK.md`.
 
 ## 1. Before deploying
 
-1. `python scripts/preflight_models.py` must exit 0. It makes free lookups only: every model the app can call (all tiers, pins, design, image default and fallbacks) must exist, and each platform key (Anthropic, OpenAI, Gemini) must be accepted. A dead key or a withdrawn model is exactly what stayed invisible before (a dead Anthropic key behind silent fallback for weeks; `gpt-image-1` withdrawn). It does **not** see a depleted balance (that only fails when a call is generated).
+0. Install dependencies from **`requirements.lock`** (`pip install -r requirements.lock`), not `requirements.txt`, and make sure the
+   deploy really replaces them: a reused virtualenv or a cached Docker layer keeps the old SDKs. Check with
+   `pip freeze | grep -E "anthropic|openai|google-genai|agno"` after the deploy. On 2026-11-20 every Claude call failed in production
+   with `Messages.stream() got an unexpected keyword argument 'output_config'`: the server had an older anthropic SDK than the one
+   the code was tested with.
+1. `python scripts/preflight_models.py` must exit 0. It first checks, offline, that the installed provider SDKs accept every argument the
+   app sends (`src/sdk_contracts.py`; `--sdk-only` runs just that, for CI or an image build). It makes free lookups only: every model the app can call (all tiers, pins, design, image default and fallbacks) must exist, and each platform key (Anthropic, OpenAI, Gemini) must be accepted. A dead key or a withdrawn model is exactly what stayed invisible before (a dead Anthropic key behind silent fallback for weeks; `gpt-image-1` withdrawn). It does **not** see a depleted balance (that only fails when a call is generated).
 2. Deployment settings (none are required, all have the measured defaults):
 
 | Setting | Default | Meaning |
@@ -14,6 +20,7 @@ Measurements behind every choice: `docs/MODEL_UPGRADE_BENCHMARK.md`.
 | `CLAUDE_BASIC_EFFORT` | empty | Sonnet 5.5; empty = model default (low changed nothing) |
 | `OPENAI_ADVANCED_EFFORT` | `none` | gpt-6.1-terra; tool-using agents always run at `none` |
 | `MODEL_PREFLIGHT_ON_START` | `true` | startup check in a background thread; logs `ROLLOUT_ALERT preflight ...` |
+| `SDK_CONTRACT_ON_MISMATCH` | `warn` | startup SDK check: `warn` logs CRITICAL `ROLLOUT_ALERT event=sdk_contract_mismatch` and keeps serving the paths that work; `fail` refuses to start. Use `fail` only with a health-gated rollout (on a single instance a failed start is a full outage) |
 | `AGENT_BACKEND_SECRET` | unset | set it: it is also what lets a monitor read `/agent/health/providers` (header `X-Agent-Backend-Secret`) |
 | `TEXT_PRICES_PER_MTOK` | unset | add `claude-opus-5-5` [4, 20], `claude-sonnet-5-5` [2, 10], `claude-haiku-5-5` [0.10, 0.50], `gpt-6.1-terra` [1, 5], `gpt-6.1-sol` [2, 10] (list prices of 2026-11; unset stays "unknown", never zero) |
 | `IMAGE_CREDITS_BY_MODEL` | unset | the old `openai/gpt-image-1` key matches nothing now; add `openai/gpt-image-2.5-flare` etc. if you price per model (unset = flat 5 credits) |

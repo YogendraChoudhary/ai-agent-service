@@ -25,12 +25,9 @@ def _answer(response, provider, model_id, run_status):
     return getattr(response, 'content', '')
 
 
-def _call(text, provider, key, timeout, request_id=None, system=_SYSTEM, max_tokens=5, sdk_deadline_floor=0.0):
-    import httpx
-    from agno.agent import Agent
-    from agno.run.base import RunStatus
+def build_light_model(provider, key, max_tokens=5):
+    """The classifier's agno model: the basic tier's model with the light (autocomplete) ID and request settings."""
     from .text_processing_agent import get_model
-    from .observability import record_text_usage
     model = get_model(provider, key, use_advanced=False, cache_model=False)
     model.id = ensure_allowed_model(AUTOCOMPLETE_MODEL_IDS[provider])
     # get_model() built this model for the basic tier, whose Claude ID may reject temperature; the ID was just replaced
@@ -46,6 +43,15 @@ def _call(text, provider, key, timeout, request_id=None, system=_SYSTEM, max_tok
         model.thinking, model.output_config = light.get('thinking'), light.get('output_config')
         if light:
             model.max_tokens = max(max_tokens, 8)
+    return model
+
+
+def _call(text, provider, key, timeout, request_id=None, system=_SYSTEM, max_tokens=5, sdk_deadline_floor=0.0):
+    import httpx
+    from agno.agent import Agent
+    from agno.run.base import RunStatus
+    from .observability import record_text_usage
+    model = build_light_model(provider, key, max_tokens)
     # SDK clients all receive a transport timeout and no automatic retries.
     with httpx.Client(timeout=timeout) as client:
         if provider == 'gemini':

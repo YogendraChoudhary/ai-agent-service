@@ -287,7 +287,7 @@ solid fallback and all gradient stops against the effective background.
 
 **Compatibility guard (the "nothing breaks" part):**
 
-* Config flag `DESIGN_SCHEMA_V11_ENABLED` (default **off**). The JSON schema embedded in `DESIGN_SYSTEM_PROMPT` is
+* Config flag `DESIGN_SCHEMA_V11_ENABLED` (default **on** since 2026-11-20). The JSON schema embedded in `DESIGN_SYSTEM_PROMPT` is
   generated from the model, so it would grow automatically — guard it: build the prompt schema from the 1.0 model
   when the flag is off, the 1.1 model when on. Both strings stay byte-stable (prompt cache).
 * `downgrade_to_v10(ast) -> DesignDocumentAST` runs on the way out when the flag is off (or the request says
@@ -301,7 +301,7 @@ solid fallback and all gradient stops against the effective background.
 
 ### W4 — Two-pass vision recreation (layout fidelity)
 
-Behind `DESIGN_VISION_TWO_PASS` (default off until W0 shows it wins). Only for `create_from_vision`.
+Behind `DESIGN_VISION_TWO_PASS` (default on since 2026-11-20). Only for `create_from_vision`.
 
 **Pass A — describe** (small JSON, image attached). Pydantic model `ReferenceSpec`:
 

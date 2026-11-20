@@ -38,9 +38,10 @@ beautifulsoup4
 # AI Model Providers
 # NOTE: agno reaches Grok (xAI) and DeepSeek through the openai client, so no
 # separate `xai`/`deepseek` packages are needed.
-openai
-anthropic<1.0  # 1.x removed `temperature` from Messages.stream(), which agno 2.8.5 sends: every Claude call fails
-google-genai          # Google GenAI SDK — used for Gemini autocomplete and image generation
+openai==3.26.1  # pinned: provider SDKs decide which request arguments exist (see src/sdk_contracts.py)
+anthropic==0.125.0  # pinned: older 0.x lacks `output_config` (Claude effort), 1.x removed `temperature` that agno 2.8.5 sends;
+                    # either way every Claude call fails. Change only together with src/sdk_contracts.py's check passing.
+google-genai==2.29.0  # Google GenAI SDK — Gemini autocomplete and image generation (pinned with the other provider SDKs)
 
 # Local speech recognition for src/voice_flow (VOICE_FLOW_ENABLED). Pulls in ctranslate2, onnxruntime (Silero VAD), PyAV and
 # numpy. voice_flow decodes uploaded audio with PyAV itself (faster-whisper 1.2.1's own file decoding fails on PyAV 19).

@@ -182,6 +182,6 @@ That is a product and legal decision, not a technical one.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `DESIGN_IMAGE_FILL_ENABLED` | off | The `fill_design_images` route. Needs schema 1.1 and the editor change in I6 |
+| `DESIGN_IMAGE_FILL_ENABLED` | on (since 2026-11-20) | The `fill_design_images` route. Needs schema 1.1 and the editor change in I6 |
 | `DESIGN_MAX_FILL_IMAGES` | 12 | Most images one fill request generates |
 | `DESIGN_FILL_FROM_REFERENCE_ENABLED` | off | I5 image-to-image from the screenshot's crops |

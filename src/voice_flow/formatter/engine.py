@@ -21,7 +21,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple
 
 from config import settings
-from src.models import AUTOCOMPLETE_MODEL_IDS, claude_accepts_temperature, claude_light_request_params, ensure_allowed_model
+from src.models import AUTOCOMPLETE_MODEL_IDS, claude_accepts_temperature, claude_light_kwargs, ensure_allowed_model
 from src.observability import record_provider_usage
 from src.voice_flow.formatter.claims import CLEAN_KINDS, POLISHED_KINDS, missing_claims
 from src.voice_flow.formatter.gate import needs_model
@@ -256,8 +256,7 @@ class ClaudeBackend:
         if self._client is None:
             self._client = anthropic.AsyncAnthropic(api_key=self.api_key, max_retries=0)
         try:
-            extra = {"temperature": 0} if claude_accepts_temperature(self.model) else {}     # Haiku 5.5 and newer: 400
-            extra.update(claude_light_request_params(self.model))                            # Haiku 5.x: thinking off, effort low
+            extra = claude_light_kwargs(self.model, 0)      # no temperature on Haiku 5.5+; thinking off, effort low
             response = await self._client.messages.create(
                 model=self.model, system=system, messages=turns, max_tokens=max_output_tokens, timeout=timeout, **extra)
         except anthropic.APIStatusError as exc:

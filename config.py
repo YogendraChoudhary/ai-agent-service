@@ -46,15 +46,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     design_canvas_enabled: bool = Field(True, alias="DESIGN_CANVAS_ENABLED")
     design_max_repair_attempts: int = Field(2, ge=0, le=5, alias="DESIGN_MAX_REPAIR_ATTEMPTS")
-    design_schema_v11_enabled: bool = Field(False, alias="DESIGN_SCHEMA_V11_ENABLED")
-    design_vision_two_pass: bool = Field(False, alias="DESIGN_VISION_TWO_PASS")
+    # On by default since 2026-11-20 (the owner's call): 1.1 designs (fonts, gradient text, ImageNode), the two-pass reference
+    # match and photo fill. The editor must render schema 1.1; set these false to return 1.0 output.
+    design_schema_v11_enabled: bool = Field(True, alias="DESIGN_SCHEMA_V11_ENABLED")
+    design_vision_two_pass: bool = Field(True, alias="DESIGN_VISION_TWO_PASS")
     design_max_fidelity_repairs: int = Field(1, ge=0, le=1, alias="DESIGN_MAX_FIDELITY_REPAIRS")
     design_vision_openai_effort: Literal["low", "medium"] = Field("low", alias="DESIGN_VISION_OPENAI_EFFORT")
     design_vision_max_output_tokens: int = Field(8192, ge=8192, le=12000, alias="DESIGN_VISION_MAX_OUTPUT_TOKENS")
     # Photo fill (docs/design_image_fill_plan.md): "add real photos" on a selected 1.1 design sends its image
     # placeholders through the image generation flow. Needs DESIGN_SCHEMA_V11_ENABLED and an editor that renders
     # ImageNode and applies image_ready by placeholder_id.
-    design_image_fill_enabled: bool = Field(False, alias="DESIGN_IMAGE_FILL_ENABLED")
+    design_image_fill_enabled: bool = Field(True, alias="DESIGN_IMAGE_FILL_ENABLED")
     design_max_fill_images: int = Field(12, ge=1, le=24, alias="DESIGN_MAX_FILL_IMAGES")
     # How hard Claude's advanced tier (claude-opus-5-5) thinks: low | medium | high | xhigh | max. Thinking cannot be switched off on
     # this model and is billed as output, so this is the speed/cost/quality dial. "low" measured as good as "medium" on writing, design
@@ -66,6 +68,11 @@ class Settings(BaseSettings):
     # At startup, look up every configured model and platform key in a background thread (free calls) and log ROLLOUT_ALERT lines for
     # anything missing or rejected; the result is served at GET /agent/health/providers. scripts/preflight_models.py runs the same check.
     model_preflight_on_start: bool = Field(True, alias="MODEL_PREFLIGHT_ON_START")
+    # At startup, check that the installed provider SDKs accept every argument the app sends (src/sdk_contracts.py; offline, ~0.1 s).
+    # "warn": log CRITICAL `ROLLOUT_ALERT event=sdk_contract_mismatch` and keep serving the paths that work. "fail": refuse to start.
+    # Use "fail" only where a failed start keeps the old version serving (health-gated rollout); on a single instance it turns one
+    # broken provider into a full outage.
+    sdk_contract_on_mismatch: str = Field("warn", alias="SDK_CONTRACT_ON_MISMATCH", pattern=r"^(warn|fail)$")
     # Same dial for the basic tier (claude-sonnet-5-5: quick edits, summaries, long-document passages). Empty = the model's own default.
     claude_basic_effort: str = Field("", alias="CLAUDE_BASIC_EFFORT")
     code_classifier_timeout_seconds: float = Field(1.5, gt=0, alias="CODE_CLASSIFIER_TIMEOUT_SECONDS")
