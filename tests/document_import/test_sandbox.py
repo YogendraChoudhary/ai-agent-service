@@ -108,10 +108,17 @@ class TestContainment:
         assert e.value.code == "unreadable"
 
     def test_a_grandchild_does_not_survive_the_kill(self, hostile):
+        # A unique sleep, so another "sleep 60" on the machine never counts, and a deadline instead of a fixed 0.5 s, so a slow
+        # reap under a busy full run is not a failure (DevOps saw this test flake once, 2026-11-20).
+        import random
+        marker = f"sleep {60 + random.random():.6f}"
         with pytest.raises(ImportRefused):
-            run("spawn", timeout=1.5)
-        time.sleep(0.5)
-        left = subprocess.run(["pgrep", "-f", "sleep 60"], capture_output=True, text=True).stdout.split()
+            run(f"spawn {marker.split()[1]}", timeout=1.5)
+        deadline, left = time.monotonic() + 5, ["?"]
+        while left and time.monotonic() < deadline:
+            left = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
+            if left:
+                time.sleep(0.1)
         for pid in left:                                              # clean up if it did, then fail
             os.kill(int(pid), 9)
         assert not left

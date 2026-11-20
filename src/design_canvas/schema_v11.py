@@ -115,9 +115,12 @@ def cdn_image_url(value):
     if not isinstance(value, str) or len(value) > 2048 or any(ch.isspace() or ord(ch) < 32 for ch in value):
         raise ValueError("src must be a URL without whitespace, at most 2048 characters")
     from config import settings
-    cdn_host = urlsplit(settings.cdn_url or "").hostname
+    cdn = urlsplit(settings.cdn_url or "")
     parts = urlsplit(value)
-    if parts.scheme != "https" or not cdn_host or parts.hostname != cdn_host:
+    # Exactly the CDN's host[:port]: https://attacker.example\@<cdn>/a.png parses here as the CDN, but browsers turn
+    # the backslash into a slash and load attacker.example (audit 2026-11-20). No userinfo, no other port.
+    if ("\\" in value or parts.scheme != "https" or not cdn.hostname or parts.hostname != cdn.hostname
+            or parts.netloc.lower() != cdn.netloc.lower()):
         raise ValueError("src must be an https URL on the image CDN; leave it empty for a placeholder")
     return value
 

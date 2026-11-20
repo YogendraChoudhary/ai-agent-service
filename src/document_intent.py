@@ -268,6 +268,35 @@ _MODE_HINT = {"edit": "Use Edit to change existing text.", "draft": "Use Draft t
 _MIXED_HINT = "Use Edit to change existing text, Draft to add new content to it, or Ask to ask about it."
 
 
+# More Write prompts that only make sense with a document (live audit 2026-11-20: all answered blind). Write-only: Auto's rules
+# keep using _REFERS_TO_DOCUMENT, so their decisions do not move.
+_WRITE_ONLY_DOCUMENT_TASK = re.compile(
+    # bare proofreading and translation: "Fix the grammar", "Proofread", "Correct the spelling mistakes", "Translate to French"
+    r"^(?:fix|correct)\s+(?:all\s+)?(?:the\s+|my\s+|any\s+)?(?:grammar|typos?|spelling(?:\s+mistakes)?|punctuation|mistakes|errors|"
+    r"capitali[sz]ation)(?:\s+(?:and|&)\s+(?:the\s+)?(?:grammar|typos?|spelling|punctuation))?\s*[.!]?$|"
+    r"^proofread(?:\s+(?:it|this|everything|the\s+text|my\s+text))?\s*[.!]?$|"
+    r"^translate(?:\s+(?:it|this|everything|all\s+of\s+it|the\s+text|all))?\s+(?:to|into)\s+[\w-]+\s*[.!]?$|"
+    r"^(?:tl;?\s*dr|tldr)\b|^(?:keep\s+going|go\s+on|carry\s+on)\b|"
+    r"^write\s+the\s+(?:ending|end|conclusion|intro(?:duction)?|next\s+part|rest|remaining\s+part)"
+    r"(?:\s+(?:of|for|to)\s+(?:it|this|that|my\s+\w+))?\s*[.!]?$|"
+    r"^add\s+(?:a\s+|an\s+|some\s+)?(?:conclusion|introduction|intro|summary|headings?|subheadings?|title|tl;?dr|faq|"
+    r"call\s+to\s+action|key\s+takeaways|table\s+of\s+contents)\s*[.!]?$|"
+    r"^tone\s+(?:it|this|that)\s+(?:down|up)\b|"
+    r"^make\s+the\s+(?:opening|ending|first\s+paragraph|last\s+paragraph|first\s+line|closing)\b|"
+    r"^(?:turn|convert|make)\s+(?:this|it|that)\s+into\b|\b(?:based\s+on|about|from|using|of)\s+(?:this|that|it)\s*[.!?]?$|"
+    r"\b\w+\s+above\s*[.!?]?$|\b(?:these|those)\s+(?:numbers|figures|results|findings|notes|points|ideas|stats)\b|"
+    # pictures with no subject for an unsent piece: "Add photos to the blog", "Add some images", "Add some relevant pictures throughout"
+    r"^add\s+(?:(?:some|a\s+few|more|relevant|nice|good|real|a\s+couple\s+of|\d+)\s+)*(?:photos?|images?|pictures?|pics|"
+    r"illustrations?)(?:\s+(?:throughout|here|to\s+(?:it|this|the\s+(?:blog|post|article|document|doc|text|page|story|essay))))?"
+    r"\s*[.!]?$|"
+    # Spanish, French, German, Italian: "Resume este texto", "Traduce esto al inglés", "Résume ce texte", "Fasse den Text zusammen"
+    r"^(?:resume|resumir|traduce|traducir|traduis|traduire|r[ée]sume|r[ée]sumer|corrige|corregir|corrigez|[üu]bersetze|fasse|"
+    r"korrigiere|riassumi|traduci|correggi)\b.{0,30}?\b(?:este\s+texto|esto|ce\s+texte|cela|[çc]a|ceci|diesen\s+text|den\s+text|"
+    r"das|questo\s+testo|questo)\b", re.I)
+# The prompt carries its own material: "Fix the grammar: their going home", "Translate to French: Hello, world".
+_CARRIES_TEXT = re.compile(r":\s+\S+(?:\s+\S+){1,}")         # a space after the colon: "9:16 story" carries nothing
+
+
 def write_needs_document(query: str) -> dict | None:
     """
     The needs_context answer for a Write prompt that refers to a document that was not sent ("rewrite this", "continue
@@ -275,7 +304,8 @@ def write_needs_document(query: str) -> dict | None:
     appended on a new line) is never stopped. Zero model calls; the mode is the advisory intent suggestion.
     """
     text = re.sub(r'^(?:(?:please|can you|could you|would you|kindly)\s+)+', '', query.strip(), flags=re.I)
-    if not text or "\n" in text or len(text) > 300 or not _REFERS_TO_DOCUMENT.search(text):
+    if not text or "\n" in text or len(text) > 300 or _CARRIES_TEXT.search(text) or not (
+            _REFERS_TO_DOCUMENT.search(text) or _WRITE_ONLY_DOCUMENT_TASK.search(text)):
         return None
     # "make it night", "restyle this picture into watercolor": the edit of the user's previous image when there is one.
     # This check runs before the user is known, so it cannot look; the image router decides after login.

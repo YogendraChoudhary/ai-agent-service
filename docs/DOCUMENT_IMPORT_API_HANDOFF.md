@@ -86,7 +86,12 @@ Body: `{"error": "<message for the user>"}` (or `{"detail": …}` from FastAPI's
 
 ## 5. Warning codes (`warnings[].code`)
 
-`images_omitted`, `hidden_text_removed`, `hidden_characters_removed`, `white_text`, `tracked_changes_accepted`, `text_boxes`, `equations_skipped`, `comments_skipped`, `macros_ignored`, `table_merged_cells`, `table_alignment_conflicts`, `tables_not_rebuilt` (names the pages), `pages_truncated`, `output_truncated`, `little_text` (a JavaScript page), `nesting_too_deep`, plus the upload endpoint's `possible_prompt_injection` and `hidden_characters`. Each has a `message` written for the user. Suggested UI: show them as a notice above the imported text.
+`images_omitted`, `superscript_subscript_html`, `hidden_text_removed`, `hidden_characters_removed`, `white_text`, `tracked_changes_accepted`, `text_boxes`, `equations_skipped`, `comments_skipped`, `macros_ignored`, `table_merged_cells`, `table_alignment_conflicts`, `tables_not_rebuilt` (names the pages), `pages_truncated`, `output_truncated`, `little_text` (a JavaScript page), `nesting_too_deep`, plus the upload endpoint's `possible_prompt_injection` and `hidden_characters`. Each has a `message` written for the user. Suggested UI: show them as a notice above the imported text.
+
+Superscripts and subscripts (Word's raised/lowered text, HTML `<sup>`/`<sub>`) are kept as inline `<sup>…</sup>` / `<sub>…</sub>` HTML
+(since 2026-11-20; flattened, `10<sup>6</sup>` read "106" and `CO<sub>2</sub>` "CO2"). The document pipeline accepts them (only lines
+that open with a block tag count as HTML) and Edit keeps each tag as a locked token. `superscript_subscript_html` gives the count, so
+a frontend whose editor does not render inline HTML can say why the tags show. Word footnote references still become `[^1]`.
 
 HTML tables carry explicit left, center, and right cell alignment into the Markdown separator row. The header takes precedence. Without an explicit header alignment, a consistent body-cell alignment sets the column. Markdown can represent one alignment per column, so conflicting values produce `table_alignment_conflicts`.
 

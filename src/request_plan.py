@@ -28,7 +28,8 @@ from config import settings
 
 _IMAGE_NOUN = (
     r"(?:images?|pictures?|photos?|photographs?|illustrations?|infographics?|graphics?|diagrams?|"
-    r"banners?|logos?|icons?|thumbnails?|visuals?|artworks?|drawings?|paintings?|renders?)"
+    r"banners?|logos?|icons?|thumbnails?|visuals?|artworks?|drawings?|paintings?|renders?|pics?|sketch(?:es)?|"
+    r"posters?|cartoons?|stickers?|memes?|portraits?)"
 )
 _IMAGE_NOUN_RE = re.compile(rf"^{_IMAGE_NOUN}$", re.I)
 _NUMBER_WORDS = {
@@ -44,14 +45,19 @@ _TOPIC_FOLLOW = {
     "models", "tool", "tools", "app", "apps", "software", "library", "libraries", "resolution", "seo",
     "optimization", "optimisation", "classification", "analysis", "detection", "dataset", "datasets",
     "hosting", "upload", "uploads", "url", "urls", "tag", "tags", "attribute", "attributes", "design",
-    "designer", "designers", "design", "editing",
+    "designer", "designers", "design", "editing", "shoot", "shoots", "tips", "gallery", "galleries", "credits",
+    "captions", "caption", "printing", "studio", "contest", "contests",
 }
 # Words that, standing between a quantifier and an image noun, show the noun is a topic ("an article about image").
 _TOPIC_BREAK = {"about", "on", "of", "for", "regarding", "to", "that", "which", "with", "in", "from", "using", "by"}
 _LEAD_VERBS = {"with", "include", "including", "includes", "add", "adding", "plus", "featuring", "containing",
                "and", "insert", "embed", "generate", "create", "make", "produce", "needs", "need", "want",
                "illustrate", "illustrated", "show", "showing"}
-_TOKEN_RE = re.compile(r"[A-Za-z0-9']+|[.!?;:\n]")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9']+|[.!?;:,\n]")
+# Verbs that ask for pictures only as a command ("Write a post and create 3 images"), not inside a sentence about images
+# ("Explain how diffusion models create images": live audit 2026-11-20 granted 2 pictures).
+_COMMAND_ONLY = {"generate", "create", "make", "produce", "illustrate", "show", "showing"}
+_CLAUSE_START = {"", ".", "!", "?", ";", ":", ",", "\n", "and", "then", "also", "please", "plus", "you", "pls", "kindly"}
 
 
 def extract_image_count(text: Optional[str]) -> int:
@@ -79,19 +85,27 @@ def image_count_requested(text: Optional[str]) -> int:
         # A picture is only requested when a request verb ("with", "include", "add", "create"...) leads
         # into it; "how to take a good photo" or "top 5 photos of 2020" are topics, not requests.
         lead_window = low[max(0, i - 7):i]
-        if not any(w in _LEAD_VERBS for w in lead_window):
+        start = max(0, i - 7)
+        leads = [w for k, w in enumerate(lead_window) if w in _LEAD_VERBS and w != "and" and (
+            w not in _COMMAND_ONLY or (low[start + k - 1] if start + k > 0 else "") in _CLAUSE_START)]
+        # "and" leads only straight into a count: "an article and 2 images", not "photography and why images matter"
+        if not leads and not (i >= 2 and low[i - 2] == "and" and (low[i - 1].isdigit() or low[i - 1] in _NUMBER_WORDS)):
             i += 1
             continue
         count = 0
+        topic = False
         # look back up to 3 tokens for a quantifier ("2", "a couple of", "several")
         for back in range(1, 4):
             j = i - back
-            if j < 0 or low[j] in ".!?;:\n":
+            if j < 0 or low[j] in ".!?;:,\n":
                 break
             word = low[j]
             if word == "of" and j > 0 and low[j - 1] in ("couple", "pair", "few"):
                 continue
+            if word in _LEAD_VERBS:
+                break                      # "with images", "add photos": a request, default count below
             if word in _TOPIC_BREAK:
+                topic = True               # "tips for editing photos", "a note about the photos": the subject, not a request
                 break
             if word.isdigit():
                 count = int(word)
@@ -99,6 +113,9 @@ def image_count_requested(text: Optional[str]) -> int:
             if word in _NUMBER_WORDS:
                 count = _NUMBER_WORDS[word]
                 break
+        if topic and count == 0:
+            i += 1
+            continue
         if count == 0:
             # bare plural ("with images") gets the default; bare singular ("add image") is one
             count = max(1, int(settings.image_default_plural_count)) if tok.endswith("s") else 1

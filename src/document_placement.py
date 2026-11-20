@@ -39,6 +39,16 @@ _CLAUSE_END = re.compile(r"\s+(?:and|then|with|that|which|so|to\s+(?:explain|cov
 _CLOSING_WORDS = re.compile(r"\s+(?:that|which|to|about|explaining|describing|covering|with|for)\b.*$", re.I)
 
 
+UNPLACEABLE_MESSAGE = ("This document is too large to place text by name; put the cursor where the text should go.")
+
+
+def _names_place(task: str) -> bool:
+    """Whether the task names a place in the document (the words resolve_placement looks for), without reading the document."""
+    return bool(_edge(task) or re.search(r"\b(?:between|" + _AFTER + "|" + _BEFORE + r")\s+(?:the\s+|this\s+)?(?:[\"“‘']|\S+\s+"
+                                         r"(?:heading|title|section|chapter|paragraph|list|table|quote)\b|(?:heading|title|section|"
+                                         r"chapter|paragraph|list|table|quote)\b)", task, re.I))
+
+
 class _Unresolved(Exception):
     """A place was named but cannot be identified safely."""
 
@@ -55,7 +65,9 @@ def _kind_name(word: str) -> str:
 class _Document:
     def __init__(self, text: str, focus: Optional[int]):
         self.text = text
-        self.blocks = [b for b in document_blocks(text) if b.kind != "blank" and b.text.strip("\ufeff \t\r\n")]
+        # No block cap: placement is read-only and makes no model call per block, so Edit's limit does not apply (audit 2026-11-20:
+        # over the cap, Draft silently inserted at the cursor instead of below the heading the user named).
+        self.blocks = [b for b in document_blocks(text, max_blocks=None) if b.kind != "blank" and b.text.strip("\ufeff \t\r\n")]
         self.focus = focus
 
     def placement(self, block: DocumentBlock, position: str) -> DraftPlacement:
@@ -289,7 +301,9 @@ def resolve_placement(text: str, task: str, focus: Optional[int] = None) -> tupl
     try:
         doc = _Document(text, focus)
     except ValueError:
-        return None, None
+        # A document the block parser refuses: a place the task names cannot be found, and inserting at the cursor instead would
+        # put the draft somewhere the user did not ask for.
+        return (None, UNPLACEABLE_MESSAGE) if _names_place(task) else (None, None)
     if not doc.blocks:
         return None, None
     try:

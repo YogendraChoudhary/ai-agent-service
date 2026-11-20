@@ -25,7 +25,8 @@ from src.design_canvas.schema import DesignDocumentAST
 from src.design_canvas.schema_v11 import DesignDocumentASTV11, Version, downgrade_to_v10
 from src.design_canvas.reference import ReferenceSpec, check_fidelity, description_coverage, heal_reference_details
 from src.design_canvas.typography_match import match_typography
-from src.design_canvas.validate import auto_heal_design_ast, validate_design_ast
+from src.design_canvas.text_edit import split_selection
+from src.design_canvas.validate import auto_heal_design_ast, keep_selected_id, validate_design_ast
 from src.design_canvas.patch import compact_design_json
 from src.design_canvas.prompts import (
     DESIGN_SYSTEM_PROMPT,
@@ -130,7 +131,7 @@ async def execute_design_canvas_harness(
     if existing_ast_json:
         try:
             incoming = json.loads(existing_ast_json)
-        except ValueError:
+        except (ValueError, RecursionError):        # a deeply nested body raises RecursionError, not ValueError
             incoming = None
         if isinstance(incoming, dict) and incoming.get("version") == "1.1":
             if not settings.design_schema_v11_enabled:
@@ -256,6 +257,8 @@ async def execute_design_canvas_harness(
     ]
 
     last_parsed_ast: Optional[DesignDocumentAST] = None
+    # The editor's selection ("(Apply this to the selected section, id X. ...)"): that node keeps its id in the result.
+    selected_id = split_selection(user_query)[1] if existing_ast_json and sub_mode == "edit_existing_ast" else None
     best: Optional[tuple[DesignDocumentAST, dict, list[str], bool]] = None
     quantized = vision_meta.quantized_hex_colors if vision_meta else ()
     expected_accents = vision_meta.roles.accents if vision_meta and vision_meta.roles else ()
@@ -297,6 +300,8 @@ async def execute_design_canvas_harness(
         # -------------------------------------------------------------- #
         try:
             candidate_ast = _parse_design(clean_json, version)
+            if selected_id:
+                candidate_ast = keep_selected_id(candidate_ast, existing_ast_json, selected_id)
             last_parsed_ast = candidate_ast
         except ValidationError as exc:
             schema_errors = [
@@ -330,6 +335,8 @@ async def execute_design_canvas_harness(
             "DUPLICATE_LAYER_ID",
             "MAX_DEPTH_EXCEEDED",
             "SVG_FORBIDDEN_ATTR",
+            # auto_heal_design_ast restores the original id; a model round cost ~45 s for it (audit 2026-11-20).
+            "RENAMED_NODE_ID",
         )
         healed_this_attempt = False
         if domain_errors and all(err.startswith(deterministic_prefixes) for err in domain_errors):

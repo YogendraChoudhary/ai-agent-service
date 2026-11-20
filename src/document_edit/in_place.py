@@ -43,11 +43,26 @@ class InPlace:
     replacement: str | None = None
     side: str | None = None
     ambiguous: bool = False
+    everywhere: bool = False          # "…everywhere", "…throughout": every occurrence, not only one
 
+
+# Words after the new text that are not part of it (live audit 2026-11-20: "Change Zoom to Teams please" wrote "Teams please."
+# into the document): courtesy, and scope that asks for every occurrence.
+_SCOPE_TAIL = re.compile(
+    r"(?:[\s,]+(?:please|pls|thanks|thank\s+you|too|as\s+well|everywhere|throughout(?:\s+the\s+(?:document|doc|text|page))?|"
+    r"in\s+(?:all|every|each)\s+(?:the\s+)?\w+(?:\s+\w+)?|across\s+the\s+(?:document|doc|text|page)|globally|"
+    r"(?:in\s+the\s+)?whole\s+(?:document|doc|text)|all\s+occurrences|every\s+time))+\s*[.!?]*\s*$", re.I)
+_ABBREVIATION_END = re.compile(r"(?:\b(?:Inc|Ltd|LLC|Co|Corp|Jr|Sr|St|Dr|Mr|Mrs|Ms|Prof|etc|vs|approx|No)|\b[A-Z]|\.\w)\.$")
+_EVERYWHERE = re.compile(r"\b(?:everywhere|throughout|all|every|each|across|globally|whole)\b", re.I)
 
 def in_place_request(instruction: str) -> InPlace | None:
     """Empty target means a selection is required. A side means insert beside the matched phrase."""
     instruction = instruction.strip()
+    everywhere = False
+    tail = _SCOPE_TAIL.search(instruction)
+    if tail and _REPLACE.match(instruction[:tail.start()]):
+        everywhere = bool(_EVERYWHERE.search(tail.group(0)))
+        instruction = instruction[:tail.start()].rstrip()
     for pattern in (_REPLACE, _WRITE, _ADD, _PHRASE):
         match = pattern.fullmatch(instruction)
         if match is None:
@@ -62,7 +77,10 @@ def in_place_request(instruction: str) -> InPlace | None:
                 (_UNQUOTED_INSTRUCTION.search(value) or _SELECTED.fullmatch(value)) for value in (old, new)):
             return InPlace(ambiguous=True)
         old, new = (value[1:-1] if value and re.fullmatch(_QUOTED, value) else value for value in (old, new))
-        return InPlace(old, new, fields.get("side", "").lower() or None)
+        if (pattern is _REPLACE and new and new[-1:] in ".?" and not re.fullmatch(_QUOTED, fields["new"])
+                and not _ABBREVIATION_END.search(new)):
+            new = new[:-1]                       # "Change Zoom to Teams." is "Teams" (it wrote "Teams.."); "Acme Inc." keeps its "."
+        return InPlace(old, new, fields.get("side", "").lower() or None, everywhere=everywhere and pattern is _REPLACE)
     if _EXACT_LEAD.search(instruction):
         return InPlace(ambiguous=True)
     if _LOCAL_EDIT.fullmatch(instruction) or _LOCAL_REWRITE.fullmatch(instruction):

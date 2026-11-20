@@ -266,16 +266,32 @@ class _Converter:
             math = next(iter(el.iter("math")), None)
             return self.math(math) if math is not None else ""
         if tag == "sup" or tag == "sub":
-            return self.footnote_ref(el, depth, flags) if self.footnotes and tag == "sup" else self.inline_children(el, depth, flags)
+            return (self.footnote_ref(el) if self.footnotes and tag == "sup" else None) or self.script(tag, el, depth, flags)
         return self.inline_children(el, depth, flags)
 
-    def footnote_ref(self, el, depth: int, flags: frozenset) -> str:
+    def footnote_ref(self, el) -> Optional[str]:
         anchor = next(iter(el.iter("a")), None)
         href = (anchor.get("href") or "") if anchor is not None else ""
         m = re.fullmatch(r"#(footnote|endnote)-(\d+)", href)
         if not m:
-            return self.inline_children(el, depth, flags)
+            return None
         return f"[^{m.group(2) if m.group(1) == 'footnote' else 'e' + m.group(2)}]"
+
+    def script(self, tag: str, el, depth: int, flags: frozenset) -> str:
+        """
+        A superscript or subscript stays one, as inline <sup>/<sub> HTML: flattened, 10<sup>6</sup> read "106", CO<sub>2</sub> "CO2" and
+        5 m<sup>2</sup> "5 m2" (audit 2026-11-20). The document pipeline accepts it (looks_like_html only counts lines that open with a
+        block tag) and Edit keeps each tag as a locked token. Not inside code (a code span cannot hold HTML) or another sup/sub.
+        """
+        if "code" in flags or "script" in flags:
+            return self.inline_children(el, depth, flags)
+        inner = self.inline_children(el, depth, flags | {"script"})
+        core = inner.strip(" ")
+        if not core or core.strip(_BR + " ") == "":
+            return inner
+        self.count("superscripts" if tag == "sup" else "subscripts")
+        lead, trail = inner[:len(inner) - len(inner.lstrip(" "))], inner[len(inner.rstrip(" ")):]
+        return f"{lead}<{tag}>{core}</{tag}>{trail}"
 
     def link(self, el, depth: int, flags: frozenset) -> str:
         inner = self.inline_children(el, depth, flags)
@@ -781,6 +797,10 @@ def html_to_markdown(html: "str | bytes", *, base_url: str = "", main_content: b
     if conv.stats.get("table_alignment_conflicts"):
         warnings.append({"code": "table_alignment_conflicts", "message": "Some table columns use different alignments in different cells. "
                          "Markdown uses one alignment per column, so these columns use the header alignment or the Markdown default."})
+    scripts = conv.stats.get("superscripts", 0) + conv.stats.get("subscripts", 0)
+    if scripts:
+        warnings.append({"code": "superscript_subscript_html", "message": f"{scripts} superscript or subscript run(s) (such as 10<sup>6</sup> or "
+                         "CO<sub>2</sub>) were kept as <sup>/<sub> HTML; an editor that does not show inline HTML displays the tags."})
     if too_deep:
         warnings.append({"code": "nesting_too_deep", "message": "Part of the page is nested too deeply to be read (over 250 levels) and was left out."})
     if conv.truncated:

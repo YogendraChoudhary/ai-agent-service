@@ -208,3 +208,36 @@ class TestOnTheRoutingPath:
         with pytest.raises(ValueError, match="truncated"):
             _stream(LIVE_QUERY, operation_type="edit_design", existing_design_ast=DESIGN)
         assert len(edges["providers"]) == 1
+
+
+def test_selection_sentence_is_found_fast_in_a_huge_prompt():
+    import time
+    started = time.perf_counter()
+    assert split_selection(" " * 100_000) == ("", None)
+    assert split_selection("x" * 100_000 + LIVE_QUERY)[1] == "header"
+    assert time.perf_counter() - started < 1.0          # an unanchored search took 44 s on 100 KB
+
+
+class TestTruncationFallback:
+    @pytest.fixture(autouse=True)
+    def _v11(self, monkeypatch):
+        monkeypatch.setattr(settings, "design_schema_v11_enabled", True)
+        monkeypatch.setattr(settings, "design_text_edit_enabled", False)
+        monkeypatch.setattr(settings, "design_section_edit_enabled", False)
+
+    def _truncate_first(self, edges, monkeypatch):
+        def call(messages, image_bytes, temperature, provider, key, request_id=""):
+            edges["providers"].append(provider)
+            if len(edges["providers"]) == 1:
+                raise ValueError("Design output truncated by model at max_tokens limit (8192)")
+            return _design_json()
+        monkeypatch.setattr(tpa, "_run_design_json_completion", call)
+
+    def test_a_provider_with_a_larger_budget_is_still_tried(self, edges, monkeypatch):
+        self._truncate_first(edges, monkeypatch)
+        monkeypatch.setattr(tpa, "_design_output_budget", lambda provider, image: 8192 if provider == "claude" else 12288)
+        events = _events(_stream(LIVE_QUERY, operation_type="edit_design", existing_design_ast=DESIGN))
+        assert edges["providers"] == ["claude", "gemini"] and "design_ready" in events
+
+    def test_gemini_gets_the_same_design_budget_as_the_others(self):
+        assert tpa._design_output_budget("gemini", None) == tpa._design_output_budget("claude", None) > 8192

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 
 from markdown_it import MarkdownIt
 
@@ -18,6 +19,15 @@ def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+# The most a model rewrites in one piece (DocumentPatch.before has the same limit).
+MAX_BLOCK_CHARS = 12_000
+# Blocks Edit accepts, blank lines not counted (audit 2026-11-20: a 2.6 KB handbook of 41 short sections had 402 blocks, about
+# half of them blank lines, and Edit refused it). The cap bounds the planner's catalog and the patch checks, which never see blanks.
+MAX_DOCUMENT_BLOCKS = 400
+# A list over MAX_BLOCK_CHARS is rewritten as runs of whole items of about this size (edit_units), each its own model call.
+LIST_RUN_CHARS = 4_000
+
+
 @dataclass(frozen=True)
 class DocumentBlock:
     id: str
@@ -26,11 +36,20 @@ class DocumentBlock:
     start: int
     end: int
     text: str
+    parent: str | None = None         # edit_units(): the id of the long list this run of items belongs to
 
     @property
     def editable(self) -> bool:
         """Prose: a paragraph or list that any request about its section may rewrite."""
-        return self.kind in ("paragraph", "list") and len(self.text) <= 12_000
+        return self.kind in ("paragraph", "list") and len(self.text) <= MAX_BLOCK_CHARS
+
+    @property
+    def span_editable(self) -> bool:
+        """
+        A paragraph or list of any length: a patch may replace an exact range inside it (at most MAX_BLOCK_CHARS of `before`), so
+        "Change X to Y" and selection edits work inside a 13.8 KB list that no model may rewrite whole.
+        """
+        return self.kind in ("paragraph", "list")
 
     @property
     def rewritable(self) -> bool:
@@ -40,7 +59,7 @@ class DocumentBlock:
         """
         if self.editable:
             return True
-        if len(self.text) > 12_000:
+        if len(self.text) > MAX_BLOCK_CHARS:
             return False
         if self.kind == "heading":
             return True
@@ -76,7 +95,8 @@ def quote_is_plain(text: str) -> bool:
     return all(b.kind in ("paragraph", "list", "blank") for b in parse(inner))
 
 
-def document_blocks(text: str) -> list[DocumentBlock]:
+def document_blocks(text: str, *, max_blocks: int | None = MAX_DOCUMENT_BLOCKS) -> list[DocumentBlock]:
+    """The document as exact top-level blocks. `max_blocks` None: no cap (read-only placement, which makes no model call per block)."""
     if not text.strip() or len(text) > 100_000 or looks_like_html(text) or "\x00" in text:
         raise ValueError("Supply a non-empty plain-text or Markdown document of at most 100,000 characters")
     result, headings, start = [], [], 0
@@ -95,10 +115,76 @@ def document_blocks(text: str) -> list[DocumentBlock]:
         result.append(DocumentBlock(f"b{i}_{fingerprint(block.text)[:12]}", block.kind,
                                     tuple(value for _, value in headings), start, end, block.text))
         start = end
-    if len(result) > 400:
-        raise ValueError("This document has too many blocks; use a smaller document (at most 400 blocks)")
+    if max_blocks is not None and sum(b.kind != "blank" for b in result) > max_blocks:
+        raise ValueError(f"This document has too many blocks; use a smaller document (at most {max_blocks} paragraphs, headings, "
+                         "lists and other blocks; blank lines do not count)")
     assert "".join(b.text for b in result) == text
     return result
+
+
+_LINES = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")         # markdown-it's lines (not str.splitlines, which splits on more)
+
+
+@lru_cache(maxsize=8)
+def _item_starts(text: str) -> tuple[int, ...] | None:
+    """
+    Where each top-level item of a list block starts (character offsets), or None when the block does not open with an item.
+    Cached: applying 24 patches to one 91 KB list parsed it 24 times (0.6 s).
+    """
+    lines = _LINES.findall(text)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    tokens = MarkdownIt("commonmark").parse(text)
+    starts = [offsets[t.map[0]] for t in tokens if t.type == "list_item_open" and t.level == 1 and t.map]
+    return tuple(starts) if starts and starts[0] == 0 else None
+
+
+def edit_units(blocks: list[DocumentBlock]) -> list[DocumentBlock]:
+    """
+    The blocks a model rewrite may target: every block, except that a list over MAX_BLOCK_CHARS becomes runs of whole top-level items
+    of about LIST_RUN_CHARS each (audit 2026-11-20: a 13.8 KB meeting-notes list of 160 items could not be proofread at all). A run
+    stops at its last non-blank line, so the blank lines between runs are never sent and never change; a patch for a run replaces
+    that range of the parent list (`parent`). A single item over MAX_BLOCK_CHARS stays too long to rewrite.
+    """
+    units = []
+    for block in blocks:
+        starts = _item_starts(block.text) if block.kind == "list" and len(block.text) > MAX_BLOCK_CHARS else None
+        if starts is None:
+            units.append(block)
+            continue
+        runs, first = [], 0
+        for item_start, item_end in zip(starts, starts[1:] + (len(block.text),)):
+            # Close the run before an item that would take it past LIST_RUN_CHARS; one long item is a run of its own.
+            if item_end - first > LIST_RUN_CHARS and item_start > first:
+                runs.append((first, item_start))
+                first = item_start
+        runs.append((first, len(block.text)))
+        index = block.id.split("_", 1)[0]
+        for first, last in runs:
+            lines = _LINES.findall(block.text[first:last])
+            while len(lines) > 1 and not lines[-1].strip():
+                lines.pop()
+            text = "".join(lines)
+            start = block.start + first
+            units.append(DocumentBlock(f"{index}_{fingerprint(f'{start}:{text}')[:12]}", "list", block.section, start,
+                                       start + len(text), text, parent=block.id))
+    return units
+
+
+def item_window(block: DocumentBlock, start: int, end: int) -> DocumentBlock:
+    """
+    The whole top-level items of a list over MAX_BLOCK_CHARS that hold the range [start, end) of its text, as a block of their own:
+    what a patch of that range is checked against. Items are independent Markdown (nothing inline runs from one into the next), so
+    checking them is checking the patch, and 24 patches into a 91 KB list no longer re-check the whole list each (4.0 s, measured).
+    Any other block is its own window.
+    """
+    starts = _item_starts(block.text) if block.kind == "list" and len(block.text) > MAX_BLOCK_CHARS else None
+    if starts is None:
+        return block
+    low = max(s for s in starts if s <= start)
+    high = min((s for s in starts if s >= end), default=len(block.text))
+    return DocumentBlock(block.id, block.kind, block.section, block.start + low, block.start + high, block.text[low:high])
 
 
 # What the instruction says about headings and quotes. They are rewritten only when asked for, never as part of "make it shorter".

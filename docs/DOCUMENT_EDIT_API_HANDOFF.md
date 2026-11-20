@@ -21,7 +21,8 @@ this field explicitly enables document editing and takes priority over image, co
 }
 ```
 
-- `document_text`: exact current plain text or Markdown, 1–100,000 characters, at most 400 parsed blocks.
+- `document_text`: exact current plain text or Markdown, 1–100,000 characters, at most 400 parsed blocks. Blank lines do not
+  count (since 2026-11-20: a 2.6 KB document of 41 short sections had 402 blocks, half of them blank lines, and was refused).
 - `query`: editing instruction, 1–2,000 characters. Omit `secondary_prompt` in this mode.
 - Headings help but are not required: “remove repetition from the paragraph about onboarding” can be located by meaning.
 - No feature flag is required: only requests that explicitly include `document_text` use this path.
@@ -45,8 +46,13 @@ extra sentences, unrequested additions in proofreading and changes to protected 
 The broad section-edit flow below applies when the user requests a section or document rewrite without an exact target.
 
 1. Parse exact source ranges and headings using the existing Markdown parser. Whitespace, tables, images, code, raw HTML
-   and reference definitions are protected. Paragraph/list blocks up to 12,000 characters can be targeted. Oversize
-   paragraphs stay protected rather than being truncated. **Headings, titles and plain-text quotes can be targeted too, but
+   and reference definitions are protected. Paragraph/list blocks up to 12,000 characters can be targeted. **A list over 12,000
+   characters is rewritten as runs of whole items of about 4,000 characters** (each run its own call; the patch for a run is a
+   range of the list, so one list can carry several non-overlapping patches with the same `block_id`, and the result's `targets`
+   name the list once). A paragraph over 12,000 characters (or a single list item over 12,000) is not rewritten: the request returns
+   `needs_clarification` with "This paragraph/list is longer than 12,000 characters, which Edit can't rewrite in one piece. Select
+   part of it, or ask for a specific change such as 'Change X to Y'." Literal replacements, "replace X everywhere" and selection
+   edits work inside paragraphs and lists of any length: they patch only the matched range. **Headings, titles and plain-text quotes can be targeted too, but
    only when the instruction is about them** ("make the title shorter", "rename the Contact heading to Get in touch",
    "shorten the quote"): "the title" is the document's top-level heading; "all the headings" offers every heading; words
    inside a clause that says what to leave alone ("leave/keep/preserve/skip/ignore …", "do not/never/avoid …", "without/except …") do not count. The clause runs to the next "but/then", to an "and" or
@@ -164,6 +170,20 @@ instruction are allowed to appear once each ("add (2024) next to the title" may 
 original block with up to 80 characters put in and nothing removed or reworded. A patch that rewrites text still must keep every
 number, as before.
 
+**Literal number changes (2026-11-20).** A literal replacement the user typed may change numbers: `Change "USD 20" to "USD 25"`,
+`Replace "555-0100" with "555-0199"` and `Change "launches in 2025" to "launches in 2026"` are proposed (no model call). Their patch
+replaces only the matched phrase, and `/apply` accepts number changes in a patch of exactly that shape: a range strictly inside a
+block, `before` and `after` each at most 300 characters, no line break. Model output never relies on it: whole-block rewrites keep
+every number when proposed, and a model's in-place (selection) edit is checked when proposed with the old rule (every number kept,
+new ones only in a short pure insertion). A hand-made patch of that shape could change a number in a short phrase at `/apply`;
+that endpoint does not authenticate patches anyway, and its caller can already write any text into its own document.
+"Replace 2025 with 2026 everywhere" still fails for ordinary blocks, because that patch covers each whole block.
+
+## Photos (insertions) and attachments
+
+Since 2026-11-20 `document_edit_ready` can carry `insertions` (photos placed after paragraphs, see FRONTEND_HANDOFF 2.8) and
+`/agent/documents/apply` accepts them next to `patches`. Edit also takes `image_urls` and `references` (FRONTEND_HANDOFF 2.10).
+
 ## Applying accepted edits
 
 The pure Python endpoint `POST /agent/documents/apply` makes no model calls and stores nothing:
@@ -180,7 +200,8 @@ The placeholder array above represents objects, not strings. Response:
 `{"document_text":"<patched document>","result_sha256":"<new hash>"}`.
 
 - HTTP 409: the supplied current document differs from the proposal's base; request a new proposal.
-- HTTP 400: invalid IDs, changed `before`, forged offsets, duplicate targets, unsafe replacements, protected
+- HTTP 400: invalid IDs, changed `before`, forged offsets, duplicate targets (several patches may share a `block_id` only in a block
+  over 12,000 characters, and only when their ranges do not overlap), unsafe replacements, protected
   content changes or invalid input. Nothing is persisted or partially applied.
 - IDs are **snapshot-bound**, not permanent editor node IDs. Positions are zero-based UTF-16 code-unit offsets,
   compatible with JavaScript string slicing even when text contains emoji. Do not treat them as UTF-8 byte offsets.

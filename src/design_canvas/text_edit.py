@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # The editor tells the model which section is selected by appending this sentence to the user's words
 # (live 2026-11-20: "...\n\n(Apply this to the selected section, id header. Keep everything else unchanged.)").
 _SELECTION_RE = re.compile(
-    r"\s*\(\s*apply this to the selected [a-z ]{2,24}?,?\s+id[\s:=]+[\"'`]?([a-z0-9_]{2,40})[\"'`]?\s*\.?[^()]*\)\s*$",
+    r"\(\s*apply this to the selected [a-z ]{2,24}?,?\s+id[\s:=]+[\"'`]?([a-z0-9_]{2,40})[\"'`]?\s*\.?[^()]*\)\s*$",
     re.IGNORECASE,
 )
 
@@ -94,10 +94,15 @@ class TextEditResult:
 def split_selection(query: str) -> tuple[str, Optional[str]]:
     """(the user's own words, the selected node id or None), from the editor's appended selection sentence."""
     text = query or ""
-    match = _SELECTION_RE.search(text)
+    # The sentence is always last and short: look only at the end (an unanchored search over a 100 KB prompt took 44 s).
+    tail_start = max(0, len(text) - 400)
+    tail = text[tail_start:]
+    if "apply this to the selected" not in tail.lower():
+        return text.strip(), None
+    match = _SELECTION_RE.search(tail)
     if not match:
         return text.strip(), None
-    return text[:match.start()].strip(), match.group(1).lower()
+    return text[:tail_start + match.start()].strip(), match.group(1).lower()
 
 
 def wants_text_lane(instruction: str, has_selection: bool) -> bool:
@@ -175,7 +180,7 @@ def try_text_edit(existing_ast_json: str, query: str, llm: Callable[[str, List[d
         return None
     try:
         raw = json.loads(existing_ast_json)
-    except ValueError:
+    except (ValueError, RecursionError):            # deeply nested JSON raises RecursionError, not ValueError
         return None
     if not isinstance(raw, dict) or not isinstance(raw.get("root"), dict):
         return None

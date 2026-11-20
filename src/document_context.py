@@ -106,6 +106,8 @@ class ContextMetadata(BaseModel):
     # returned as written without a model call; "model" when a model writes the draft. null for Ask and whenever no draft is produced
     # (needs_context, needs_clarification).
     source: Optional[Literal["model", "literal"]] = None
+    # What the user attached (additive, 2026-11-20): {"images": n, "references": [{"name", "chars"}]}; None without attachments.
+    attachments: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -153,11 +155,18 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
             raise ValueError('Analysis requires Ask with document scope')
         from .document_analysis import prepare_analysis
         return prepare_analysis(context, query, analysis)
+    section_refusal = None
     if action == 'ask':
         from .document_question import requested_section
+        from .document_retrieval import retrieve_context, section_is_in_text
         target = requested_section(query)
+        if target is not None and scope in ('document', 'auto') and section_is_in_text(context.text, target):
+            # "In section 2, what is the rent?" where "Section 2." is a paragraph or a list item, not a heading (audit 2026-11-20:
+            # refused with "No heading matches"): a document that fits is read whole, so the answer can find it by its wording.
+            # The refusal still stands for a document that does not fit (below).
+            section_refusal = retrieve_context(context, query, 'focused', target=target)
+            target = None
         if scope in ('selection', 'focused') or target is not None:
-            from .document_retrieval import retrieve_context
             return retrieve_context(context, query, 'selection' if scope == 'selection' else 'focused', target=target)
     text = context.text
     selection = context.selection
@@ -209,6 +218,8 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
     start, end, outline = 0, len(text), []
     data = envelope(start, end)
     if not fits(data):
+        if section_refusal is not None:
+            return section_refusal
         if action == "ask":
             from config import settings
             if scope == 'auto' or settings.document_large_ask == 'auto':
@@ -267,6 +278,25 @@ def prepare_context(context: DocumentContext, query: str, action: str = "ask", *
         "included_ranges": [ContextRange(start_utf16=utf16_length(text[:left]), end_utf16=utf16_length(text[:right])) for left, right in merged],
         "estimated_input_tokens": estimated_tokens(prompt), "billable_input_chars": len(data) + len(query)})
     return PreparedContext(prompt, metadata)
+
+
+def with_attachments(prepared: "PreparedContext", references, image_count: int) -> "PreparedContext":
+    """
+    The prepared Ask/Draft input with the user's attachments: reference text in its own read-only block before the document
+    envelope, and both counted as input (images at VISION_INPUT_CHARS_PER_IMAGE). Answers that need no model are unchanged.
+    """
+    from dataclasses import replace
+    from .attachments import VISION_INPUT_CHARS_PER_IMAGE, attachment_summary, reference_block, reference_chars
+    if (not references and not image_count) or prepared.message is not None or prepared.analysis is not None:
+        return prepared
+    block = reference_block(references)
+    prompt = f"{block}\n\n{prepared.prompt}" if block else prepared.prompt
+    extra = reference_chars(references) + VISION_INPUT_CHARS_PER_IMAGE * image_count
+    metadata = prepared.metadata.model_copy(update={
+        "billable_input_chars": prepared.metadata.billable_input_chars + extra,
+        "estimated_input_tokens": estimated_tokens(prompt) + 1_000 * image_count,
+        "attachments": attachment_summary(references, image_count)})
+    return replace(prepared, prompt=prompt, metadata=metadata)
 
 
 ContextMetadata.model_rebuild()

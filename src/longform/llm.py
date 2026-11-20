@@ -67,11 +67,13 @@ class AgnoLLM:
     def __init__(self, candidates: Sequence, key_for: Callable[[str], Optional[str]], *,
                  outline_candidates: Optional[Sequence] = None, request_id: Optional[str] = None,
                  user_id: Optional[str] = None, is_byok: bool = False, image_ctx: Optional[dict] = None,
-                 agent_type: str = "blog_writer", timeout: Optional[float] = None, cancel_event=None, deadline=None):
+                 agent_type: str = "blog_writer", timeout: Optional[float] = None, cancel_event=None, deadline=None,
+                 images=None):
         self.agent_type = agent_type                         # the AGENT_CONFIGS entry every call is made with
         self.timeout = timeout                               # seconds one call may take before it counts as a retryable failure
         self.cancel_event = cancel_event
         self.deadline = deadline
+        self.images = images                                 # attached images every call sees (Edit with attachments)
         self.candidates = list(candidates)
         self.outline_candidates = list(outline_candidates) if outline_candidates else None
         self.key_for = key_for
@@ -196,13 +198,13 @@ class AgnoLLM:
         if self.agent_type == 'document_editor':
             trace_set(self.request_id, document_model_started=True)
         if spec.on_text is None:
-            response = agent.run(history, stream=False)
+            response = agent.run(history, stream=False, **({"images": self.images} if self.images else {}))
             # agno does not raise on provider failures: the run comes back failed with the error text as content.
             if is_failed_run(response):
                 raise RuntimeError(tpa._agent_error_message(candidate.provider, getattr(response, "content", None)))
             content, metrics = response.content, getattr(response, "metrics", None)
         else:
-            content, metrics = self._stream(tpa, agent, candidate, history, spec.on_text)
+            content, metrics = self._stream(tpa, agent, candidate, history, spec.on_text, self.images)
         model_id = model_id_for(candidate, spec.use_web, self.agent_type)
         record_text_usage(self.request_id, model_id, metrics, feature=spec.stage)
         served = (candidate.provider, model_id)
@@ -221,12 +223,12 @@ class AgnoLLM:
         return content if isinstance(content, str) else str(content or "")
 
     @staticmethod
-    def _stream(tpa, agent, candidate, history, on_text: Callable[[str], None]) -> Tuple[str, object]:
+    def _stream(tpa, agent, candidate, history, on_text: Callable[[str], None], images=None) -> Tuple[str, object]:
         """The same call, streamed the way the chat path streams: (text, metrics). A failure raises as a failed run does."""
         from agno.agent import RunEvent
 
         text, metrics = "", None
-        for event in agent.run(history, stream=True, stream_events=True):
+        for event in agent.run(history, stream=True, stream_events=True, **({"images": images} if images else {})):
             if getattr(event, "metrics", None) is not None:
                 metrics = event.metrics
             kind = getattr(event, "event", None)

@@ -90,6 +90,23 @@ The settlement delay retains the existing assumption that the backend's balance 
 
 Explicit `document_context` Edit and legacy `document_text` edits now record model work only immediately before the provider invocation. Cancellation is checked again after constructing the agent. If canceled before a provider call, the stream reports `done.aborted=true`, releases its active reservation and sends no successful billing deduction. No-model clarification results also incur no text charge. Successful edits preserve their patch/apply contract and remain billable. Cancellation after provider work has started retains the existing billing policy for that work.
 
+## Billing fixes of 2026-11-20 (audit)
+
+* **Images started by a Write answer are always settled.** The API passes its own image dict into the pipeline
+  (`image_sink`), so an image reserved before an abort, a provider error or `credit_limit_reached` is charged if delivered and
+  released if not. Before, 5 credits per image stayed reserved and the reservation TTL was refreshed by later requests.
+* **A picture answer is billed as its images only.** Direct image requests and photo fills without a layout call send
+  `operation_type: "image"` with `input_chars`/`output_chars` 0 (the placeholder is not text). When no image is delivered,
+  nothing is charged and every hold is released.
+* **No hold per attached image.** An edit of an attached picture reserves its own image price when it starts; the extra
+  per-URL hold made users with enough credits fail with "insufficient credits".
+* **Designs are charged their flat price only when `design_ready` is delivered.** An aborted or failed design costs nothing.
+* **`images[]` lists only the images the user was sent** (`image_ready`), matching `image_count`.
+* **`/agent/process` now returns `billing`:** `{"operation_type", "input_chars", "output_chars", "image_count", "images",
+  "design"}`, computed as `/agent/stream` settles. `design` is `{"sub_mode", "credits_scaled"}` when a flat-priced design was
+  delivered (also for `type: general` requests that became designs), else `null`. Bill from this block rather than from the
+  request `type`.
+
 ## Verification
 
 Install test dependencies with `.venv/bin/python -m pip install -r requirements-dev.txt`.

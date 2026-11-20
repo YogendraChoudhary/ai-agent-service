@@ -1,3 +1,6 @@
+# Kept in the monorepo, not in the developer's zips: never commit .env (it holds the platform keys).
+.env
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

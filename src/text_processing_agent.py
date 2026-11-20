@@ -30,6 +30,7 @@ from .autocomplete_join import apply_join_tag, fix_join, is_commentary
 from .net_safety import is_public_ip
 from .security_guardrails import sanitize_web_content
 from .observability import record_provider_usage, trace_mark, trace_set
+from .attachments import REFERENCE_INSTRUCTION, reference_block
 from .document_context import ContextRange, PreparedContext, OUTPUT_TOKENS
 from .blog.prompts import section_system_prompt
 from .provider_work import (AUTOCOMPLETE_TIMEOUT_SECONDS, MODEL_CALL_TIMEOUT_SECONDS, ProviderCancelled,
@@ -1465,6 +1466,7 @@ def build_smart_global_instructions(plan=None) -> list:
             "Partial coverage supports only the supplied excerpts and outline. Never claim to have reviewed the whole document or ruled out every contradiction from partial context.",
             "You have no web access, image tools, storage or editor-write tools. Do not claim to look up facts or apply document changes. Explain when external verification is needed.",
             "Return clean Markdown appropriate to the task. Do not echo the reference envelope or add a preface to a draft.",
+            REFERENCE_INSTRUCTION,
         ]
 
     if plan is None:
@@ -2404,12 +2406,16 @@ def process_user_query_stream(
     document_text: Optional[str] = None,
     document_edit_selection: ContextRange | None = None,
     prepared_context: Optional[PreparedContext] = None,
+    references=None,
+    document_steps=None,
+    steps_document=None,
     match_document_style: bool = False,
     document_intent: Optional[dict] = None,
     chart_request: Optional[dict] = None,
     needs_document: Optional[dict] = None,
     action_resolution: Optional[dict] = None,
     schema_version: Optional[Literal["1.0", "1.1"]] = None,
+    image_sink: Optional[dict] = None,
 ):
     """
     Stream query processor for text editor integration.
@@ -2462,6 +2468,24 @@ def process_user_query_stream(
         yield {'__event__': {'event': 'document_action_resolved', 'data': action_resolution}}
     if document_intent is not None:
         yield {'__event__': {'event': 'document_intent_suggested', 'data': document_intent}}
+    if document_steps:
+        # Auto with several tasks (src/document_steps.py): each step is a nested run of this pipeline on the document as it
+        # is after the steps before it.
+        from .document_steps import run_steps
+        trace_set(request_id, mode='document_steps', document_steps=[s.public() for s in document_steps])
+
+        def nested(step_query, **inputs):
+            return process_user_query_stream(
+                step_query, model_provider=model_provider, api_key=api_key, request_id=request_id, user_id=user_id,
+                credit_manager=credit_manager, is_byok=is_byok, image_urls=image_urls, force_agent_type=FREE_FORM_AGENT,
+                image_completion_callback=image_completion_callback, image_routing=False, document_id=document_id,
+                model_source=model_source, key_resolver=key_resolver, non_streaming=non_streaming, report_model=True,
+                classifier_platform_key=classifier_platform_key, text_byok=text_byok, user_text=step_query,
+                operation_type='general', cancel_event=cancel_event, references=references,
+                match_document_style='document_text' in inputs, **inputs)
+        yield from run_steps(document_steps, steps_document.text, steps_document.cursor_utf16, nested,
+                             references=references, image_count=len(image_urls or []), cancel_event=cancel_event)
+        return
     if needs_document is not None:
         # Write mode asked about a document it did not send: name the mode instead of guessing (no model call).
         trace_set(request_id, mode='needs_context', suggested_action=needs_document['suggested_action'])
@@ -2507,7 +2531,8 @@ def process_user_query_stream(
         from .document_edit.runtime import stream_document_edit
         from .task_router import Candidate, resolve_route
         routed = key_resolver is not None and (settings.task_routing_enabled or settings.provider_fallback_enabled)
-        candidates = resolve_route('writing', model_provider, model_source, key_resolver.available_providers, True) if routed else [Candidate(model_provider, True)]
+        candidates = resolve_route('writing', model_provider, model_source, key_resolver.available_providers, True,
+                                   has_images=bool(image_urls)) if routed else [Candidate(model_provider, True)]
         if not candidates:
             raise ValueError('No API key configured for an eligible provider')
         edit_instruction = user_text if user_text is not None else query
@@ -2532,7 +2557,8 @@ def process_user_query_stream(
             candidates=candidates, key_for=edit_key_for,
             is_byok=is_byok, user_id=user_id, request_id=request_id, report_model=report_model, cancel_event=cancel_event,
             match_style=match_document_style, selection=document_edit_selection,
-            photo_tool=edit_photo_tool, pending_images=edit_images)
+            photo_tool=edit_photo_tool, pending_images=edit_images, references=references,
+            images=build_agno_images(image_urls, request_id) if image_urls else None)
         return
 
     query_lower = query.lower()
@@ -2610,6 +2636,11 @@ def process_user_query_stream(
             reference_url = prev_ctx["cdn_url"]
         reference_required = image_intent["kind"] == "edit"
 
+        # The answer is a picture, not text: it is billed as its image only, and not at all when no image arrives (audit
+        # 2026-11-20: a direct image cost 6 credits with its placeholder billed as text, and a failed one still cost 1).
+        # Marked in the image dict (internal "__" key), so the stream itself does not change.
+        if image_sink is not None:
+            image_sink["__image_only__"] = True
         # Price the image for the model that will actually draw it, then reserve (skipped for BYOK users).
         from src.credit_manager import image_credits_scaled, IMAGE_CREDITS_SCALED
         from src.image_gen import plan_image_target
@@ -2626,7 +2657,7 @@ def process_user_query_stream(
             reserved = credits
 
         placeholder_id = str(uuid.uuid4())
-        pending_images = {
+        direct_entry = {
             placeholder_id: {
                 "status": "generating",
                 "cdn_url": None,
@@ -2642,6 +2673,10 @@ def process_user_query_stream(
             },
             "__completion_callback__": image_completion_callback,
         }
+        # Into the caller's dict when it passed one (image_sink): the API then sees this image before it starts.
+        pending_images = image_sink if image_sink is not None else {}
+        pending_images.update(direct_entry)
+        pending_images["__image_only__"] = True
 
         def _direct_bg_generate():
             t_start = time.perf_counter()
@@ -2724,7 +2759,7 @@ def process_user_query_stream(
     topic = strip_length(query, length_spec) or query
     if task == 'code' and request_type == 'general':
         force_agent_type = 'code_writer'
-    elif (request_type == 'general' and not image_urls and settings.blog_ai_enabled and not design_mode and not document_mode
+    elif (request_type == 'general' and not image_urls and not references and settings.blog_ai_enabled and not design_mode and not document_mode
           and not (image_intent and image_intent['kind'] in ('generate', 'edit'))
           and (settings.blog_intent_regex_enabled or settings.blog_intent_shadow_mode)):
         # "write a blog post about ..." in free-form chat: image and code intent were checked first, as for code.
@@ -2760,8 +2795,11 @@ def process_user_query_stream(
     # callers are expected to gate on supports_vision() before getting here.
     images = build_agno_images(image_urls, request_id) if image_urls else None
 
-    # Shared dict for tracking async image generation
-    pending_images = {"__completion_callback__": image_completion_callback}
+    # Shared dict for tracking async image generation. The API passes its own (image_sink), so it sees every image the moment it
+    # starts (audit 2026-11-20: the dict was only handed over after the answer, so an abort, a provider error or the credit limit
+    # left every started image's credits reserved).
+    pending_images = image_sink if image_sink is not None else {}
+    pending_images["__completion_callback__"] = image_completion_callback
 
     # Deterministic plan for the free-form agent: image count, web access and model tier come from the
     # user's own words, not from the LLM (src/request_plan.py).
@@ -2846,6 +2884,10 @@ def process_user_query_stream(
         from src.models import design_model_id
 
         sub_mode = getattr(plan, 'design_sub_mode', None) or 'create_from_prompt'
+        if sub_mode == 'fill_design_images' and schema_version == "1.0":
+            # Photo slots are 1.1 (ImageNode) and the fill answers in 1.1: a 1.0 client gets the layout edit it got before
+            # photo fill existed, as when fill is switched off (request_plan.plan_design_request).
+            sub_mode = 'edit_existing_ast'
         logger.info(f"{log_prefix}Mode 8 Design Canvas activated (sub_mode={sub_mode})")
         trace_set(request_id, route='design_canvas', design_sub_mode=sub_mode)
         trace_mark(request_id, 'design_canvas_start')
@@ -2890,7 +2932,7 @@ def process_user_query_stream(
             async def run_json_completion(self, messages, image_bytes=None, temperature=0.2):
                 last_err = None
                 cand_list = candidates if candidates else [Candidate(model_provider, True)]
-                for cand in cand_list:
+                for index, cand in enumerate(cand_list):
                     check_cancelled(cancel_event)
                     k = key_resolver(cand.provider) if routed else api_key
                     if not k:
@@ -2905,9 +2947,11 @@ def process_user_query_stream(
                         check_cancelled(cancel_event)
                         logger.warning(f"{log_prefix}Design canvas runner attempt failed on {cand.provider}: {err}")
                         _design_failure_kind(cand.provider, design_model_id(cand.provider, cand.provider), err, is_byok)
-                        if _DESIGN_TRUNCATED in str(err):
-                            # Every provider has the same output cap: the next one would spend as long and be cut off too
-                            # (2026-11-20: a rename of one word on a 43 KB design ran for minutes this way).
+                        if _DESIGN_TRUNCATED in str(err) and not any(
+                                _design_output_budget(c.provider, image_bytes) > _design_output_budget(cand.provider, image_bytes)
+                                for c in cand_list[index + 1:]):
+                            # No provider left can write more: it would spend as long and be cut off too (2026-11-20: a
+                            # rename of one word on a 43 KB design ran for minutes this way). One with a larger budget is tried.
                             raise
                         last_err = err
                         continue
@@ -2947,7 +2991,9 @@ def process_user_query_stream(
             t0_fill = _time.perf_counter()
             fill_ast = DesignDocumentASTV11.model_validate_json(existing_ast_str or "")
             converted = False
-            if not design_images.image_nodes(fill_ast.model_dump()):
+            if design_images.image_nodes(fill_ast.model_dump()):
+                pending_images["__image_only__"] = True      # no layout call: billed as its photos, nothing when none arrives
+            else:
                 try:
                     fill_ast = asyncio.run(_harness_unless_aborted(design_images.CONVERT_INSTRUCTION, 'edit_existing_ast'))
                 except (asyncio.CancelledError, ProviderCancelled):
@@ -2956,9 +3002,9 @@ def process_user_query_stream(
                 converted = True
                 if report_model:
                     yield {'__model_used__': runner.used}
+            fill_warnings = design_images.check_image_srcs(fill_ast, existing_ast_str) if converted else []
             raw_fill = fill_ast.model_dump()
             targets, fill_summary = design_images.fill_targets(raw_fill, query, settings.design_max_fill_images)
-            fill_warnings = []
             prompt_failed = False
             if targets and design_images.needs_prompt_rewrite(query):
                 # The request says what the new photos should show ("replace this image with a pizza", "brighter"):
@@ -2968,7 +3014,8 @@ def process_user_query_stream(
                 try:
                     photo_llm = _design_text_llm(list(candidates)[:1], key_resolver if routed else (lambda _provider: api_key),
                                                  is_byok, user_id, request_id, cancel_event)
-                    rewritten = design_images.rewrite_photo_prompts(raw_fill, targets, query, photo_llm)
+                    rewrite_stats: dict = {}
+                    rewritten = design_images.rewrite_photo_prompts(raw_fill, targets, query, photo_llm, rewrite_stats)
                 except ProviderCancelled:
                     trace_mark(request_id, 'design_canvas_aborted')
                     return
@@ -2987,6 +3034,8 @@ def process_user_query_stream(
                         "again, or say what the photo should show.")})
                     targets = []
                 else:
+                    # The rewrite was a model call: billed as text with the photos it described (nothing if none arrives).
+                    pending_images["__text_chars__"] = rewrite_stats
                     for node in targets:
                         node["prompt"] = rewritten[node["id"]]["prompt"]
                         if rewritten[node["id"]]["alt"]:
@@ -2997,6 +3046,7 @@ def process_user_query_stream(
             image_tools = {}
             started = 0
             from .design_canvas.schema_v11 import generation_aspect
+            from .image_gen import without_image_memory
             for node in targets:
                 aspect = generation_aspect(node["aspect_ratio"])
                 if aspect not in image_tools:
@@ -3004,8 +3054,11 @@ def process_user_query_stream(
                     base_ctx = image_ctx or {}
                     slot_ctx = {**base_ctx, "explicit_params": {**(base_ctx.get("explicit_params") or {}),
                                                                 "aspect_ratio": aspect}}
-                    image_tools[aspect] = _build_image_tool(image_provider, image_key, pending_images, request_id,
-                                                            user_id, credit_manager, is_byok, slot_ctx, image_budget)
+                    # A design photo is not the document's "previous image": a later chat "make it night" must still
+                    # edit the user's own picture (audit 2026-11-20).
+                    image_tools[aspect] = without_image_memory(_build_image_tool(
+                        image_provider, image_key, pending_images, request_id, user_id, credit_manager, is_byok,
+                        slot_ctx, image_budget))
                 answer = image_tools[aspect](design_images.photo_prompt(node))
                 placeholder = design_images.placeholder_id(answer)
                 if placeholder:
@@ -3105,6 +3158,9 @@ def process_user_query_stream(
         # Button links stay exactly what the user gave; anything else is removed and reported (design_canvas/links.py).
         from .design_canvas.links import check_links
         link_warnings = check_links(design_ast, query, existing_ast_str)
+        # Photo addresses likewise: only ones the design already had (design_canvas/images.check_image_srcs).
+        from .design_canvas.images import check_image_srcs
+        link_warnings += check_image_srcs(design_ast, existing_ast_str)
         if link_warnings:
             trace_set(request_id, design_link_warnings=[w["kind"] for w in link_warnings])
         fidelity = harness_report.get("fidelity")
@@ -3127,6 +3183,13 @@ def process_user_query_stream(
             **({"edit_path": edit_path} if edit_path else {}),
         }}}
         return
+    if existing_design_ast and agent_type == FREE_FORM_AGENT and not document_mode:
+        # A design is selected but the request is not a change to it ("What font is this?", "Why is the header blue?"):
+        # chat answers from a compact read-only copy, sent as reference material (data, never instructions). Before,
+        # the design was dropped and the answer was a guess (audit 2026-11-20).
+        design_reference = _design_chat_reference(existing_design_ast, query)
+        if design_reference is not None:
+            references = [*(references or []), design_reference]
 
     from .provider_errors import can_fall_back, is_provider_unusable, is_sdk_contract_error, is_rate_limit, retry_delay, status_code
     from .models import ADVANCED_MODEL_IDS, BASIC_MODEL_IDS, DEEPSEEK_TOOL_MODEL_ID, output_token_budget
@@ -3142,6 +3205,9 @@ def process_user_query_stream(
     if document_mode and length_check is not None and length_check.unit == 'words':
         max_tokens = max(max_tokens, min(8_000, 3 * length_check.high))
     base_input = prepared_context.prompt if document_mode else (topic if length_check is not None else query)
+    if references and not document_mode:
+        # Write with reference files: the material is data before the task, never instructions (src/attachments.py).
+        base_input = f"{reference_block(references)}\n\n{REFERENCE_INSTRUCTION}\n\nUSER_TASK:\n{base_input}"
     for index, candidate in enumerate(candidates):
         if cancel_event is not None and cancel_event.is_set():
             return
@@ -3368,6 +3434,9 @@ def process_user_query_with_images(
     document_text: Optional[str] = None,
     document_edit_selection: ContextRange | None = None,
     prepared_context: Optional[PreparedContext] = None,
+    references=None,
+    document_steps=None,
+    steps_document=None,
     match_document_style: bool = False,
     document_intent: Optional[dict] = None,
     chart_request: Optional[dict] = None,
@@ -3421,6 +3490,9 @@ def process_user_query_with_images(
         document_text=document_text,
         document_edit_selection=document_edit_selection,
         prepared_context=prepared_context,
+        references=references,
+        document_steps=document_steps,
+        steps_document=steps_document,
         match_document_style=match_document_style,
         document_intent=document_intent,
         chart_request=chart_request,
@@ -3431,6 +3503,9 @@ def process_user_query_with_images(
     ):
         if isinstance(chunk, dict) and "__pending_images__" in chunk:
             pending = chunk["__pending_images__"]
+        elif isinstance(chunk, dict) and "__steps_billing__" in chunk:
+            if meta is not None:
+                meta["steps_billing"] = chunk["__steps_billing__"]
         elif isinstance(chunk, dict) and "__warnings__" in chunk:
             if meta is not None:
                 warnings = meta.get("warnings") or []
@@ -3446,6 +3521,10 @@ def process_user_query_with_images(
                 design_data = ev.get("data")
             if meta is not None:
                 meta[ev.get("event", "event")] = ev.get("data")
+                if ev.get("event") == "document_step_finished":
+                    meta.setdefault("document_step_results", []).append(ev.get("data"))
+                if ev.get("event") == "document_steps_ready":
+                    chunks = [ev["data"]["document_text"]]          # the document after the proposed steps
                 if ev.get('event') == 'document_analysis_ready':
                     meta['document_context_ready'] = ev['data']['context']
                 if ev.get("event") == "complete" and ev["data"].get("mode") == "design_canvas":
@@ -3781,6 +3860,57 @@ def _design_measure_image(image_bytes: bytes) -> Optional[bytes]:
         return None
 
 
+_DESIGN_CHAT_MAX_CHARS = 12_000      # ~3k tokens: a 43 KB editor design compacts to ~14 KB (patch.compact_design_json)
+
+
+def _design_chat_reference(existing_design_ast, query: str):
+    """
+    The selected design as a read-only ReferenceDocument for a chat answer, or None when it is not a JSON object.
+    Compact (defaults left out); a design still over _DESIGN_CHAT_MAX_CHARS sends the document settings and the
+    selected node only, and is cut at the limit after that.
+    """
+    import json as _json
+    from .attachments import ReferenceDocument
+    from .design_canvas.patch import compact_design_json
+    from .design_canvas.text_edit import split_selection
+
+    # Reads the raw, unvalidated design on every chat request with a design attached: linear, and never throws (a deeply
+    # nested body raises RecursionError, not ValueError: DevOps note 2026-11-20).
+    try:
+        raw = existing_design_ast if isinstance(existing_design_ast, str) else _json.dumps(existing_design_ast)
+        text = compact_design_json(raw)
+        design = _json.loads(text)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(design, dict):
+        return None
+    selected_id = split_selection(query)[1]
+    if len(text) > _DESIGN_CHAT_MAX_CHARS and selected_id:
+        stack = [design.get("root")]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            if node.get("id") == selected_id:
+                text = _json.dumps({**{k: v for k, v in design.items() if k != "root"}, "selected_node": node},
+                                   ensure_ascii=False, separators=(",", ":"))
+                break
+            stack.extend(node.get("children") or [])
+    if len(text) > _DESIGN_CHAT_MAX_CHARS:
+        text = text[:_DESIGN_CHAT_MAX_CHARS] + " ...[design cut here]"
+    name = "The design the user has selected (DesignDocumentAST JSON)" + (
+        f"; the selected node is `{selected_id}`" if selected_id else "")
+    return ReferenceDocument(name=name, text=text)
+
+
+def _design_output_budget(provider: str, image_bytes) -> int:
+    """The output tokens a design call on this provider may write (the cap _run_design_json_completion sends)."""
+    from config import settings
+    from src.models import design_model_id, output_token_budget
+    cap = settings.design_vision_max_output_tokens if image_bytes else _DESIGN_MAX_OUTPUT_TOKENS
+    return output_token_budget(design_model_id(provider, "claude-opus-5-5"), cap)
+
+
 def _design_text_llm(candidates, key_for, is_byok, user_id, request_id, cancel_event):
     """The model call of the design text lane: the design route's providers, with the usual fallback and usage records."""
     from config import settings
@@ -3967,7 +4097,8 @@ def _run_design_json_completion(
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt if system_prompt else None,
                 temperature=temperature,
-                max_output_tokens=output_cap,
+                # Gemini thinks too (live 2026-11-20: 7,445 visible + 743 thinking hit an 8,192 cap): same budget as the others.
+                max_output_tokens=output_token_budget(model_id, output_cap),
                 response_mime_type="application/json",
             ),
         )

@@ -185,12 +185,16 @@ def validate_design_ast(
             errors.append(f"DUPLICATE_LAYER_ID: `{lid}` appears {count} times in VectorIllustrationNodes")
 
     # ------------------------------------------------------------------
-    # Check 3: WCAG 2.1 contrast — text spans vs nearest ancestor background
+    # Check 3: WCAG 2.1 contrast — text spans vs nearest ancestor background. In edit mode only what the edit made:
+    # a colour the original already had on the same background is the user's choice.
     # ------------------------------------------------------------------
+    kept = _preexisting_low_contrast(ast, existing_ast_json) if existing_ast_json else set()
     for node, _, ancestor_bg in all_nodes:
         if not isinstance(node, TextNode):
             continue
         for i, stop, ratio, bg_hex in _low_contrast_spans(node, ancestor_bg):
+            if _contrast_key(node, i, stop, ancestor_bg) in kept:
+                continue
             target = f" gradient stop {stop + 1}" if stop is not None else ""
             errors.append(
                 f"WCAG_LOW_CONTRAST: node `{node.id}` span \"{node.spans[i].text[:20]}\"{target} "
@@ -220,6 +224,36 @@ def validate_design_ast(
     return errors
 
 
+def _contrast_key(node: TextNode, span: int, stop: Optional[int], backgrounds: tuple[str, ...]) -> tuple:
+    """A low-contrast colour as (node id, colour, backgrounds), case-insensitive, to compare with the original's."""
+    color = node.spans[span].color if stop is None else node.spans[span].gradient.stops[stop]
+    return node.id, color.upper(), tuple(bg.upper() for bg in backgrounds)
+
+
+def _original_ast(ast: DesignDocumentAST, existing_ast_json: str) -> Optional[DesignDocumentAST]:
+    try:
+        return type(ast).model_validate_json(existing_ast_json)
+    except (ValidationError, ValueError, TypeError):
+        return None
+
+
+def _preexisting_low_contrast(ast: DesignDocumentAST, existing_ast_json: str) -> Set[tuple]:
+    """
+    (node id, colour, backgrounds) of every low-contrast span colour the original design already had. An edit leaves
+    these alone: audit 2026-11-20, a label the user set to #3A3A40 on #18100C came back #FFFFFF after "make the button
+    blue". The same node with a new colour, or on a new background, is the edit's doing and is still checked.
+    """
+    original = _original_ast(ast, existing_ast_json)
+    if original is None:
+        return set()
+    found = set()
+    for node, _, backgrounds in _collect_all_nodes(original.root):
+        if isinstance(node, TextNode):
+            for i, stop, _, _ in _low_contrast_spans(node, backgrounds):
+                found.add(_contrast_key(node, i, stop, backgrounds))
+    return found
+
+
 def _node_signature(node: DesignNode) -> str:
     """Everything about a node except its id and its children, for spotting a node that only got a new id."""
     return json.dumps(node.model_dump(exclude={"id", "children"}), sort_keys=True)
@@ -231,9 +265,8 @@ def _renamed_nodes(ast: DesignDocumentAST, existing_ast_json: str) -> List[Tuple
     identical to an original node whose id is gone. Paired one to one, in tree order. An original that does
     not parse cannot be compared, so it yields nothing.
     """
-    try:
-        original = type(ast).model_validate_json(existing_ast_json)
-    except (ValidationError, ValueError, TypeError):
+    original = _original_ast(ast, existing_ast_json)
+    if original is None:
         return []
     original_nodes = [n for n, _, _ in _collect_all_nodes(original.root)]
     new_nodes = [n for n, _, _ in _collect_all_nodes(ast.root)]
@@ -253,6 +286,36 @@ def _renamed_nodes(ast: DesignDocumentAST, existing_ast_json: str) -> List[Tuple
         if candidates:
             renamed.append((n, candidates.pop(0)))
     return renamed
+
+
+def keep_selected_id(ast: DesignDocumentAST, existing_ast_json: str, selected_id: Optional[str]) -> DesignDocumentAST:
+    """
+    The edited design with the editor's selected node under its original id. A model that edits the selected node
+    sometimes renames it (audit 2026-11-20: `badge_container` came back as `badge_container_new`); _renamed_nodes only
+    pairs nodes that are otherwise identical, so the editor lost its selection. The node of the same type at the
+    selected node's place (same parent, nearest position) with an id the original did not have takes the id back.
+    """
+    if not selected_id:
+        return ast
+    original = _original_ast(ast, existing_ast_json)
+    if original is None:
+        return ast
+    placed = list(_placed(ast.root))
+    if any(n.id == selected_id for n, _, _ in placed):
+        return ast
+    where = next(((parent, index, n.node_type) for n, parent, index in _placed(original.root) if n.id == selected_id), None)
+    if where is None or where[0] is None:
+        return ast
+    old_parent, old_index, node_type = where
+    original_ids = {n.id for n, _, _ in _placed(original.root)}
+    candidates = [(n, index) for n, parent, index in placed
+                  if parent == old_parent and n.node_type == node_type and n.id not in original_ids]
+    if not candidates:
+        return ast
+    node = min(candidates, key=lambda c: abs(c[1] - old_index))[0]
+    healed = ast.model_copy(deep=True)
+    next(n for n, _, _ in _placed(healed.root) if n.id == node.id).id = selected_id
+    return type(ast).model_validate(healed.model_dump())
 
 
 # ---------------------------------------------------------------------------
@@ -275,10 +338,12 @@ def auto_heal_design_ast(
     * Restore the original id of a node that is unchanged apart from a new id
       (edit mode).
     * Deduplicate node IDs and SVG layer IDs with a ``_2``, ``_3``, … suffix,
-      shortened to stay within the 40-character id limit.
+      shortened to stay within the 40-character id limit. In edit mode the
+      node that matches the original keeps an original id; the newcomer is renamed.
     * Strip forbidden SVG attributes.
     * Recolour low-contrast text and gradient stops using the closest legible
-      reference shade of the same hue, or the better of black and white.
+      reference shade of the same hue, or the better of black and white
+      (in edit mode, only colours the original did not already have there).
 
     Never changes text content or layout properties.
 
@@ -289,9 +354,10 @@ def auto_heal_design_ast(
     if existing_ast_json:
         for node, original_id in _renamed_nodes(healed, existing_ast_json):
             node.id = original_id
-    _dedupe_ids(healed)
+    original = _original_ast(healed, existing_ast_json) if existing_ast_json else None
+    _dedupe_ids(healed, original)
     _strip_svg_attrs(healed)
-    _fix_contrast(healed, vision_meta)
+    _fix_contrast(healed, vision_meta, _preexisting_low_contrast(healed, existing_ast_json) if existing_ast_json else set())
     # Re-parse so Pydantic re-validates every mutation.
     return type(ast).model_validate(healed.model_dump())
 
@@ -328,13 +394,50 @@ def _unique_id(base: str, taken: Set[str]) -> str:
         n += 1
 
 
-def _dedupe_ids(ast: DesignDocumentAST) -> None:
-    """The first node (layer) with an id keeps it; later ones get a fresh id that no node (layer) uses."""
-    nodes = [n for n, _, _ in _collect_all_nodes(ast.root)]
+def _placed(node: DesignNode, parent: Optional[str] = None, index: int = 0) -> Iterator[tuple[DesignNode, Optional[str], int]]:
+    """(node, parent id, index among its siblings) in tree order."""
+    yield node, parent, index
+    if isinstance(node, ContainerNode):
+        for i, child in enumerate(node.children):
+            yield from _placed(child, node.id, i)
+
+
+def _child_ids(node: DesignNode) -> Set[str]:
+    return {child.id for child in node.children} if isinstance(node, ContainerNode) else set()
+
+
+def _dedupe_ids(ast: DesignDocumentAST, original: Optional[DesignDocumentAST] = None) -> None:
+    """
+    Later nodes (layers) with a used id get a fresh id that no node (layer) uses. Which one keeps the id: in edit mode,
+    for an id the original had, the occurrence most like the original node (content, children, parent, position);
+    otherwise the first. Audit 2026-11-20: a new button inserted before `btn_order_now` with the same id kept it, and
+    the user's own button became `btn_order_now_2` (the editor lost the selection on it).
+    """
+    placed = list(_placed(ast.root))
+    nodes = [n for n, _, _ in placed]
     layers = [layer for n in nodes if isinstance(n, VectorIllustrationNode) for layer in n.layers]
+
+    keeper: Dict[str, DesignNode] = {}
+    if original is not None:
+        before = {n.id: (n, parent, index) for n, parent, index in _placed(original.root)}
+        occurrences: Dict[str, List[tuple]] = {}
+        for n, parent, index in placed:
+            occurrences.setdefault(n.id, []).append((n, parent, index))
+        for nid, found in occurrences.items():
+            if len(found) < 2 or nid not in before:
+                continue
+            old, old_parent, old_index = before[nid]
+            signature, old_children = _node_signature(old), _child_ids(old)
+            keeper[nid] = max(found, key=lambda f: (
+                _node_signature(f[0]) == signature, len(_child_ids(f[0]) & old_children),
+                f[1] == old_parent, -abs(f[2] - old_index)))[0]
 
     taken, seen = {n.id for n in nodes}, set()
     for n in nodes:
+        if n.id in keeper:
+            if n is not keeper[n.id]:
+                n.id = _unique_id(n.id, taken)
+            continue
         if n.id in seen:
             n.id = _unique_id(n.id, taken)
         seen.add(n.id)
@@ -358,13 +461,16 @@ def _strip_svg_attrs(ast: DesignDocumentAST) -> None:
             }
 
 
-def _fix_contrast(ast: DesignDocumentAST, vision_meta: Optional[VisionMetadata] = None) -> None:
+def _fix_contrast(ast: DesignDocumentAST, vision_meta: Optional[VisionMetadata] = None, kept: Set[tuple] = frozenset()) -> None:
+    """``kept``: the original's own low-contrast colours (_preexisting_low_contrast), left as the user set them."""
     roles = vision_meta.roles if vision_meta else None
     palette = {color: lab(hex_rgb(color)) for color in (*roles.text, *roles.accents)} if roles else {}
     for node, _, backgrounds in _collect_all_nodes(ast.root):
         if not isinstance(node, TextNode):
             continue
         for i, stop, _, _ in list(_low_contrast_spans(node, backgrounds)):
+            if _contrast_key(node, i, stop, backgrounds) in kept:
+                continue
             span = node.spans[i]
             original = span.color if stop is None else span.gradient.stops[stop]
             backdrop = [_relative_luminance(bg) for bg in backgrounds]

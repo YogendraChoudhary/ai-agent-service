@@ -350,6 +350,87 @@ in Write, which never sees the document, and came back as a generic page with un
 
 ---
 
+### 2.9 Several steps in one prompt (Auto) — new, 2026-11-20
+
+"Shorten the introduction and add a FAQ section at the end" now does both. Send it as today (`document_context`,
+`document_action: "auto"`). Nothing changes for a single-task prompt.
+
+**How it is split.** At a request verb after "and", "then", a comma, a semicolon or a new sentence ("…introduction and
+**add** a FAQ…"). Not split: one task with two objects ("Fix typos and grammar"), a part that points back ("Add a FAQ section
+and make **it** shorter"), quoted text, a selection, a scope or analysis request. Each part gets its action from Auto's rules
+(or its light classifier). Two edits, or two questions, next to each other become one step. More than 3 steps, or a part Auto
+cannot place, runs as one action, exactly as before.
+
+**Stream.**
+
+```text
+event: document_action_resolved
+data: {"requested_action":"auto","action":"steps","source":"rules","reason":"several_tasks","ambiguous":false,
+       "steps":[{"step":1,"action":"edit","label":"Shorten the introduction"},{"step":2,"action":"draft","label":"Add a FAQ section at the end"}]}
+event: document_step_started   data: {"step":1,"action":"edit","label":"Shorten the introduction","total":2}
+event: document_step_finished  data: {"step":1,"action":"edit","label":"…","total":2,"status":"proposed","message":"…",
+                                      "base_sha256":"…","result_sha256":"…","document_edit":{ …the usual document_edit_ready object… }}
+event: document_step_started   data: {"step":2,"action":"draft",…}
+event: document_step_finished  data: {"step":2,"action":"draft",…,"status":"proposed","markdown":"## FAQ…","insert_at_utf16":3912,
+                                      "document_context":{ …the usual document_context_ready object… }}
+event: document_steps_ready    data: {"steps":[{"step":1,"action":"edit","label":"…","status":"proposed"},…],
+                                      "base_sha256":"…","result_sha256":"…","document_text":"<the document after every proposed step>"}
+data: {"type":"done", …}
+```
+
+* Results come in the step events: there are **no `content` frames** in this mode. `action` is `edit`, `draft` or `ask`
+  (a standalone "write a …" part is written as a Draft).
+* Each step runs on the document **as the steps before it left it**. `base_sha256` is that document; `result_sha256` the one
+  after the step. Edit offsets and Draft `insert_at_utf16` refer to that step's base. Apply kept steps in order; if the user
+  discards an earlier step, re-locate a later Edit patch by its `before` text and a Draft by `document_context.placement.text`
+  (or insert it where the user wants).
+* `status`: `proposed`, `answered` (ask), `no_change`, `needs_clarification`, `needs_context` or `failed` (with `error`). A
+  failed step does not stop the others.
+* Photos from an Edit step stream as `image_ready` after `done`, as in 2.8.
+* `/agent/process`: `document_steps` = `{"steps": [<each document_step_finished object>], "base_sha256", "result_sha256",
+  "document_text"}`, and `markdown_response` is `document_text`.
+* **Credits: per step.** Each step is billed as if it had been sent alone (its document and attachment input, its output),
+  settled as one charge for the prompt. A failed step, or one that stopped before a model call, costs nothing. The upfront hold
+  covers every step, so a two-step prompt on a long document holds about twice what one action would.
+* Switch: `DOCUMENT_STEPS_ENABLED` (on).
+
+### 2.10 Attachments with Write, Ask, Draft and Edit — new, 2026-11-20
+
+**Images.** `image_urls` (max 3, CDN URLs as for Write) are now accepted with `document_context` for ask, draft, edit and auto.
+The model sees them ("what does this diagram show?", "add a paragraph describing this chart"). They are read, never edited,
+and hold no image-generation credits.
+
+**Files: option (b).** Convert PDF and DOCX with `POST /agent/documents/import`; send TXT and MD as they are. Put the text in
+`references` (works with `/agent/stream` and `/agent/process`, type `general`: Write, Auto, Ask, Draft, Edit):
+
+```json
+"references": [{"name": "brief.docx", "text": "<the converted text>"}]
+```
+
+* Why (b): one conversion path with its existing limits and SSRF guard, you can show the extracted text or an import error
+  before sending, and the agent fetches nothing.
+* Reference material goes to the model in its own read-only block, marked as data, never instructions, and not the document.
+  It is never edited or returned as an edit target. `document_context_ready.attachments` (additive) lists what was attached:
+  `{"images": 1, "references": [{"name": "brief.docx", "chars": 276}]}`.
+* **Limits:** at most 3 reference files and **60,000 characters in total** (`ATTACHMENT_MAX_REFERENCE_CHARS`, about 15k tokens,
+  roughly 25-30 pages of text); at most 3 images. Over a limit: HTTP 400 with the reason. Each file is also bound by the import
+  limits (`docs/DOCUMENT_IMPORT_API_HANDOFF.md`). `document_analysis` (summary, contradictions) does not take attachments yet.
+* **Credits:** attachments are input. Reference text counts as its characters; each image as 4,000 characters
+  (`ATTACHMENT_IMAGE_INPUT_CHARS`, about 1k tokens). At 1,000 characters per credit: one image about 4 credits, a full 60,000
+  characters of references about 60 credits. In a several-step prompt every step reads the attachments, so each step pays for them.
+* **What Edit does with them:** wording, tone and facts may come from an attachment ("rewrite the intro in the tone the brief asks
+  for", "mention the audience the brief names in the intro"). Edit still **never changes or adds numbers and cannot edit
+  tables**, so "add the launch date from this brief" (a new number) or "update the pricing
+  table from this screenshot" is refused or left unchanged; that needs table editing and a decision to let attachments change
+  figures. Draft can use numbers from an attachment ("add a note with the price from this screenshot").
+
+### 2.11 Write and Draft
+
+Draft already writes new text with the document in view, including standalone pieces ("write a short poem about family game
+night at the end"). If you want one "Add" action, send `document_action: "draft"` for it (or `auto`). Keep Write for what
+Draft cannot do: pictures, editable designs, code, charts and the blog pipeline. Write still does not read the document; it
+does take `references` now.
+
 ## 3. Voice dictation
 
 > **Not used by the editor.** The editor team keeps AssemblyAI for real-time transcription; `/v1/voice/dictate` is a

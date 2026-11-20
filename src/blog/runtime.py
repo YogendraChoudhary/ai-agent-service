@@ -19,8 +19,28 @@ from .sources import WebSources
 
 logger = logging.getLogger(__name__)
 
-# Defaults for a post's pictures; the user's explicit image_params still win.
+# Defaults for a post's pictures. The user's explicit image_params win, and so do their own words about the pictures.
 BLOG_IMAGE_DEFAULTS = {"aspect_ratio": "16:9", "quality": "medium"}
+# The words describing the pictures ("with square, high quality images", "photos in portrait"): only these may override
+# the defaults. Not the whole brief: "a post about vertical farming" or "Times Square" is no 9:16 or 1:1 request.
+_STOP = r"(?:with|about|on|of|for|to|from|in|and|or|a|an|the|that|featuring|including|plus|post|article|blog)"
+_PICTURE_WORDS_RE = re.compile(
+    rf"\b(?:(?!{_STOP}\b)[\w:-]+[ ,]+){{0,4}}(?:images?|pictures?|photos?|illustrations?|visuals?)\b"
+    r"(?:\s+(?:in|at)\s+[\w:-]+(?:\s+[\w:-]+){0,2})?",
+    re.IGNORECASE)
+
+
+def picture_params(query: str, instruction: Optional[str], image_params: Optional[dict]) -> dict:
+    """
+    The explicit params for a post's pictures: API fields > the user's words about the pictures > BLOG_IMAGE_DEFAULTS.
+    The defaults used to be sent as explicit params, which outrank the user's words in the image flow (audit 2026-11-20:
+    "a blog post ... with square, high quality images" got 16:9 medium pictures).
+    """
+    from src.image_gen import ImageParams
+
+    words = " ".join(m.group(0) for text in (query, instruction) for m in _PICTURE_WORDS_RE.finditer(text or ""))
+    params = ImageParams.from_prompt_and_overrides("", image_params, BLOG_IMAGE_DEFAULTS, selection_text=words)
+    return {**(image_params or {}), "aspect_ratio": params.aspect_ratio, "quality": params.quality}
 
 
 def parse_outline_model(value: Optional[str]) -> Optional[Tuple[str, bool]]:
@@ -75,6 +95,7 @@ def stream_blog(
     same completion callback) the chat path uses, so the stream endpoint's image_ready / billing flow applies as is.
     """
     from src import text_processing_agent as tpa
+    from src.image_gen import without_image_memory
     from src.request_plan import ToolBudget
 
     sources = WebSources()
@@ -82,7 +103,7 @@ def stream_blog(
     # record of which pages were read (the lint needs it to allow an attributed quote).
     ctx = {
         "document_id": document_id,
-        "explicit_params": {**BLOG_IMAGE_DEFAULTS, **(image_params or {})},
+        "explicit_params": picture_params(query, instruction, image_params),
         "user_query": query,
         "web_sources": sources,
     }
@@ -103,8 +124,9 @@ def stream_blog(
     media = None
     if plan.images and drawer is not None:
         candidate, key = drawer
-        tool = tpa._build_image_tool(candidate.provider, key, pending_images, request_id, user_id, credit_manager,
-                                     is_byok, ctx, ToolBudget(plan.images, "image"))
+        # A post's pictures are not the document's "previous image" that a later chat edit should change.
+        tool = without_image_memory(tpa._build_image_tool(candidate.provider, key, pending_images, request_id, user_id,
+                                                          credit_manager, is_byok, ctx, ToolBudget(plan.images, "image")))
         media = get_source(settings.blog_image_source, tool)
 
     fast_outline = outline_chain(settings.blog_outline_model, candidates, available_providers)

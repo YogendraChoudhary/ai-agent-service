@@ -16,19 +16,25 @@ logger = logging.getLogger(__name__)
 
 def stream_document_edit(source, instruction, *, candidates, key_for, is_byok, user_id=None,
                          request_id=None, report_model=False, cancel_event=None, match_style=False, selection=None,
-                         photo_tool=None, pending_images=None):
+                         photo_tool=None, pending_images=None, references=None, images=None):
     """
     photo_tool(prompt) -> placeholder id or None starts one photo in the image flow; the photos it started are handed to the
-    caller as {"__pending_images__": pending_images} after the snapshot, so they stream as image_ready events like Write's.
+    caller as {"__pending_images__": pending_images} before the edit runs, so they stream as image_ready events like Write's and
+    their credits are settled even when the edit is aborted.
     """
     llm = AgnoLLM(candidates, key_for, is_byok=is_byok, user_id=user_id, request_id=request_id,
                   agent_type="document_editor", timeout=float(settings.longform_call_timeout_seconds) or None,
-                  cancel_event=cancel_event)
+                  cancel_event=cancel_event, images=images)
     trace_set(request_id, mode="document_edit", agent_type="document_editor")
+    if pending_images is not None and photo_tool is not None:
+        # Handed over before any photo starts (as the blog does): a photo reserves credits when it starts, and an abort or
+        # error below returns without reaching the end, so the caller must already hold the dict to settle them.
+        yield {"__pending_images__": pending_images}
     try:
         text, result = edit_document(source, instruction, llm, cancel_event=cancel_event, match_style=match_style, selection=selection,
                                      photo_tool=photo_tool if settings.document_edit_photos_enabled else None,
-                                     max_photos=min(settings.document_edit_max_photos, settings.image_max_per_request))
+                                     max_photos=min(settings.document_edit_max_photos, settings.image_max_per_request),
+                                     references=references, has_images=bool(images))
     except (EditCancelled, ProviderCancelled):
         return
     except Exception as error:
@@ -45,5 +51,3 @@ def stream_document_edit(source, instruction, *, candidates, key_for, is_byok, u
     yield {"__event__": {"event": "document_edit_ready", "data": result.model_dump(mode="json")}}
     # A complete verified snapshot, never a partially generated replacement. The frontend buffers this mode.
     yield text
-    if pending_images is not None and any(not str(k).startswith("__") for k in pending_images):
-        yield {"__pending_images__": pending_images}

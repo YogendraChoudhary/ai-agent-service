@@ -36,10 +36,11 @@ logger = logging.getLogger(__name__)
 IMAGE_NOUNS = (
     r"(?:images?|pictures?|photos?|photographs?|logos?|posters?|banners?|icons?|"
     r"illustrations?|artworks?|sketch(?:es)?|wallpapers?|drawings?|paintings?|"
-    r"graphics?|infographics?|avatars?|thumbnails?|renders?|portraits?)"
+    r"graphics?|infographics?|avatars?|thumbnails?|renders?|portraits?|pics?|cartoons?|stickers?|memes?|"
+    r"watercolou?rs?)"
 )
 
-CREATION_VERBS = r"(?:draw|create|generate|design|render|illustrate|paint|sketch|produce|make|craft)"
+CREATION_VERBS = r"(?:draw|create|generate|design|render|illustrate|paint|sketch|produce|make|craft|whip\s+up)"
 
 EDIT_VERBS = (
     r"(?:refine|redraw|restyle|recolou?r|re-colou?r|retouch|touch\s+up|polish|enhance|improve|"
@@ -57,7 +58,9 @@ REF_EDIT_VERBS = (
 _PREFIX = (
     r"^[\s\W]*(?:(?:please|pls|kindly|hey|hi|ok|okay|now|then|also|and|just|go\s+ahead\s+and|"
     r"can\s+you|could\s+you|would\s+you|will\s+you|you\s+can|help\s+me|try\s+to|let'?s|"
-    r"i\s+(?:want|need|would\s+like|'d\s+like|wanna)(?:\s+you)?(?:\s+to)?)[\s,]+)*"
+    r"i\s+(?:want|need|would\s+like|'d\s+like|wanna)(?:\s+you)?(?:\s+to)?|"
+    # "I'd like a photo of…", "Can I get a picture of…", "Give me a photo of…" (live audit 2026-11-20: no image was made)
+    r"i'?d\s+(?:like|love)|i\s+would\s+love|(?:can|could|may)\s+i\s+(?:get|have|see)|give\s+me|get\s+me|show\s+me)[\s,]+)*"
 )
 
 # Shared with other start-anchored routers (src/blog/intent.py) so "please", "can you"... mean one thing everywhere.
@@ -68,7 +71,10 @@ TEXT_CUES = re.compile(
     r"\b(?:summary|summari[sz]e|list|table|caption|description|text|essay|article|email|post|"
     r"poem|story|title|slogan|tagline|paragraph|sentence|bullet|translate|translation|grammar|"
     r"spelling|wording|heading|headline|tone|formal|casual|concise|shorter|longer|outline|"
-    r"script|prompt|markdown|html|csv|json|code|template|document|checklist|ideas?|names?)\b",
+    r"script|prompt|markdown|html|csv|json|code|template|document|checklist|ideas?|names?|"
+    # reading an attached picture into text ("Turn this whiteboard photo into meeting notes", "Make a recipe from this
+    # picture", "Fix the typos in this screenshot": live audit 2026-11-20, each became a 5-credit image edit)
+    r"notes|minutes|recipes?|ingredients|typos?|transcripts?|transcribe|instructions|quiz|explanation|report|feedback)\b",
     re.I,
 )
 
@@ -163,15 +169,19 @@ QUESTION_START = re.compile(
 # "create a poster design brief" asks for a document about a poster, not the poster.
 _DOC_FOLLOW = (
     r"(?:brief|copy|guidelines?|concepts?|ideas?|descriptions?|prompts?|proposals?|strategy|"
-    r"requirements?|specs?|template|checklist)"
+    r"requirements?|specs?|template|checklist|"
+    # a page part styled like a picture ("a watercolor landing section"): an editable design, not an image
+    r"sections?|layouts?|screens?|websites?|cards?|ui|ux)"
 )
 
 VERB_NEAR_NOUN = re.compile(
-    _PREFIX + CREATION_VERBS + r"\b(?:\s+[\w'-]+){0,5}?\s+" + IMAGE_NOUNS + r"\b(?!\s+(?:\w+\s+)?" + _DOC_FOLLOW + r"\b)",
+    _PREFIX + CREATION_VERBS + r"\b(?:\s+[\w'-]+){0,5}?\s+" + IMAGE_NOUNS
+    + r"\b(?!\s+(?:\w+\s+)?" + _DOC_FOLLOW + r"\b)(?!\s+" + _TEXTY_FOLLOW + r"\b)",
     re.I,
 )
 NOUN_OF_START = re.compile(
-    _PREFIX + r"(?:(?:an?|the)\s+)?(?:[\w-]+\s+){0,2}?(?:image|picture|photo|illustration|drawing|painting)\s+of\b",
+    _PREFIX + r"(?:(?:an?|the)\s+)?(?:[\w-]+\s+){0,2}?(?:image|picture|photo|pic|illustration|drawing|painting|portrait|"
+    r"sketch|watercolou?r|cartoon|render)\s+of\b",
     re.I,
 )
 DRAW_START = re.compile(
@@ -182,12 +192,46 @@ DRAW_START = re.compile(
 _TEXT_ARTIFACT = re.compile(
     r"\b(?:list|summary|outline|plan|script|description|caption|article|post|email|ideas?|"
     r"names?|titles?|checklist|bullet|paragraph|essay|prompts?|markdown|html|csv|json|code|"
-    r"template|page|document|spreadsheet)\b"
+    r"template|page|document|spreadsheet|"
+    # what is being made is text or code, the image noun is only its topic ("Create a slogan for my logo", "Make a poem about
+    # a painting", "Create a function to resize images": live audit 2026-11-20, 15 of 38 text tasks drew a picture)
+    r"slogans?|taglines?|quiz(?:zes)?|functions?|components?|faqs?|contracts?|budgets?|keywords?|speech(?:es)?|"
+    r"tutorials?|courses?|lessons?|guides?|recipes?|questions?|poems?|stor(?:y|ies)|essays?|letters?|reports?|"
+    r"reviews?|plans?|css|react|api|class|website|web\s*page|landing\s+page|gallery|grid|form|newsletter|blog|"
+    r"invitation|announcement|bio|resume|cv|presentation|slides?|captions?|jokes?|riddles?|songs?|lyrics|quotes?)\b"
     # "table" is text only as a document table ("a table of results", "create a table"), not "a wooden table"
     r"|\btable\s+(?:of|with|showing|comparing|listing|format)\b"
     r"|\b(?:create|make|build|generate|add|insert)\s+(?:an?\s+|the\s+)?(?:\w+\s+){0,2}table\b",
     re.I,
 )
+
+
+# Other languages: "Crea una imagen de un gato", "Erstelle ein Bild von einem Hund", "Dessine un chat", "画一只猫".
+_ML_PLEASE = r"^\s*(?:por\s+favor|bitte|s'il\s+(?:te|vous)\s+pla[iî]t|per\s+favore|请|帮我)?[\s,，]*"
+ML_GENERATE = re.compile(
+    _ML_PLEASE + r"(?:"
+    r"(?:crea|créame|creame|genera|genérame|generame|haz(?:me)?|diseña)\s+(?:\w+\s+){0,3}?"
+    r"(?:imagen|imágenes|foto|fotos|fotografía|dibujo|ilustración|ilustracion|logo|póster|cartel)\b"
+    r"|(?:erstelle|erzeuge|generiere|mach|male|gestalte)\s+(?:\w+\s+){0,3}?(?:bild|bilder|foto|fotos|zeichnung|illustration|logo|poster)\b"
+    r"|(?:crée|cree|génère|genere|fais)(?:-moi)?\s+(?:\w+\s+){0,3}?(?:image|images|photo|photos|dessin|illustration|logo|affiche)\b"
+    r"|(?:crie|cria|gere|gera|faça|faca)\s+(?:\w+\s+){0,3}?(?:imagem|imagens|foto|fotos|desenho|ilustração|ilustracao|logo)\b"
+    r"|(?:genera|crea|fai)\s+(?:\w+['’]?\s*){0,3}?(?:immagine|immagini|foto|disegno|illustrazione|logo)\b"
+    r"|(?:dibuja|dibújame|dibujame|zeichne|dessine|desenhe|desenha|disegna)\b"
+    r"|画(?!面)|(?:生成|创建|绘制|制作).{0,10}?(?:图|图片|图像|照片|插图|插画)"
+    r"|.{0,30}?(?:画像|イラスト|写真|絵).{0,6}?(?:生成|作成|作って|描いて|描く|作る)|.{0,30}?を描いて"
+    r")", re.I)
+
+# Wording that is about TEXT even when a word in it can describe a picture ("more background on the history", "add a plot
+# twist", "highlights from the match", "contrast between the two arguments"): never a follow-up edit of the last image.
+_TEXT_FOLLOWUP = re.compile(
+    r"\b(?:plot|twist|story|stories|history|argument|arguments|company|academic|chapter|character|characters|dialogue|"
+    r"essay|article|blog|research|facts?|examples?|details?|information|info|explanation|readers?|audience|paragraphs?)\b"
+    r"|\bbackground\s+(?:on|about|info|information|context|for\s+the|of\s+the)\b|\bhighlights?\s+(?:from|of)\b"
+    r"|\bcontrast\s+between\b", re.I)
+
+# Only the start of a request decides: image requests are short, and the rules below run in time that grows with the length
+# (live audit 2026-11-20: 9.3 s on an 8,000-character prompt, 57 s on 100,000).
+_MAX_INTENT_CHARS = 1500
 
 
 def _result(kind: str, rule: str, query: str, **extra: Any) -> Dict[str, Any]:
@@ -224,6 +268,18 @@ def detect_image_intent(
     has_previous_image: bool = False,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """The rules below, read on the first _MAX_INTENT_CHARS characters; raw_query is always the whole stripped query."""
+    result = _detect_image_intent(query, has_reference, has_previous_image, request_id)
+    result["raw_query"] = (query or "").strip()
+    return result
+
+
+def _detect_image_intent(
+    query: str,
+    has_reference: bool = False,
+    has_previous_image: bool = False,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Classify a free-form chat query.
 
@@ -242,6 +298,7 @@ def detect_image_intent(
     q = (query or "").strip()
     if not q:
         return _result("none", "empty_query", q)
+    q = q[:_MAX_INTENT_CHARS]
 
     # 1. Composite requests stay on the agent path
     for p in COMPOSITE_PATTERNS:
@@ -263,7 +320,7 @@ def detect_image_intent(
 
     # 3. Follow-ups: only meaningful when there is a previous image and the user
     #    did not attach a new one.
-    if not has_reference and not text_cue:
+    if not has_reference and not text_cue and not _TEXT_FOLLOWUP.search(q):
         for p in REDO_PATTERNS:
             if p.search(q):
                 if has_previous_image:
@@ -314,5 +371,9 @@ def detect_image_intent(
     if m and not _TEXT_ARTIFACT.search(q):
         logger.info(f"{log_prefix}Intent rule matched: standalone_draw_command -> generate")
         return _result("generate", "standalone_draw_command", q)
+
+    if not has_reference and ML_GENERATE.search(q):
+        logger.info(f"{log_prefix}Intent rule matched: other_language_image_request -> generate")
+        return _result("generate", "other_language_image_request", q)
 
     return _result("none", "no_image_intent_matched", q)

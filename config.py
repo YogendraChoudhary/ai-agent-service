@@ -71,6 +71,13 @@ class Settings(BaseSettings):
     # paragraphs they illustrate, described from the document, and drawn by the image flow (credits, CDN, image_ready).
     document_edit_photos_enabled: bool = Field(True, alias="DOCUMENT_EDIT_PHOTOS_ENABLED")
     document_edit_max_photos: int = Field(4, ge=1, le=8, alias="DOCUMENT_EDIT_MAX_PHOTOS")
+    # Auto with several tasks in one prompt ("shorten the intro and add a FAQ at the end"; src/document_steps.py): up to 3 steps,
+    # each run on the document as the step before left it, each returned on its own.
+    document_steps_enabled: bool = Field(True, alias="DOCUMENT_STEPS_ENABLED")
+    # Attachments with Write, Ask, Draft and Edit (src/attachments.py): reference files arrive as text (converted with
+    # /agent/documents/import first); an attached image is billed as this many input characters (about 1k tokens).
+    attachment_max_reference_chars: int = Field(60_000, ge=1_000, le=200_000, alias="ATTACHMENT_MAX_REFERENCE_CHARS")
+    attachment_image_input_chars: int = Field(4_000, ge=0, le=20_000, alias="ATTACHMENT_IMAGE_INPUT_CHARS")
     # How hard Claude's advanced tier (claude-opus-5-5) thinks: low | medium | high | xhigh | max. Thinking cannot be switched off on
     # this model and is billed as output, so this is the speed/cost/quality dial. "low" measured as good as "medium" on writing, design
     # canvas and code, and faster and cheaper (docs/MODEL_UPGRADE_BENCHMARK.md, section 12). The model's own default would be medium.

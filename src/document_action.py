@@ -34,6 +34,17 @@ _DOCUMENT_PART = re.compile(r"\b(?:section|paragraph|heading|chapter|document|do
 
 _REASON = {"ask": "question_or_advice", "draft": "new_content", "edit": "existing_prose"}
 
+# Material the task points back to ("Write a blog post about these findings", "Create a chart from this data", "Summarize the
+# findings above", "a script that tracks the drop-off described here"): it is in the open document, so Write, which never sees
+# the document, cannot do the task (live audit 2026-11-20: Auto dropped the document for all of these).
+_BACK_REFERENCE = re.compile(
+    r"\b(?:these|those|this|my|our|the)\s+(?:\w+\s+){0,2}?(?:findings|notes|data|numbers|figures|results|insights|feedback|"
+    r"stats|statistics|metrics|transcript|minutes|survey\s+(?:results|responses)|responses|interview|interviews|takeaways|"
+    r"action\s+items|requirements|quotes|comments)\b|"
+    r"\b(?:these|those)\s+(?:\w+\s+){0,1}?(?:points|ideas|steps|items|examples|questions|answers|tasks|bullets|names|dates)\b|"
+    r"\b(?:\w+\s+)?(?:above|below)\b(?!\s+(?:average|the\s+fold|zero|\d))|\bdescribed\s+(?:here|above|below|in\s+(?:this|the))\b|"
+    r"\b(?:based\s+on|from|using|in)\s+(?:this|here|the\s+(?:doc|document|text|page|file|content))\b", re.IGNORECASE)
+
 CLASSIFIER_SYSTEM = """A user typed a request into a writing assistant while a document is open. Decide which mode runs it. Reply with ONE lowercase word: ask, draft, edit or write.
 
 ask - the user wants an ANSWER about the document: a question, a summary, feedback, a check, advice. Nothing is written into the document.
@@ -107,8 +118,12 @@ def decide_by_rules(query: str, document_text: str, *, scope: str = "document", 
         # "make it more appealing and add some photos": Edit places photos that illustrate the document (document_edit/photos).
         # Write would draw them blind: it never sees the document (live 2026-11-20: three photos unrelated to the blog).
         return ActionDecision("edit", "rules", "document_photos")
-    points_at_document = refers_to_document(task) or asks_to_insert(task) or bool(_DOCUMENT_PART.search(task))
-    if not points_at_document and _standalone_task(task):
+    points_at_document = (refers_to_document(task) or asks_to_insert(task) or bool(_DOCUMENT_PART.search(task))
+                          or bool(_BACK_REFERENCE.search(task)))
+    standalone = None if points_at_document else _standalone_task(task)
+    if standalone == "chart" and not re.search(r"\d", task):
+        standalone = None        # a chart with no numbers of its own is drawn from the open document's data
+    if standalone:
         return ActionDecision("write", "rules", "standalone_task")
     signals = intent_signals(task)
     hits = [name for name in ("ask", "draft", "edit") if signals[name]]
@@ -142,12 +157,14 @@ def _question_shaped(task: str) -> bool:
     return "?" in task and not _POLITE_LEAD.match(task)
 
 
-def _hint(document_text: str, has_selection: bool) -> str:
+def _hint(document_text: str, has_selection: bool, attachments: str = "") -> str:
     words = len(document_text.split())
-    return f"[document: {'empty' if not words else f'{words} words'}; {'text is selected' if has_selection else 'no selection'}]"
+    return (f"[document: {'empty' if not words else f'{words} words'}; {'text is selected' if has_selection else 'no selection'}"
+            f"{'; attached: ' + attachments if attachments else ''}]")
 
 
-def decide_with_model(query: str, document_text: str, *, has_selection: bool = False, classify: Optional[Callable] = None) -> ActionDecision:
+def decide_with_model(query: str, document_text: str, *, has_selection: bool = False, classify: Optional[Callable] = None,
+                      attachments: str = "") -> ActionDecision:
     """
     The light-tier answer, or Ask when there is none. `classify(text, system, labels)` returns one of LABELS or None; the endpoints
     bind it to the request's provider and key.
@@ -155,7 +172,7 @@ def decide_with_model(query: str, document_text: str, *, has_selection: bool = F
     label = None
     if classify is not None and settings.document_action_classifier_enabled:
         try:
-            label = classify(f"{_hint(document_text, has_selection)}\n{digest(query)}", CLASSIFIER_SYSTEM, LABELS)
+            label = classify(f"{_hint(document_text, has_selection, attachments)}\n{digest(query)}", CLASSIFIER_SYSTEM, LABELS)
         except Exception as error:      # a classifier problem must never fail the request
             logger.warning("Document action classifier failed (%s)", type(error).__name__)
     if label is None:

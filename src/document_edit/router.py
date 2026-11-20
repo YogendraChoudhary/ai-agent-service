@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import Field, field_validator
 
 from .blocks import document_blocks, fingerprint
-from .schema import DocumentInsertion, DocumentPatch, StrictModel
+from .schema import MAX_EDIT_TARGETS, DocumentInsertion, DocumentPatch, StrictModel
 from .service import apply_document_edits
 
 router = APIRouter(prefix="/agent/documents", tags=["Document edits"])
@@ -12,7 +12,7 @@ router = APIRouter(prefix="/agent/documents", tags=["Document edits"])
 class ApplyRequest(StrictModel):
     document_text: str = Field(min_length=1, max_length=100_000)
     base_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    patches: list[DocumentPatch] = Field(max_length=12)
+    patches: list[DocumentPatch] = Field(max_length=MAX_EDIT_TARGETS)
     # Photos proposed with an Edit (additive): each one image line at the end of the block it names. The markdown may carry
     # the placeholder or, once image_ready arrived, the photo's CDN URL.
     insertions: list[DocumentInsertion] = Field(default_factory=list, max_length=8)

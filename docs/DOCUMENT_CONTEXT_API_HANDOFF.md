@@ -58,7 +58,7 @@ No provider token-count request is added to the hot path. Before production enab
 
 ## Long-document Ask
 
-When Ask specifies one section by number or quoted title, such as “Summarize section 4” or `Summarize section "Risk Factors"`, the backend resolves the heading before retrieval. It sends only excerpts from that section, including any subsections, up to the existing retrieval budget. A missing or ambiguous heading returns `needs_context` with no model call. This applies even when the document fits in full or the caller omits the scope. With explicit `selection` scope, Ask uses the overlap with the named section. A selection outside that section returns `needs_context`.
+When Ask specifies one section by number or quoted title, such as “Summarize section 4” or `Summarize section "Risk Factors"`, the backend resolves the heading before retrieval. It sends only excerpts from that section, including any subsections, up to the existing retrieval budget. A missing or ambiguous heading returns `needs_context` with no model call. Exception (2026-11-20): when no heading matches and none uses the label (no "Section …" heading for "section 2", no "Appendix …" heading for "Appendix A"), the section is in the text, such as a numbered paragraph "Section 2. Rent is…" or a list item; with `document` or `auto` scope a document that fits in full is then answered from the whole document as a normal Ask, and a larger one still gets the `needs_context` message. Otherwise this applies even when the document fits in full or the caller omits the scope. With explicit `selection` scope, Ask uses the overlap with the named section. A selection outside that section returns `needs_context`.
 
 For other Ask requests, the scope behaves as follows.
 
@@ -174,7 +174,10 @@ For empty or oversized default Ask, or unavailable scoped/analysis context, meta
 When the document starts with YAML or TOML front matter, "at the top", "at the beginning" and "at the start" place the draft just below the front matter (front matter has to stay the first thing in the file); if the front matter is the only block, the draft goes after it.
 
 When a Draft task names a place, `document_context_ready` carries `placement`, resolved in code (no model call) against
-the same top-level blocks Edit uses; the draft is written for that place, and the context is centred there:
+the same top-level blocks Edit uses, without Edit's 400-block cap (since 2026-11-20; over the cap, Draft silently inserted at the
+cursor); the draft is written for that place, and the context is centred there. If the document cannot be split into blocks at all,
+a task that names a place gets `needs_clarification` with "This document is too large to place text by name; put the cursor where
+the text should go." instead of a silent insertion at the cursor:
 
 ```json
 "placement": {"position": "after", "text": "## Pricing\n", "start_utf16": 120, "end_utf16": 131}
@@ -273,7 +276,7 @@ Notes for the editor:
 
 - **Write** runs the plain prompt: the document is **not** sent to it and `document_context` in the response is `null`. Use this for
   "write a blog post…", code, images, charts and designs; they come back as they do from the Write tab.
-- **Edit** gets the checks an explicit Edit gets, so an unparseable or over-400-block document is HTTP 400 (`too many blocks…`) and an
+- **Edit** gets the checks an explicit Edit gets, so an unparseable or over-400-block document (blank lines not counted) is HTTP 400 (`too many blocks…`) and an
   instruction over 2,000 characters is HTTP 400, before any model work. Auto accepts a `query` of up to 8,000 characters otherwise.
 - `suggest_document_intent` is ignored with `auto`: the report replaces the advisory suggestion (no `document_intent_suggested`).
 - Billing is by the mode that ran. A literal Draft and clarifications cost nothing; the decision call is not billed.

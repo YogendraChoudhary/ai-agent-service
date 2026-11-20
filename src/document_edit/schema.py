@@ -5,6 +5,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+# Paragraphs one Edit may change (was 12: live audit 2026-11-20, "make the whole blog more concise" on a 20-paragraph blog
+# edited only 12, and a 13-target plan failed the whole edit). Shared by the plan, the result and the apply endpoint.
+MAX_EDIT_TARGETS = 30
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -18,7 +23,7 @@ class Target(StrictModel):
 class EditPlan(StrictModel):
     status: Literal["ready", "needs_clarification", "no_change"]
     message: str = Field(min_length=1, max_length=500)
-    targets: list[Target] = Field(default_factory=list, max_length=12)
+    targets: list[Target] = Field(default_factory=list, max_length=MAX_EDIT_TARGETS)
 
     @model_validator(mode="after")
     def coherent(self):
@@ -55,6 +60,6 @@ class DocumentEditResult(StrictModel):
     base_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     result_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     message: str = Field(min_length=1, max_length=500)
-    targets: list[Target] = Field(default_factory=list, max_length=12)
-    patches: list[DocumentPatch] = Field(default_factory=list, max_length=12)
+    targets: list[Target] = Field(default_factory=list, max_length=MAX_EDIT_TARGETS)
+    patches: list[DocumentPatch] = Field(default_factory=list, max_length=MAX_EDIT_TARGETS)
     insertions: list[DocumentInsertion] = Field(default_factory=list, max_length=8)

@@ -17,10 +17,13 @@ from src.intent import POLITE_PREFIX
 
 from .plan import BRIEF_MAX_CHARS
 
-_ADJECTIVES = r"(?:(?:short|long|detailed|comprehensive|in-depth|engaging|practical|complete|beginner'?s?)\s+)?"
-_FORM = r"(?:blog(?:\s+post)?|article|guide|long[- ]form\s+(?:piece|article|post))"
+# Up to three free words before the form ("an SEO blog post", "an informative blog post", "a blog article"), and the usual ways
+# to name the subject after it ("for my bakery about…", "titled…", "explaining how…"): live audit 2026-11-20 missed all of these.
+_ADJECTIVES = r"(?:[\w'-]+\s+){0,3}?"
+_FORM = r"(?:blog(?:\s+(?:post|article|entry))?|article|guide|long[- ]form\s+(?:piece|article|post))"
 _BLOG = re.compile(
-    POLITE_PREFIX + rf"(?:write|draft|create)\s+(?:me\s+)?(?:an?\s+){_ADJECTIVES}{_FORM}\s+(?:about|on|covering)\b",
+    POLITE_PREFIX + rf"(?:write|draft|create)\s+(?:me\s+)?(?:an?\s+){_ADJECTIVES}{_FORM}\s+"
+    r"(?:about|on|covering|for|titled|called|named|explaining|describing|that\s+(?:explains|covers|describes))\b",
     re.I,
 )
 

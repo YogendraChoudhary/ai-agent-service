@@ -75,7 +75,8 @@ def search_terms(text):
     return list(dict.fromkeys(terms))
 
 
-def _section_range(text, target):
+def _matching_headings(text, target):
+    """(headings as (start, level, folded title), indexes of the ones the target names)."""
     name, number = target
     headings = []
     start = int(text.startswith('\ufeff'))
@@ -92,6 +93,24 @@ def _section_range(text, target):
         number = number.casefold()
         prefix = re.compile(rf'^(?:{re.escape(name)}|{re.escape(number)})(?=$|[\s:.)–—-])(?![.\-]\d)')
         matches = [i for i, (_, _, title) in enumerate(headings) if prefix.match(title)]
+    return headings, matches
+
+
+def section_is_in_text(text, target) -> bool:
+    """
+    Whether the section a question names can only be in the text, not a heading: no heading matches it and, for a numbered one, no
+    heading uses its label ("Section 2." as a paragraph or list item, audit 2026-11-20). When headings do ("## Section 40: Policy"),
+    "section 4" is a section that is not there, and the refusal says so.
+    """
+    headings, matches = _matching_headings(text, target)
+    if matches:
+        return False
+    label = re.escape(target[0].split()[0].casefold())
+    return target[1] is None or not any(re.match(rf"{label}\b", title) for _, _, title in headings)
+
+
+def _section_range(text, target):
+    headings, matches = _matching_headings(text, target)
     if len(matches) != 1:
         message = 'More than one heading matches' if matches else 'No heading matches'
         raise ValueError(f'{message} “{target[0]}”. Quote the full heading title or select the relevant text.')

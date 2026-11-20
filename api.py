@@ -41,6 +41,7 @@ from src.document_edit.router import router as document_router
 from src.document_upload.router import router as document_upload_router
 from src.document_import.router import router as document_import_router
 from src.document_edit.schema import DocumentEditResult
+from src.attachments import ReferenceDocument, check_references, reference_chars, VISION_INPUT_CHARS_PER_IMAGE
 from src.document_context import AnalysisMode, DocumentAction, DocumentActionRequest, DocumentScopeRequest, DocumentContext, ContextMetadata, CONTEXT_ERROR, prepare_context, source_index
 from src.document_analysis import AnalysisResult
 from src.document_intent import IntentSuggestion, suggest_document_intent
@@ -415,8 +416,8 @@ def check_document_fields(request) -> None:
             raise ValueError('query must not contain NUL characters')
         if request.document_analysis is not None and len(json.dumps(request.query, ensure_ascii=False).encode('utf-8')) > 2000:
             raise ValueError('An analysis instruction must fit 2,000 serialized UTF-8 bytes')
-        if request.existing_design_ast is not None or getattr(request, 'image_urls', None) or request.image_params or request.image_provider or request.image_model or request.blog_options is not None:
-            raise ValueError('Document context does not accept design, image or blog inputs')
+        if request.existing_design_ast is not None or request.image_params or request.image_provider or request.image_model or request.blog_options is not None:
+            raise ValueError('Document context does not accept design, image-generation or blog inputs')
         if request.document_action == 'edit':
             from src.document_edit.blocks import document_blocks
             document_blocks(request.document_context.text)
@@ -433,6 +434,15 @@ def check_document_fields(request) -> None:
     document_blocks(request.document_text)
 
 
+def check_attachment_fields(request) -> None:
+    """Reference files go with the free-form types (Write, Ask, Draft, Edit, Auto); analysis runs on the document alone."""
+    check_references(request.references)
+    if request.references and request.type != 'general':
+        raise ValueError('references are only valid with type general')
+    if request.document_analysis is not None and (request.references or getattr(request, 'image_urls', None)):
+        raise ValueError('Document analysis does not take attachments; ask about the attachment without document_analysis')
+
+
 def check_highlight_fields(request) -> None:
     if request.type != 'highlight_key_points':
         return
@@ -446,7 +456,7 @@ def check_highlight_fields(request) -> None:
 def write_needs_document_for(request) -> Optional[dict]:
     """Write mode (type general, nothing but the prompt) that refers to a document it did not send; see document_intent."""
     if (request.type != 'general' or request.document_context is not None or request.document_text is not None
-            or request.existing_design_ast is not None or getattr(request, 'image_urls', None)):
+            or request.existing_design_ast is not None or getattr(request, 'image_urls', None) or request.references):
         return None
     from src.document_intent import write_needs_document
     return write_needs_document(request.query)
@@ -476,7 +486,8 @@ async def document_request_inputs(request):
         return request.document_context.text, None
     prepared = await run_in_threadpool(prepare_context, request.document_context, request.query, request.document_action or 'ask',
                                      scope=request.document_scope or 'document', analysis=request.document_analysis)
-    return None, prepared
+    from src.document_context import with_attachments
+    return None, with_attachments(prepared, request.references, len(getattr(request, 'image_urls', None) or []))
 
 
 def auto_action_by_rules(request):
@@ -499,7 +510,42 @@ def classify_auto_action(request, *, provider, api_key, is_byok, platform_key, r
     def classify(text, system, labels):
         return classify_label(text, provider, api_key, system=system, labels=labels, is_byok=is_byok, platform_key=platform_key,
                               timeout=settings.document_action_classifier_timeout_seconds, request_id=request_id)
-    return decide_with_model(request.query, request.document_context.text, has_selection=has_selection, classify=classify)
+    return decide_with_model(request.query, request.document_context.text, has_selection=has_selection, classify=classify,
+                             attachments=attachments_hint(request))
+
+
+def attachments_hint(request) -> str:
+    """'1 image, 2 reference files' for Auto's classifier, so "summarise this PDF" is read with the PDF attached."""
+    images, refs = len(getattr(request, 'image_urls', None) or []), len(request.references or [])
+    parts = [f"{images} image{'s' if images != 1 else ''}" if images else "", f"{refs} reference file{'s' if refs != 1 else ''}" if refs else ""]
+    return ", ".join(p for p in parts if p)
+
+
+def may_have_steps(request) -> bool:
+    """An Auto request whose wording splits into several tasks (src/document_steps.py); decided after the licence check."""
+    from src.document_steps import split_parts
+    context = request.document_context
+    return (request.document_action == 'auto' and settings.document_steps_enabled and context is not None
+            and (request.document_scope or 'document') == 'document' and request.document_analysis is None
+            and not (context.selection and context.selection.start_utf16 != context.selection.end_utf16)
+            and len(split_parts(request.query)) > 1)
+
+
+def plan_auto_steps(request, *, provider, api_key, is_byok, platform_key, request_id):
+    """The steps of a several-task Auto prompt, or None for one action. Blocking (the light classifier): run it off the loop."""
+    from src.document_action import decide_with_model
+    from src.document_steps import plan_steps
+    from src.intent_classifier import classify_label
+
+    def classify_text(text, system, labels):
+        return classify_label(text, provider, api_key, system=system, labels=labels, is_byok=is_byok, platform_key=platform_key,
+                              timeout=settings.document_action_classifier_timeout_seconds, request_id=request_id)
+
+    def classify_part(part):
+        decision = decide_with_model(part, request.document_context.text, classify=classify_text,
+                                     attachments=attachments_hint(request))
+        return decision.action if decision.source == 'model' else None
+    return plan_steps(request.query, request.document_context.text, classify=classify_part)
 
 
 def request_for_action(request, decision):
@@ -542,6 +588,8 @@ class ProcessRequest(BaseModel):
     document_scope: Optional[DocumentScopeRequest] = None
     document_analysis: Optional[AnalysisMode] = None
     suggest_document_intent: bool = Field(False, strict=True)
+    # Read-only reference material (PDF/DOCX converted with /agent/documents/import, TXT/MD as they are): src/attachments.py
+    references: Optional[List[ReferenceDocument]] = Field(default=None, max_length=3)
 
     @model_validator(mode='before')
     @classmethod
@@ -584,6 +632,7 @@ class ProcessRequest(BaseModel):
     def validate_blog_fields(self):
         check_blog_fields(self.type, self.query, self.blog_options)
         check_document_fields(self)
+        check_attachment_fields(self)
         check_highlight_fields(self)
         return self
 
@@ -615,6 +664,8 @@ class StreamRequest(BaseModel):
     document_scope: Optional[DocumentScopeRequest] = None
     document_analysis: Optional[AnalysisMode] = None
     suggest_document_intent: bool = Field(False, strict=True)
+    # Read-only reference material (PDF/DOCX converted with /agent/documents/import, TXT/MD as they are): src/attachments.py
+    references: Optional[List[ReferenceDocument]] = Field(default=None, max_length=3)
 
     @field_validator('image_provider')
     @classmethod
@@ -649,6 +700,7 @@ class StreamRequest(BaseModel):
     def validate_blog_fields(self):
         check_blog_fields(self.type, self.query, self.blog_options)
         check_document_fields(self)
+        check_attachment_fields(self)
         check_highlight_fields(self)
         return self
 
@@ -910,19 +962,63 @@ TYPE_PREFIX_MAP: dict[str, str] = {
 }
 
 
-def image_billing(pending_images: Optional[dict]) -> tuple[int, list]:
+def image_billing(pending_images: Optional[dict], delivered: Optional[set] = None) -> tuple[int, list]:
     """
     (credits reserved for ALL images started, details of the images that finished).
     Every reservation is released at settlement, so a failed image no longer holds credits until the
     reservation key expires. details = [{"provider", "model", "credits_scaled"}] for the webhook.
+    `delivered`: the placeholder ids the user was sent as image_ready. When given, only those are billed: an image that
+    finished after an abort or after the wait was reported as failed and must not be charged (audit 2026-11-20).
     """
-    entries = [v for k, v in (pending_images or {}).items() if not str(k).startswith("__") and isinstance(v, dict)]
-    reserved = sum(int(e.get("reserved_scaled") or 0) for e in entries)
+    items = [(k, v) for k, v in (pending_images or {}).items() if not str(k).startswith("__") and isinstance(v, dict)]
+    reserved = sum(int(e.get("reserved_scaled") or 0) for _, e in items)
     done = [
         {"provider": e.get("provider"), "model": e.get("model"), "credits_scaled": int(e.get("credits_scaled") or 0)}
-        for e in entries if e.get("status") == "done"
+        for k, e in items if e.get("status") == "done" and (delivered is None or k in delivered)
     ]
     return reserved, done
+
+
+def process_billing(request_data, meta: dict, response: str, image_details: list, document_text, prepared_context) -> dict:
+    """
+    The billing facts of an /agent/process call, computed as /agent/stream settles them (audit 2026-11-20: the response had no
+    image count, no image details and no design price, and the backend priced designs from the request type alone, though
+    `general` requests make designs too). {operation_type, input_chars, output_chars, image_count, images, design}.
+    """
+    meta = meta or {}
+    design = None
+    if meta.get('design_ready') is not None:
+        from src.request_plan import plan_design_request
+        from src.design_canvas.images import has_image_slots
+        plan = plan_design_request(request_data.query, request_data.type, False, bool(request_data.existing_design_ast),
+                                   request_data.existing_design_ast)
+        if plan is not None:
+            sub_mode = plan.design_sub_mode
+            if sub_mode == 'fill_design_images' and request_data.schema_version == '1.0':
+                sub_mode = 'edit_existing_ast'
+            price = design_credits_scaled(sub_mode, has_image_slots(request_data.existing_design_ast))
+            design = {'sub_mode': sub_mode, 'credits_scaled': price} if price else None
+    edit = meta.get('document_edit_ready')
+    if meta.get('steps_billing'):
+        input_chars, output_chars = meta['steps_billing']['input_chars'], meta['steps_billing']['output_chars']
+    elif edit is not None:
+        input_chars = len(request_data.query) + len(document_text or '') + reference_chars(request_data.references)
+        output_chars = sum(len(p.get('after', '')) for p in edit.get('patches', [])) if edit.get('status') == 'proposed' else 0
+    elif prepared_context is not None:
+        input_chars, output_chars = prepared_context.metadata.billable_input_chars, len(response or '')
+    else:
+        input_chars, output_chars = len(request_data.query) + reference_chars(request_data.references), len(response or '')
+    if meta.get('image_only') or design is not None:
+        input_chars = output_chars = 0          # a picture or a flat-priced design: not billed per character
+    if meta.get('image_only') and meta.get('image_text_chars') and image_details:
+        # the photo-prompt rewrite that described the delivered photos is a text call: billed as text with them
+        input_chars = int(meta['image_text_chars'].get('input_chars') or 0)
+        output_chars = int(meta['image_text_chars'].get('output_chars') or 0)
+    operation_type = ('design' if design is not None else
+                      ('mixed' if output_chars or input_chars else 'image') if meta.get('image_only') else
+                      'mixed' if image_details and output_chars else 'image' if image_details else 'text')
+    return {'operation_type': operation_type, 'input_chars': input_chars, 'output_chars': output_chars,
+            'image_count': len(image_details), 'images': image_details, 'design': design}
 
 
 def billed_provider_model(model_provider: str, op_type: str, details: list) -> tuple[str, Optional[str]]:
@@ -1157,7 +1253,16 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
     try:
         had_document_context = request_data.document_context is not None      # auto -> Write drops the document, not the fact that this was one
         action_resolution = None
-        if request_data.document_action == 'auto':
+        document_steps = None
+        if may_have_steps(request_data):
+            document_steps = await run_provider_work(
+                plan_auto_steps, request_data, provider=request_data.model, api_key=request_data.api_key, is_byok=True,
+                platform_key=None, request_id=request_id)
+        if document_steps:
+            from src.document_steps import steps_resolution
+            action_resolution = steps_resolution(document_steps)
+            trace_set(request_id, document_action='steps', document_action_source=action_resolution['source'])
+        elif request_data.document_action == 'auto':
             # The backend's provider key serves the classifier as it would a BYOK key: the document task stays with that provider.
             decision = auto_action_by_rules(request_data) or await run_provider_work(
                 classify_auto_action, request_data, provider=request_data.model, api_key=request_data.api_key, is_byok=True,
@@ -1165,9 +1270,10 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
             action_resolution = decision.event()
             trace_set(request_id, document_action=decision.action, document_action_source=decision.source)
             request_data = request_for_action(request_data, decision)
-        chart_request = chart_request_for(request_data)
-        needs_document = None if action_resolution and request_data.document_context is None else write_needs_document_for(request_data)
-        document_text, prepared_context = await document_request_inputs(request_data)
+        chart_request = None if document_steps else chart_request_for(request_data)
+        needs_document = None if (document_steps or (action_resolution and request_data.document_context is None)) \
+            else write_needs_document_for(request_data)
+        document_text, prepared_context = (None, None) if document_steps else await document_request_inputs(request_data)
         logger.info(f"[{request_id}] Type: {request_data.type}")
         logger.info(f"[{request_id}] Model: {request_data.model}")
         query_preview = (
@@ -1234,6 +1340,9 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
             document_text=document_text,
             document_edit_selection=request_data.document_context.selection if document_text is not None and request_data.document_context else None,
             prepared_context=prepared_context,
+            references=request_data.references,
+            document_steps=document_steps,
+            steps_document=request_data.document_context if document_steps else None,
             match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
             document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
             action_resolution=action_resolution,
@@ -1246,6 +1355,9 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
 
         # Images are the only thing this endpoint meters (text is not metered here, as before).
         image_reserved_scaled, image_details = image_billing(pending_images)
+        billing = process_billing(request_data, {**meta, 'image_only': bool((pending_images or {}).get('__image_only__')),
+                                                 'image_text_chars': (pending_images or {}).get('__text_chars__')},
+                                  response, image_details, document_text, prepared_context)
         if not is_byok and (image_details or image_reserved_scaled):
             bill_provider, bill_model = billed_provider_model(model_provider, 'image', image_details)
             duration_ms = int((time.time() - start_time) * 1000)
@@ -1302,8 +1414,13 @@ async def process_text(request_data: ProcessRequest, request: Request) -> JSONRe
                 'document_analysis': meta.get('document_analysis_ready'),
                 'document_intent': meta.get('document_intent_suggested'),
                 'document_action_resolved': meta.get('document_action_resolved'),
+                # Several-step Auto: every step's own result, in order, and the document after the proposed steps.
+                'document_steps': ({**meta['document_steps_ready'], 'steps': meta.get('document_step_results', [])}
+                                   if meta.get('document_steps_ready') else None),
                 'highlighting': meta.get('highlight_ready'),
                 'needs_context': meta.get('needs_context'),
+                # What to bill (the backend bills /agent/process): the same rules /agent/stream settles with.
+                'billing': billing,
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1356,7 +1473,11 @@ async def stream_text(
     try:
         had_document_context = request_data.document_context is not None
         action_resolution, defer_action = None, False
-        if request_data.document_action == 'auto':
+        document_steps = None
+        steps_possible = may_have_steps(request_data)
+        if steps_possible:
+            defer_action = True          # several tasks: the steps are planned after the licence check (the classifier needs the key)
+        elif request_data.document_action == 'auto':
             decision = auto_action_by_rules(request_data)
             if decision is None:
                 defer_action = True      # unclear wording: the classifier needs the resolved key, so it runs right after the licence check
@@ -1402,16 +1523,28 @@ async def stream_text(
         text_byok = is_byok or bool((license_meta['user_keys'] or {}).get('use_own_keys'))
         if defer_action:
             # Same key rules as the code classifier: a BYOK request stays on its own key, anything else uses the platform's Claude key.
-            decision = await run_provider_work(
-                classify_auto_action, request_data, provider=model_provider, api_key=api_key, is_byok=text_byok,
-                platform_key=DEFAULT_API_KEYS.get('anthropic_api_key') if not text_byok else None, request_id=request_id)
-            action_resolution = decision.event()
-            trace_set(request_id, document_action=decision.action, document_action_source=decision.source)
-            request_data = request_for_action(request_data, decision)
-            chart_request = chart_request_for(request_data)
-            needs_document = None if request_data.document_context is None else write_needs_document_for(request_data)
-            document_text, prepared_context = await document_request_inputs(request_data)
-            context_no_model = (prepared_context is not None and prepared_context.message is not None) or needs_document is not None
+            classifier_key = DEFAULT_API_KEYS.get('anthropic_api_key') if not text_byok else None
+            if steps_possible:
+                document_steps = await run_provider_work(
+                    plan_auto_steps, request_data, provider=model_provider, api_key=api_key, is_byok=text_byok,
+                    platform_key=classifier_key, request_id=request_id)
+            if document_steps:
+                from src.document_steps import steps_resolution
+                action_resolution = steps_resolution(document_steps)
+                trace_set(request_id, document_action='steps', document_action_source=action_resolution['source'])
+                chart_request = needs_document = document_text = prepared_context = None
+                context_no_model = False
+            else:
+                decision = (auto_action_by_rules(request_data) if steps_possible else None) or await run_provider_work(
+                    classify_auto_action, request_data, provider=model_provider, api_key=api_key, is_byok=text_byok,
+                    platform_key=classifier_key, request_id=request_id)
+                action_resolution = decision.event()
+                trace_set(request_id, document_action=decision.action, document_action_source=decision.source)
+                request_data = request_for_action(request_data, decision)
+                chart_request = chart_request_for(request_data)
+                needs_document = None if request_data.document_context is None else write_needs_document_for(request_data)
+                document_text, prepared_context = await document_request_inputs(request_data)
+                context_no_model = (prepared_context is not None and prepared_context.message is not None) or needs_document is not None
         if not context_no_model and CREDIT_PRECHECK_ENABLED and not is_byok and credit_manager is None:
             raise HTTPException(status_code=503, detail='Credit service unavailable')
         key_resolver = None
@@ -1441,8 +1574,15 @@ async def stream_text(
         full_query = build_full_query(
             agent_type, request_data.query, request_data.secondary_prompt or ""
         )
+        # Attachments are input: reference text as it is, an image as VISION_INPUT_CHARS_PER_IMAGE (Ask and Draft already
+        # carry both in billable_input_chars; Edit and Write add them here).
         input_chars = (prepared_context.metadata.billable_input_chars if prepared_context is not None
-                       else len(request_data.query) + len(document_text or ''))
+                       else len(request_data.query) + len(document_text or '') + reference_chars(request_data.references)
+                       + (VISION_INPUT_CHARS_PER_IMAGE * len(image_urls) if document_text is not None else 0))
+        if document_steps:
+            # Each step reads the whole document (and the attachments) once: reserve for every step.
+            input_chars = len(document_steps) * (len(request_data.query) + len(request_data.document_context.text)
+                                                 + reference_chars(request_data.references) + VISION_INPUT_CHARS_PER_IMAGE * len(image_urls))
 
         # Mode 8 is billed at a flat price, not by characters. Same gate, same inputs as the pipeline's priority-1
         # design check, so the price reserved here is the price of what the pipeline runs.
@@ -1455,8 +1595,18 @@ async def stream_text(
         design_price_scaled = 0
         if design_plan:
             from src.design_canvas.images import has_image_slots
+            if design_plan.design_sub_mode == 'fill_design_images' and request_data.schema_version == '1.0':
+                # The pipeline runs a 1.0 client's photo request as a layout edit (no photo slots in 1.0): price it as one.
+                from dataclasses import replace as _replace
+                design_plan = _replace(design_plan, design_sub_mode='edit_existing_ast')
             design_price_scaled = design_credits_scaled(
                 design_plan.design_sub_mode, has_image_slots(request_data.existing_design_ast))
+        if request_data.existing_design_ast is not None and not design_plan and document_text is None and prepared_context is None:
+            # A question about the selected design: the chat answer reads it (compact, at most 12,000 characters).
+            from src.text_processing_agent import _DESIGN_CHAT_MAX_CHARS
+            input_chars += min(_DESIGN_CHAT_MAX_CHARS, len(json.dumps(request_data.existing_design_ast)
+                                                         if not isinstance(request_data.existing_design_ast, str)
+                                                         else request_data.existing_design_ast))
 
         # Upfront credit reservation (skipped for BYOK users)
         upfront_reserved_scaled = 0
@@ -1468,6 +1618,8 @@ async def stream_text(
                 expected_output_chars = prepared_context.metadata.reserved_output_chars
             if document_text is not None:
                 expected_output_chars = len(document_text)
+            elif document_steps:
+                expected_output_chars = len(request_data.document_context.text)
             if agent_type == 'generate_blog':
                 # A post costs the platform its full parallel draft before the user has read a word: reserve for it.
                 from src.blog.plan import BlogRequest, plan_blog
@@ -1476,13 +1628,13 @@ async def stream_text(
                     request_data.blog_options.model_dump(exclude_none=True) if request_data.blog_options else None),
                     image_available=False).visible_words
             upfront_reserved_scaled = design_price_scaled or text_credits_scaled(reservation_input_chars, expected_output_chars)
-            if (document_text is not None or prepared_context is not None) and upfront_reserved_scaled > MAX_RESERVATION_PER_REQUEST_SCALED:
+            if (document_text is not None or prepared_context is not None or document_steps) and upfront_reserved_scaled > MAX_RESERVATION_PER_REQUEST_SCALED:
                 finish_trace(request_id, 'rejected', error='document request exceeds credit limit', http_status=402)
                 return JSONResponse(status_code=402, content={
                     'error': 'This document exceeds the per-request credit limit. Use a smaller document.',
                     'code': 'REQUEST_CREDIT_LIMIT'})
-            if image_urls and not design_plan:
-                upfront_reserved_scaled += IMAGE_CREDITS_SCALED * len(image_urls)
+            # No hold per attached image (audit 2026-11-20): an edit of the attached picture reserves its own image price when it
+            # starts, so the hold doubled it and users with enough credits got "insufficient credits" (and paid for that text).
             ok, available_scaled = await run_credit_io(credit_manager.reserve, user_id, upfront_reserved_scaled)
             if not ok:
                 logger.warning(
@@ -1511,6 +1663,9 @@ async def stream_text(
             design_billing = None   # set when a Mode 8 design is delivered: its flat price replaces the char charge
             analysis_billing = None
             edit_result = None
+            steps_billing = None    # several-step Auto: the characters its steps used (src/document_steps.py)
+            image_only = False      # the answer is a picture (direct image, photo fill; marked in the image dict): images only
+            delivered_ids: set = set()   # images the user was sent as image_ready
             stream_started = False
 
             cancel_event = register_cancellation_event(request_id, user_id)
@@ -1575,6 +1730,10 @@ async def stream_text(
                     document_text=document_text,
                     document_edit_selection=request_data.document_context.selection if document_text is not None and request_data.document_context else None,
                     prepared_context=prepared_context,
+                    references=request_data.references,
+                    document_steps=document_steps,
+                    steps_document=request_data.document_context if document_steps else None,
+                    image_sink=pending_images,
                     match_document_style=request_data.document_context is not None and request_data.document_action == 'edit',
                     document_intent=suggest_document_intent(request_data.query, request_data.document_action).model_dump() if request_data.suggest_document_intent else None,
                     action_resolution=action_resolution,
@@ -1594,6 +1753,9 @@ async def stream_text(
 
                     if isinstance(chunk, dict) and "__pending_images__" in chunk:
                         pending_images = chunk["__pending_images__"]
+                        continue
+                    if isinstance(chunk, dict) and "__steps_billing__" in chunk:
+                        steps_billing = chunk["__steps_billing__"]
                         continue
 
                     if isinstance(chunk, dict) and '__model_used__' in chunk:
@@ -1654,7 +1816,7 @@ async def stream_text(
 
                 # Done event
                 total_duration = time.time() - start_time
-                actual_images = {k: v for k, v in pending_images.items() if k != "__completion_callback__"}
+                actual_images = {k: v for k, v in pending_images.items() if not str(k).startswith("__") and isinstance(v, dict)}
                 pending_count = len(actual_images)
                 logger.info(
                     f"[{request_id}] STREAM SUCCESS — {total_duration:.2f}s, "
@@ -1687,6 +1849,7 @@ async def stream_text(
                                 continue
                             if info["status"] == "done":
                                 resolved.add(pid)
+                                delivered_ids.add(pid)
                                 resolved_image_count += 1
                                 logger.info(
                                     f"[{request_id}] Image ready: {pid} -> {info['cdn_url']} "
@@ -1761,6 +1924,9 @@ async def stream_text(
                 context_used_model = (stream_started and prepared_context is None and document_text is None and needs_document is None) or bool(context_trace and context_trace.attrs.get('document_model_started'))
                 if prepared_context is not None and prepared_context.analysis is not None and analysis_billing is None and not had_error:
                     context_used_model = False
+                if document_steps:
+                    # Steps bill what their models did: nothing when every step stopped before a model call.
+                    context_used_model = bool(context_trace and context_trace.attrs.get('document_model_started'))
                 if edit_result is not None and edit_result.get('status') != 'proposed':
                     # No proposal (no_change, needs_clarification, failed): nothing reaches the document, nothing is charged.
                     context_used_model = False
@@ -1769,6 +1935,8 @@ async def stream_text(
                 if edit_result is not None:
                     # The stream carries the whole document snapshot; only the rewritten blocks are generated output.
                     billed_output_chars = sum(len(p.get('after', '')) for p in edit_result.get('patches', []))
+                if steps_billing is not None:
+                    billed_input_chars, billed_output_chars = steps_billing['input_chars'], steps_billing['output_chars']
                 duration_ms = int((time.time() - start_time) * 1000)
                 log_response_body(request_id, '/agent/stream', {
                     'text': ''.join(out_preview), 'output_chars': output_chars,
@@ -1779,18 +1947,34 @@ async def stream_text(
                     images=summarize_images(pending_images), http_status=200,
                 )
 
-                if not context_used_model and not is_byok and credit_manager is not None and upfront_reserved_scaled:
-                    credit_manager.schedule_release(user_id, upfront_reserved_scaled + extra_reserved_scaled, delay_seconds=0)
+                image_only = bool(pending_images.get("__image_only__"))
+                if image_only and resolved_image_count == 0:
+                    context_used_model = False      # no picture arrived: nothing to charge (the placeholder is not text)
+                if design_plan is not None and design_price_scaled and design_billing is None:
+                    # A design is charged its flat price when design_ready is delivered, never per character: an aborted or
+                    # failed design costs nothing (audit 2026-11-20: an abort was charged 1 credit even before a model ran).
+                    context_used_model = False
+                if not context_used_model and not is_byok and credit_manager is not None:
+                    # Photos reserve their own credits when they start; nothing is charged here, so release those too.
+                    unused_scaled = upfront_reserved_scaled + extra_reserved_scaled + image_billing(pending_images)[0]
+                    if unused_scaled:
+                        credit_manager.schedule_release(user_id, unused_scaled, delay_seconds=0)
 
                 if context_used_model and not had_error and not is_byok:
-                    if resolved_image_count > 0 and output_chars > 0:
+                    if image_only:
+                        # A picture answer: its images, plus any small text call that served them (the photo-prompt rewrite).
+                        text_chars = pending_images.get("__text_chars__") or {}
+                        billed_input_chars = int(text_chars.get("input_chars") or 0)
+                        billed_output_chars = int(text_chars.get("output_chars") or 0)
+                        op_type = 'mixed' if billed_input_chars or billed_output_chars else 'image'
+                    elif resolved_image_count > 0 and output_chars > 0:
                         op_type = 'mixed'
                     elif resolved_image_count > 0:
                         op_type = 'image'
                     else:
                         op_type = 'text'
 
-                    image_reserved_scaled, image_details = image_billing(pending_images)
+                    image_reserved_scaled, image_details = image_billing(pending_images, delivered_ids)
                     bill_provider, bill_model = billed_provider_model(used_provider, op_type, image_details)
                     if op_type != 'image':
                         bill_model = used_model

@@ -17,7 +17,8 @@ import uuid
 import base64
 import logging
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any, List, Tuple
+from contextvars import ContextVar
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from config import settings
@@ -464,6 +465,24 @@ def image_route_available(
 # ======================================================================
 
 MAX_MODIFICATIONS = 3
+# Whether a finished image becomes the "previous image" a later chat edits ("make it night"). Off for pictures made as
+# parts of something else (design photo fill, blog pictures): audit 2026-11-20, a design photo replaced the user's own
+# image in the document's memory. A ContextVar, not a parameter: the image tool starts generation in a thread that runs
+# in a copy of the caller's context, so the setting reaches it without changing every caller.
+_REMEMBER_IMAGES: ContextVar[bool] = ContextVar("remember_images", default=True)
+
+
+def without_image_memory(tool: Callable[..., Any]) -> Callable[..., Any]:
+    """``tool`` (an image tool) with the images it starts kept out of the previous-image memory."""
+    def call(*args, **kwargs):
+        token = _REMEMBER_IMAGES.set(False)
+        try:
+            return tool(*args, **kwargs)
+        finally:
+            _REMEMBER_IMAGES.reset(token)
+    return call
+
+
 _REDIS_RETRY_AFTER = 0.0
 _REDIS_RETRY_COOLDOWN_SECONDS = 30.0
 
@@ -1004,7 +1023,7 @@ def generate_image_unified(
     5. A Grok edit that fails falls back to Gemini when a platform key exists; otherwise it
        raises. The reference image is never silently dropped.
     6. Sniffs real bytes, converts format if needed, uploads to S3/CDN, measures dimensions
-    7. Stores context for follow-ups (scoped to document_id when given)
+    7. Stores context for follow-ups (scoped to document_id when given), unless made under without_image_memory
     """
     check_provider_call()
     start_time = time.time()
@@ -1079,7 +1098,7 @@ def generate_image_unified(
     )
 
     extra = context_extra or {}
-    if user_id:
+    if user_id and _REMEMBER_IMAGES.get():
         save_image_context(
             user_id=user_id,
             final_prompt=prompt,

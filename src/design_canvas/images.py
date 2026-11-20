@@ -73,6 +73,8 @@ def fill_targets(ast: dict, query: str, cap: int) -> tuple[list[dict], dict]:
                        "over_cap": max(0, len(chosen) - cap)}
             return chosen[:cap], summary
     replace = bool(_REPLACE_RE.search(query))
+    if not replace and needs_prompt_rewrite(query) and not any(not n.get("src") for n, _ in slots):
+        replace = True                   # "make the photos brighter" on a finished design: every photo, not none
     asked = " " + " ".join(re.findall(r"[\w'&!]+", query.casefold())) + " "
     candidates = [(n, a) for n, a in slots if replace or not n.get("src")]
     named = []
@@ -131,6 +133,28 @@ def apply_finished_images(ast: dict, pending_images: dict) -> dict:
     return ast
 
 
+def check_image_srcs(ast, existing_design_ast) -> list[dict]:
+    """
+    Clear every ImageNode src the existing design did not already have, and say so. A src comes only from the image flow
+    (the editor writes it after image_ready); the schema only checks the host, so a model could still point a slot at
+    any file on the CDN, another user's included. Same idea as links.check_links for button links.
+    """
+    existing = _parse_design(existing_design_ast)
+    known = {node.get("src") for node, _ in walk(existing["root"]) if isinstance(node, dict) and node.get("src")} \
+        if existing and isinstance(existing.get("root"), dict) else set()
+    warnings = []
+    stack = [ast.root]
+    while stack:
+        node = stack.pop()
+        stack.extend(reversed(getattr(node, "children", None) or []))
+        if getattr(node, "node_type", None) == "image" and node.src and node.src not in known:
+            node.src = None
+            warnings.append({"kind": "image_src_removed", "node_id": node.id, "detail": (
+                "A photo address that was not made for this design was removed; the slot is empty. "
+                "Ask for real photos to fill it.")})
+    return warnings
+
+
 # Wording that changes how a photo sits in the layout (size, crop, corners, position): a layout edit, not a new photo.
 _PHOTO_LAYOUT_RE = re.compile(
     r"\b(?:bigger|smaller|larger|wider|narrower|taller|shorter|size|resize|width|height|crop|cropped|aspect|ratio"
@@ -138,6 +162,47 @@ _PHOTO_LAYOUT_RE = re.compile(
     r"|move|position|padding|margins?|spacing|gap|full[- ]width|stretch|fit|contain|cover|remove|delete|hide)\b",
     re.IGNORECASE,
 )
+
+
+_QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”|'[^']{2,}'|‘[^’]*’")
+# The new photo described ("replace this with a burger on the left side of a table", "a close-up, centered on the plate",
+# "make it a cheeseburger with a shadow"): position words there describe the picture, not where the slot sits.
+_CONTENT_LEAD = re.compile(
+    r"^\s*(?:please\s+)?(?:replace|swap|show|use|regenerate|redo|make\s+it\s+(?:into\b|(?:a|an)\s+(?!bit\b|little\b|lot\b|tad\b))|change\s+it\s+(?:to|into)\b|"
+    r"turn\s+it\s+into\b|(?:a|an)\s+(?!bit\b|little\b|lot\b|tad\b))", re.IGNORECASE)
+# A request whose object is a photo: the verb starts the request or a clause, and the photo word heads its object
+# ("make the photos brighter", "replace this image with a pizza"), not "the image captions" or "the text over the image".
+_PHOTO_OBJECT_RE = re.compile(
+    r"(?:^|[,;:]\s*|\b(?:and|then|also|please|now)\s+)(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?"
+    r"(?:add|use|put|insert|fill(?:\s+in)?|generate|create|make|replace|swap|show|give|get|place|load|regenerate|redo|change|"
+    r"edit|update|modify|turn|alter|adjust|tweak|fix|improve|enhance|brighten|darken|lighten|recolou?r|refresh)\s+"
+    r"(?:(?:the|this|that|these|those|a|an|some|all|every|each|more|real|actual|proper|stock|realistic|new|different|"
+    r"better|nicer|nice|other|my|our|its|their|in|me|us|\d+)\s+){0,4}(?:[\w'-]+\s+){0,2}?"
+    r"(?:photos?|images?|pictures?|pics|photographs?|imagery)\b"
+    r"(?!\s+(?:captions?|credits?|galler(?:y|ies)|sections?|buttons?|links?|alt\b|text|sizes?|borders?|frames?|grid|layout|"
+    r"titles?|labels?|count|descriptions?|names?|files?|uploads?|format)\b)",
+    re.IGNORECASE)
+# With a photo selected, wording without a photo word is about that photo ("make it a pizza", "brighter please"), unless it
+# adds or removes something or names text ("add a caption below this").
+_NOT_THE_PHOTO = re.compile(
+    r"^\s*(?:please\s+)?(?:add|insert|put|include|remove|delete|hide|duplicate|link)\b|"
+    r"\b(?:captions?|alt(?:\s+text)?|text|titles?|headings?|labels?|buttons?|links?|fonts?|credits?|badges?)\b",
+    re.IGNORECASE)
+
+
+def asks_for_new_photos(instruction: str, holds: str | None = None) -> bool:
+    """
+    Whether a design request asks for new photos (the image flow) rather than a layout or text edit. `holds` is what the
+    selection holds (selected_photo_scope). Quoted text is the user's new wording, never a cue.
+    """
+    text = _QUOTED.sub(" ", instruction or "")[:600]
+    if holds == "no_images":
+        return False                     # "add a photo here" on a section without a slot adds one: a layout edit
+    if is_photo_layout_wording(text) and not _CONTENT_LEAD.match(text):
+        return False                     # "make the image bigger", "crop this image", "move the photo to the right"
+    if _PHOTO_OBJECT_RE.search(text):
+        return True
+    return holds == "image" and not _NOT_THE_PHOTO.search(text)
 
 
 def is_photo_layout_wording(text: str) -> bool:
@@ -150,10 +215,26 @@ def _parse_design(existing_design_ast) -> dict | None:
     if isinstance(existing_design_ast, str):
         try:
             value = json.loads(existing_design_ast)
-        except ValueError:
+        except (ValueError, RecursionError):        # deeply nested JSON raises RecursionError, not ValueError
             return None
         return value if isinstance(value, dict) else None
     return None
+
+
+def _raw_nodes(node) -> Iterator[dict]:
+    """
+    Every dict node under ``node`` of an unvalidated design. Unlike walk() it carries no ancestor lists: walk() copies
+    one per node, so a large, deeply nested request body would cost memory in the square of its depth on every request.
+    """
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        yield current
+        children = current.get("children")
+        if isinstance(children, list):
+            stack.extend(children)
 
 
 def selected_photo_scope(existing_design_ast, query: str) -> tuple[str | None, str | None]:
@@ -168,11 +249,11 @@ def selected_photo_scope(existing_design_ast, query: str) -> tuple[str | None, s
     design = _parse_design(existing_design_ast)
     if not selected_id or design is None or not isinstance(design.get("root"), dict):
         return selected_id, None
-    for node, _ in walk(design["root"]):
-        if isinstance(node, dict) and node.get("id") == selected_id:
+    for node in _raw_nodes(design["root"]):
+        if node.get("id") == selected_id:
             if node.get("node_type") == "image":
                 return selected_id, "image"
-            inside = any(isinstance(n, dict) and n.get("node_type") == "image" for n, _ in walk(node))
+            inside = any(n.get("node_type") == "image" for n in _raw_nodes(node))
             return selected_id, "contains_images" if inside else "no_images"
     return selected_id, None
 
@@ -195,6 +276,8 @@ def needs_prompt_rewrite(query: str) -> bool:
     from .text_edit import split_selection
 
     instruction, _ = split_selection(query)
+    if len(instruction) > 300:
+        return True                      # a plain fill is a short sentence; and the pattern below need not see a long text
     return not _PLAIN_FILL_RE.match(instruction)
 
 
@@ -214,7 +297,7 @@ If the request cannot be done by generating new photos for these slots, answer {
 Answer with the JSON object only."""
 
 
-def rewrite_photo_prompts(ast: dict, targets: list[dict], query: str, llm) -> dict[str, dict] | None:
+def rewrite_photo_prompts(ast: dict, targets: list[dict], query: str, llm, stats: dict | None = None) -> dict[str, dict] | None:
     """
     {id: {"prompt", "alt"}} for the targets, from the request; None when the model declines or the answer does not hold.
     Provider errors propagate.
@@ -231,8 +314,12 @@ def rewrite_photo_prompts(ast: dict, targets: list[dict], query: str, llm) -> di
     user = (f"Design: {json.dumps(ast.get('title') or '', ensure_ascii=False)}\n"
             f"Request: {json.dumps(instruction, ensure_ascii=False)}\n"
             f"Slots: {json.dumps(slots, ensure_ascii=False)}")
+    if stats is not None:
+        stats["input_chars"] = len(user)          # billed as text when the photos are delivered (DevOps note 2026-11-20)
     reply = llm(REWRITE_SYSTEM_PROMPT, [{"role": "user", "content": user}],
                 CallSpec(stage="design_photo_prompt", temperature=0.3, max_tokens=min(4000, 300 + 220 * len(targets))))
+    if stats is not None:
+        stats["output_chars"] = len(reply or "")
     try:
         answer = json.loads(strip_json_fence(reply or "").strip())
     except ValueError:

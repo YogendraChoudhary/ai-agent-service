@@ -26,9 +26,18 @@ _NOUN = r"(?:photos?|images?|pictures?|pics|photographs?|illustrations?|visuals?
 _COUNT_WORDS = {"a": 1, "an": 1, "one": 1, "single": 1, "two": 2, "couple": 2, "pair": 2, "three": 3, "four": 4,
                 "five": 5, "six": 6, "seven": 7, "eight": 8, "few": 3, "some": 3, "several": 3, "more": 3}
 # "add some photos", "include a few relevant pictures throughout", "put an image in each section"
+_NOT_PHOTO_WORD = (r"(?:captions?|alt|text|links?|notes?|credits?|sentences?|descriptions?|titles?|labels?|references?|"
+                   r"sources?|lines?|paragraphs?|sections?|headings?|bullets?|tables?|quotes?|summary|that|which|to|for|under|"
+                   r"below|above|after|before|in|on|into|about|between|beside|next|around|over|the\s+right\s+order)")
 _ASK = re.compile(
     r"(?:(?:,\s*|\s+)(?:and|also|plus|then|&)\s+|,\s*|^\s*)?"
-    r"\b(?:add|insert|include|put|place|sprinkle|throw\s+in)\b(?P<mid>[^.;!?\n]{0,40}?)\b(?P<noun>" + _NOUN + r")\b"
+    # The photos must be the object: the words between the verb and "photos" are only counts and adjectives, never another
+    # thing to add ("captions to the photos", "a link to the photo gallery", "a note that images…") and never a preposition.
+    r"\b(?:add|insert|include|put|place|sprinkle|throw\s+in)\b"
+    r"(?P<mid>(?:\s+(?!" + _NOT_PHOTO_WORD + r"\b)[\w'-]+){0,4}?)\s+(?P<noun>" + _NOUN + r")\b"
+    # "image credits", "photo gallery", "photo contest": the photo word names something else
+    r"(?!\s+(?:credits?|captions?|galler(?:y|ies)|contests?|sizes?|limits?|links?|descriptions?|titles?|names?|sources?|"
+    r"rights?|licen[cs]es?|uploads?|files?|formats?|quality|sections?|albums?|shoots?|editing|tips?)\b)"
     # what the photos show ("of happy families playing games") belongs to the photo request, not to the text edit
     r"(?P<subject>\s+(?:of|showing|with|featuring|about|that\s+show)\s+[^.,;!?\n]{1,80}?(?=$|[.,;!?\n]|\s+(?:and|to|in|into|"
     r"throughout|across|for)\b))?"
@@ -37,6 +46,8 @@ _ASK = re.compile(
     r"text|page|sections?|paragraphs?|content|story|essay|guide)|sections?))?)",
     re.IGNORECASE,
 )
+# "Put the images in the right order", "move the photos to the end": the photos that are there, rearranged.
+_REARRANGE = re.compile(r"\b(?:order|reorder|rearrange|arrange|move|swap\s+the|sort)\b", re.IGNORECASE)
 _EACH = re.compile(r"\b(?:each|every|all)\b", re.IGNORECASE)
 _FILLER = re.compile(r"^(?:please|also|too|as\s+well|thanks?|thank\s+you|now|and|,|\.|\s)*$", re.IGNORECASE)
 
@@ -75,7 +86,7 @@ class PhotoSpot:
 def photo_request(instruction: str, blocks: list[DocumentBlock], cap: int) -> Optional[PhotoRequest]:
     """The photos a request asks to add to the document, or None when it asks for none."""
     match = _ASK.search(instruction or "")
-    if not match or cap < 1:
+    if not match or cap < 1 or _REARRANGE.search(instruction):
         return None
     words = match.group("mid").lower().split()
     count = None
@@ -173,16 +184,17 @@ def plan_photos(instruction: str, blocks: list[DocumentBlock], count: int, llm: 
 
 def insertion_for(source: str, block: DocumentBlock, alt: str, placeholder: str) -> tuple[int, str]:
     """(UTF-16 offset of the end of the block, the Markdown to insert there): the image on its own line, blank lines around it."""
-    before = source[:block.end]
-    lead = "" if before.endswith("\n\n") else "\n" if before.endswith("\n") else "\n\n"   # a list block keeps its blank line
-    tail = "" if source[block.end:].startswith("\n") or block.end == len(source) else "\n"
-    return utf16_length(source[:block.end]), f"{lead}![{alt}](placeholder::{placeholder})\n{tail}"
+    nl = "\r\n" if "\r\n" in source else "\n"          # the document's own line ending (a CRLF file stays CRLF)
+    before, after = source[:block.end], source[block.end:]
+    lead = "" if before.endswith(nl * 2) else nl if before.endswith(nl) else nl * 2   # a list block keeps its blank line
+    tail = "" if after.startswith(nl) or not after else nl
+    return utf16_length(before), f"{lead}![{alt}](placeholder::{placeholder}){nl}{tail}"
 
 
 # What an insertion may contain: one image line, with the photo's placeholder or (once the editor has it) its CDN URL.
 _INSERTION_RE = re.compile(
-    r"^\n{0,2}!\[([^\[\]\n]{1,120})\]\((placeholder::[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-    r"|https://[^\s()<>\"']{1,2000})\)\n{1,2}$")
+    r"^(?:\r?\n){0,2}!\[([^\[\]\r\n]{1,120})\]\((placeholder::[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|https://[^\s()<>\"']{1,2000})\)(?:\r?\n){1,2}$")
 
 
 def valid_insertion_markdown(markdown: str) -> bool:

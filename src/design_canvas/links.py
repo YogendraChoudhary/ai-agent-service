@@ -56,7 +56,7 @@ def check_links(ast: DesignDocumentAST, user_query: str, existing_ast_json: Opti
                    if not a.startswith(("#", "/")) and not re.match(r"(?:javascript|data|vbscript|file|mailto|tel):", a, re.I)}
     try:
         existing = _hrefs_in(json.loads(existing_ast_json)) if existing_ast_json else set()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         existing = set()
     warnings, kept = [], set()
     for button in _buttons(ast.root):

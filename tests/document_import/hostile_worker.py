@@ -38,8 +38,9 @@ def main(argv):
     elif mode == "garbage":
         with open(out, "w") as f:
             f.write("not json {")
-    elif mode == "spawn":                           # tries to leave a grandchild behind
-        os.system("sleep 60 &")
+    elif mode.startswith("spawn"):                  # tries to leave a grandchild behind ("spawn 60.123456": a unique sleep the test can find)
+        seconds = mode.split()[1] if " " in mode else "60"
+        os.system(f"sleep {seconds} &")
         time.sleep(60)
     elif mode == "write_elsewhere":
         with open(out, "w") as f:

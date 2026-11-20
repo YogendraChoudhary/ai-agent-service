@@ -131,16 +131,28 @@ def section_query(scope: SectionScope) -> str:
 
 def splice_section(scope: SectionScope, edited_section) -> Optional[object]:
     """The whole design with the edited section in place of the selected node, validated; None if it does not hold."""
+    from src.design_canvas.schema_v11 import DesignDocumentASTV11
     from src.design_canvas.validate import auto_heal_design_ast, validate_design_ast
 
-    model = type(scope.original)
+    original = scope.original
+    if isinstance(edited_section, DesignDocumentASTV11) and edited_section.version == "1.1" and original.version == "1.0":
+        # The full path answers a 1.0 design in 1.1 when DESIGN_SCHEMA_V11_ENABLED; so does this one. Splicing into the
+        # 1.0 model dropped what the edit asked for (audit 2026-11-20: "make the headline a gold gradient" -> no gradient).
+        original = DesignDocumentASTV11.model_validate(original.model_dump(mode="json")).model_copy(update={"version": "1.1"})
+    model = type(original)
     section = edited_section.model_dump(mode="json")
     replacement = section["root"].get("children") or []
     if not replacement:
         return None
-    full = scope.original.model_dump(mode="json")
+    full = original.model_dump(mode="json")
     path = _path_to(full["root"], scope.selected_id, [])
     parent = path[-2]
+    if scope.selected_id not in set().union(*(_ids(node, set()) for node in replacement)):
+        # The model renamed the node it was asked to edit (audit 2026-11-20: `badge_container` -> `badge_container_new`):
+        # the first node of the same type takes the id back, or the editor loses the user's selection.
+        same_type = [node for node in replacement if node.get("node_type") == path[-1].get("node_type")]
+        if same_type:
+            same_type[0]["id"] = scope.selected_id
     # Ids used outside the section belong to nodes the user did not touch: a new node that reuses one is renamed, never
     # the existing node (auto-heal keeps the first occurrence, which may be the new one).
     taken = _ids(full["root"], set()) - _ids(path[-1], set())
@@ -157,7 +169,7 @@ def splice_section(scope: SectionScope, edited_section) -> Optional[object]:
     except Exception as exc:
         logger.info("design section edit: spliced design did not validate (%s)", type(exc).__name__)
         return None
-    before = set(validate_design_ast(scope.original, existing_ast_json=scope.original_json))
+    before = set(validate_design_ast(original, existing_ast_json=scope.original_json))
     errors = set(validate_design_ast(candidate, existing_ast_json=scope.original_json))
     if errors <= before:
         return candidate

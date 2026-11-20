@@ -4,7 +4,12 @@ import re
 _PREFIX = r"^[\s\W]*(?:(?:please|pls|kindly|can you|could you|would you|help me|i want you to|i need you to)\s+)*"
 _LANG = r'(?:python|javascript|typescript|js|ts|react|sql|bash|shell|html|css|java|rust|go|c\+\+|c#|ruby|php|swift|kotlin)'
 _NOUN = rf'(?:code|function|script|component|class|program|query|regex|regular expression|endpoint|command|{_LANG})'
-_EXPLICIT = rf'(?:code|function|regex|regular expression|endpoint|html|css|{_LANG}\s+(?:code|function|script|component|class|program|query|command|stylesheet|module|app|application|test|service))'
+# "code"/"function" as a programming request, not "a code name", "a code word", "a function plan", "a function invitation",
+# "a code for the treasure hunt riddle" (live audit 2026-11-20: all went to the code writer).
+_NOT_PROGRAMMING = (r'(?!\s+(?:names?|words?|of\s+conduct|plans?|invitations?|events?|party|parties|rooms?|halls?|venues?|menus?|'
+                    r'dress|attire|for\s+(?:the\s+|a\s+|our\s+|my\s+)?(?:treasure|hunt|riddle|game|escape|door|lock|puzzle|party|event|'
+                    r'wedding|reception|gala|dinner)))')
+_EXPLICIT = rf'(?:code{_NOT_PROGRAMMING}|function{_NOT_PROGRAMMING}|regex|regular expression|endpoint|html|css|{_LANG}\s+(?:code|function|script|component|class|program|query|command|stylesheet|module|app|application|test|service))'
 _BUILD = re.compile(_PREFIX + rf'(?:write|create|generate|build|implement|make)\s+(?:(?:me|us)\s+)?(?:(?:a|an|the|simple|small|new)\s+)*{_EXPLICIT}(?=\W|$)', re.I)
 _DIRECT = re.compile(_PREFIX + rf'(?:fix\s+(?:this|my|the)\s+code|convert\s+.+?\s+to\s+{_LANG}\b|(?:sql query|regex|bash command)\s+(?:to|for)\b)', re.I)
 _MIXED = re.compile(

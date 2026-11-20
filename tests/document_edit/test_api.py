@@ -171,7 +171,8 @@ def test_document_requests_respect_provider_eligibility_and_fallback(runtime, mo
                   document_text=DOC, user_text=INSTRUCTION, key_resolver=resolver, is_byok=byok, report_model=True))
     metadata = next(c["__event__"]["data"] for c in output if isinstance(c, dict) and "__event__" in c)
     assert metadata["status"] == "proposed"
-    assert output[0]["__model_used__"][0] == "claude"
+    # (the photo dict is handed over first, before the edit runs; the order of these internal chunks is not a contract)
+    assert next(c["__model_used__"] for c in output if isinstance(c, dict) and "__model_used__" in c)[0] == "claude"
     assert attempted == (["claude"] * 3 if byok else ["openai"] + ["claude"] * 3)
     if byok:
         assert all(key == "own-claude" for _, key, _ in state["calls"])

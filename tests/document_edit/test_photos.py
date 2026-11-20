@@ -5,6 +5,7 @@ the request could only run in Write, which never sees the document: a generic pa
 """
 import json
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -308,3 +309,45 @@ def test_paid_user_is_charged_for_the_text_and_each_finished_photo(monkeypatch):
     assert charge["success"] is True and charge["image_count"] == 2 == len(proposal["insertions"])
     assert charge["operation_type"] == "mixed" and len(charge["images"]) == 2
     assert charge["output_chars"] == sum(len(p["after"]) for p in proposal["patches"])   # text billed on its patches only
+
+
+# 2026-11-20 audit: requests that only mention photos started paid photos.
+@pytest.mark.parametrize("query", [
+    "Add captions to the photos", "Add alt text to the images", "Add a caption under each image",
+    "Add a link to the photo gallery", "Include image credits", "Add photo credits at the end",
+    "Add a note that images are copyrighted", "Put the images in the right order", "Add a sentence about our photo contest",
+    "Add a description to each image", "add a title above the pictures", "Move the photos to the end",
+    "add the photo size limits to the FAQ",
+])
+def test_mentioning_photos_is_not_asking_for_new_ones(query):
+    assert photo_request(query, document_blocks(DOC), cap=4) is None
+    assert (decide_by_rules(query, DOC) or SimpleNamespace(reason=None)).reason != "document_photos"
+
+
+def test_photo_dict_is_handed_over_before_the_edit_runs_so_an_abort_settles_its_credits(monkeypatch):
+    import threading
+    cancel, images = threading.Event(), {"__completion_callback__": None}
+    llm = _editor()
+
+    def tool(prompt):
+        images["p1"] = {"status": "generating"}
+        cancel.set()                                     # the user aborts while the photo is being made
+        return str(uuid.uuid4())
+    monkeypatch.setattr(edit_runtime, "AgnoLLM", lambda *a, **k: _Used(llm))
+    chunks = list(edit_runtime.stream_document_edit(DOC, "add some photos", candidates=[], key_for=lambda p: "k",
+                  is_byok=False, cancel_event=cancel, photo_tool=tool, pending_images=images))
+    assert chunks[0] == {"__pending_images__": images} and "p1" in images
+    assert not any(isinstance(c, dict) and "__event__" in c for c in chunks)    # aborted: no proposal
+
+
+def test_crlf_document_keeps_crlf_around_a_photo():
+    source = "# T\r\n\r\nIntro text.\r\n\r\n- one\r\n- two\r\n\r\n## Next\r\n\r\nMore.\r\n"
+    for block in (b for b in document_blocks(source) if b.kind in ("paragraph", "list")):
+        _, markdown = insertion_for(source, block, "Alt", "00000000-0000-4000-8000-000000000000")
+        text = source[:block.end] + markdown + source[block.end:]
+        assert "\n" not in text.replace("\r\n", "") and "\r\n\r\n\r\n" not in text
+
+
+def test_the_message_says_when_no_photo_could_be_placed():
+    _, result = edit_document(DOC, REQUEST, _editor(photos={"photos": []}), photo_tool=FakePhotoTool(), max_photos=4)
+    assert result.status == "proposed" and not result.insertions and "No photos could be placed" in result.message

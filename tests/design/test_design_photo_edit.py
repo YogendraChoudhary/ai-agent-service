@@ -181,3 +181,73 @@ class TestSelectedPhotoEndToEnd(unittest.TestCase):
         by_name, _ = self._stream("replace this image with a pizza" + SELECT.format("img2"))
         self.assertEqual(self.record, [])
         self.assertEqual([w["kind"] for w in by_name["complete"]["warnings"]], ["photo_prompt_failed"])
+
+
+# 2026-11-20 audit: a photo word anywhere sent text and layout edits to photo fill (nothing changed, "no photo was made").
+class TestPhotoWordIsNotAPhotoRequest:
+    @pytest.mark.parametrize("query, target", [
+        ("Change the button text to 'Upload images'", None), ("Change the button text to Upload images", None),
+        ("Change the subtitle to say we use real photos of our food", None),
+        ("Use a different font for the image captions", None), ("Change the color of the text over the image to white", None),
+        ("Add a 'View all photos' button", None), ("Add a gallery section with 6 images", None),
+        ("add alt text to the images", None), ("add a photo gallery", None),
+        ("add a caption below this", "img1"), ("make it a bit bigger", "img1"),
+    ])
+    def test_text_and_layout_edits_stay_edits(self, query, target):
+        assert _sub_mode(query + (SELECT.format(target) if target else "")) == "edit_existing_ast"
+
+    @pytest.mark.parametrize("query", [
+        "Replace this with a burger on the left side of a wooden table", "Show a chef holding a burger in his right hand",
+        "A close-up of a burger, centered on the plate", "Make it a cheeseburger with a shadow on the table",
+        "Use a photo of a burger with fries on the right",
+    ])
+    def test_position_words_inside_a_description_still_mean_a_new_photo(self, query):
+        assert _sub_mode(query + SELECT.format("img1")) == "fill_design_images"
+
+    @pytest.mark.parametrize("query", ["make the photos brighter", "make the image a pizza", "Make the photo show a pizza",
+                                       "Add photos of pizzas"])
+    def test_changing_finished_photos_without_a_selection_redraws_them(self, query):
+        ast = DesignDocumentASTV11.model_validate(_design()).model_dump()
+        assert _sub_mode(query) == "fill_design_images"
+        assert [t["id"] for t in design_images.fill_targets(ast, query, cap=12)[0]] == ["img1", "img2", "img3"]
+
+    def test_a_plain_fill_on_a_finished_design_still_redraws_nothing(self):
+        ast = DesignDocumentASTV11.model_validate(_design()).model_dump()
+        assert design_images.fill_targets(ast, "add real photos", cap=12)[0] == []
+
+
+def test_selected_photo_scope_reads_large_or_malformed_raw_designs_cheaply():
+    """It runs on every request before validation: no ancestor copies per node, no crash on odd input."""
+    import tracemalloc
+    from src.design_canvas.images import selected_photo_scope
+
+    q = "make it a pizza (apply this to the selected section, id: sel)"
+    leaves = ",".join('{"id":"l%d","node_type":"text"}' % i for i in range(20000))
+    depth = 800
+    body = json.loads('{"root":' + '{"id":"x","node_type":"frame","children":[' * depth + leaves + ']}' * depth + '}')
+    tracemalloc.start()
+    assert selected_photo_scope(body, q) == ("sel", None)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 20_000_000      # was ~150 MB with one ancestor list per node
+
+    deep = '{"root":' + '{"children":[' * 5000 + ']}' * 5000 + '}'
+    assert selected_photo_scope(deep, q) == ("sel", None)           # RecursionError in json.loads
+    odd = {"root": {"id": "a", "node_type": "frame", "children": ["text", 3, None,
+                                                                  {"id": "sel", "node_type": "image"}]}}
+    assert selected_photo_scope(odd, q) == ("sel", "image")
+
+
+def test_other_raw_design_readers_do_not_throw_on_deeply_nested_bodies():
+    """Same rule as above for the chat reference and the wording fast lane (both read the raw design; RecursionError seen)."""
+    import src.text_processing_agent as tpa
+    from src.design_canvas.text_edit import try_text_edit
+    from src.design_canvas.links import check_links
+
+    deep = '{"root":' + '{"children":[' * 5000 + ']}' * 5000 + '}'
+    q = "make this shorter\n\n(Apply this to the selected section, id header. Keep everything else unchanged.)"
+    assert tpa._design_chat_reference(deep, "What font is this?") is None
+    assert try_text_edit(deep, q, lambda *a: pytest.fail("no model call for an unreadable design")) is None
+    nested = '{"root":' + '{"id":"x","children":[' * 900 + ']}' * 900 + '}'
+    ast = DesignDocumentASTV11.model_validate(_design())
+    assert check_links(ast, "make it blue", nested) == []
