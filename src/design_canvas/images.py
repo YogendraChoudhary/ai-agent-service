@@ -88,12 +88,19 @@ def placeholder_id(tool_result: str) -> str | None:
 
 
 def has_image_slots(existing_design_ast) -> bool:
-    """Whether a design sent by the editor already has ImageNodes (no validation: used to price the request)."""
-    import json
+    """
+    Whether a design sent by the editor already has ImageNodes; prices the request. Validated with the same schema
+    the fill path uses: an image node the schema drops (e.g. under a text node) must not price a conversion edit at 0.
+    """
+    from pydantic import ValidationError
+    from .schema_v11 import DesignDocumentASTV11
     try:
-        ast = json.loads(existing_design_ast) if isinstance(existing_design_ast, str) else existing_design_ast
-        return bool(isinstance(ast, dict) and isinstance(ast.get("root"), dict) and image_nodes(ast))
-    except (ValueError, TypeError, KeyError, AttributeError):
+        if isinstance(existing_design_ast, str):
+            ast = DesignDocumentASTV11.model_validate_json(existing_design_ast)
+        else:
+            ast = DesignDocumentASTV11.model_validate(existing_design_ast)
+        return bool(image_nodes(ast.model_dump()))
+    except (ValidationError, ValueError, TypeError):
         return False
 
 

@@ -105,6 +105,11 @@ def test_fill_price_is_images_only_unless_a_conversion_edit_runs():
     assert design_images.has_image_slots(json.dumps(_listing([_card(1, "KFC", _image(1))])))
     assert not design_images.has_image_slots(_listing([_card(1, "KFC")]))
     assert not design_images.has_image_slots("not json")
+    # An image node the schema drops (here under a text node) must not make the conversion edit free.
+    hidden = _listing([_card(1, "KFC")])
+    text = next(n for n, _ in design_images.walk(hidden["root"]) if n["node_type"] == "text")
+    text["children"] = [_image(9)]
+    assert not design_images.has_image_slots(json.dumps(hidden))
 
 
 # ---------------------------------------------------------------------------------------------------- fill targets
