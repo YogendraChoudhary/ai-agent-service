@@ -16,6 +16,14 @@ and insertion suggestions; the existing edit review/apply contract remains intac
 Document actions update, 12 November 2026: **`document_action: "auto"`** (the agent picks Ask / Draft / Edit / Write and reports it in
 a new `document_action_resolved` event), Draft returning exactly the text the user gave, Edit small additions and heading/title/quote
 edits, and "next to" / "beside" / unnamed-heading placement. All additive; wiring notes in [section 2.8](#28-document-actions-auto-mode-and-whats-new).
+**Update, 20 November 2026 (what changed for the frontend this week):**
+1. **Design schema 1.1, two-pass screenshot matching and photo fill are ON by default** (§4.8). The editor must render 1.1
+   (fonts, `ImageNode`, ...) or send `schema_version: "1.0"` on design requests to keep the legacy format.
+2. **Email:** new `POST /agent/email/rewrite` and an optional `layout` on `/agent/email/generate` (§8, `EMAIL_API_HANDOFF.md` §3.2.1, §3.3).
+3. **Length targets** ("in 100 words"): Draft/Write may send `content_replace` with the corrected text, and `done.warnings` may
+   carry `{kind: "length"}` (§2.8, §2.3).
+4. **`error` frames and 500 bodies** no longer contain raw Python/SDK errors; see the `error` row in §2.3.
+
 Verified: 2026-10-29 against HEAD `df292a7`, by reading the code paths named below.
 Licence and billing are implemented in `src/voice_flow/access.py` and covered by `tests/voice_flow/test_access.py`, including production API wiring.
 **Not exercised for this document:** live provider calls, a real browser microphone, the production deployment.
@@ -75,14 +83,14 @@ would cost days. Verified against the code:
 
 ### Feature flags (code defaults in `config.py`)
 
-If a feature is off, its UI entry point should be hidden or fail gracefully. These are the **code** defaults; the
-production environment may override them. Confirm with whoever deploys.
+If a feature is off, its UI entry point should be hidden or fail gracefully. These are the **code** defaults; production runs
+on them unless whoever deploys has overridden one.
 
 | Feature | Env var | Code default | When off |
 |---|---|---|---|
 | Design canvas | `DESIGN_CANVAS_ENABLED` | **on** | No `design_ready` ever arrives; the request is answered as ordinary chat text (§4.2) |
 | Voice | `VOICE_FLOW_ENABLED` | **off** (enable only with `VOICE_FLOW_TOKEN`) | `/v1/voice/*` returns 404 |
-| Email | `EMAIL_AI_ENABLED` | on | 503 on all three routes |
+| Email | `EMAIL_AI_ENABLED` | on | 503 on every `/agent/email/*` route (categories, generate, rewrite, image) |
 | Blog | `BLOG_AI_ENABLED` | **on** | `generate_blog` → HTTP 503 `{"error": "AI blog generation is disabled"}` |
 | Charts | `CHART_SUGGESTIONS_ENABLED` | **on** | No `graph_suggestion` or `graph_suggestion_unavailable` after Enhance, even when the instruction asks for a chart |
 | Document context | `DOCUMENT_CONTEXT_ENABLED` | **on** | `document_context` → HTTP 503 `DOCUMENT_CONTEXT_DISABLED`; legacy edits unchanged |
@@ -92,6 +100,9 @@ production environment may override them. Confirm with whoever deploys.
 | Write and Draft length repair | `LENGTH_REPAIR_ENABLED` | **on** | Length checks report warnings without rewriting the answer |
 | Task routing | `TASK_ROUTING_ENABLED` | on | Provider chosen as submitted |
 | Blog promotion | `BLOG_INTENT_REGEX_ENABLED` | **on** | "Write a blog post about …" in `general` is answered by the free-form writer instead of the blog pipeline |
+| Design schema 1.1 | `DESIGN_SCHEMA_V11_ENABLED` | **on** (since 2026-11-20) | Designs come back as 1.0; an edit of a saved 1.1 design is refused (§4.8) |
+| Two-pass screenshot match | `DESIGN_VISION_TWO_PASS` | **on** (since 2026-11-20) | "Make it look like this" designs use one model call (faster, less faithful) |
+| Design photo fill | `DESIGN_IMAGE_FILL_ENABLED` | **on** (since 2026-11-20) | "Add real photos" to a design is answered without photos (§4.8 Photos) |
 
 ---
 
@@ -165,7 +176,7 @@ So dispatch on `event ?? payload.type`.
 | `image_failed` | `{type, placeholder_id, error}` | Image failed or timed out (120 s) | Remove the placeholder or show a retry |
 | `stream_end` | `{type}` | **Only** when `pending_images > 0`, after the last image | Done |
 | `credit_limit_reached` | `{type, output_chars}` | Credits ran out mid-stream | Output is truncated; a `done` follows. Offer top-up |
-| `error` | `{type, error}` | Provider/pipeline failure | Show `error`. **No `done` follows**; a design/blog also produces no result |
+| `error` | `{type, error}` | Provider/pipeline failure | Show `error`. **No `done` follows**; a design/blog also produces no result. Since 2026-11-20 the text is always safe to show: errors the user can act on keep their message (bad API key, rate limit, bad input), while server-side faults read e.g. "The Claude model is temporarily unavailable because of a problem on our side. Please try again shortly or choose another model." Do not parse it; show it with the `request_id` as the reference |
 
 **End of stream** = the connection closes. `stream_end` is not always sent, so do not wait for it.
 Typical order for a text request: `start → content… → done`. With images: `… → done → image_ready… → stream_end`.
@@ -669,10 +680,11 @@ whitelisted attributes above even though the server already filtered them.
 
 ### 4.8 Schema 1.1
 
-Branch on the returned `version`. Schema 1.0 continues to use §4.5. While the renderer is in rollout, send
-`schema_version: "1.0"` on design requests to pin the legacy format. Save the full AST, including its version and font
-tokens, and send it back for AI edits. A server with `DESIGN_SCHEMA_V11_ENABLED=false` refuses an edit of a saved 1.1 AST.
-Enable both 1.1 and two-pass vision in production after this renderer passes the editor acceptance checks below.
+**On by default since 2026-11-20** (together with two-pass screenshot matching and photo fill), so new designs come back as
+1.1 unless the request pins the old format. Branch on the returned `version`; schema 1.0 continues to use §4.5. **Until the
+editor passes the 1.1 acceptance checks below, send `schema_version: "1.0"` on design requests** to keep the legacy format.
+Save the full AST, including its version and font tokens, and send it back for AI edits. A server with
+`DESIGN_SCHEMA_V11_ENABLED=false` refuses an edit of a saved 1.1 AST.
 
 | Field | Rendering rule |
 |---|---|
@@ -815,7 +827,14 @@ excludes image alt text and captions attached to images.
 ## 8. Email templates: deltas to `EMAIL_API_HANDOFF.md`
 
 Follow that document; it is accurate (15 block types, all request fields and categories re-checked against the code).
-Three additions:
+**New on 2026-11-20** (documented there):
+* `POST /agent/email/rewrite` (§3.3): rewrite an existing template from an instruction ("Make this a Black Friday sale
+  email"). Only the copy changes; blocks, ids, links, merge tags, images and theme are kept. The response adds
+  `block_changes` and per template `added_blocks` / `removed_blocks` (block ids) for highlighting.
+* `layout` on `/agent/email/generate` (§3.2.1): a list of block types (`["header", "hero", "paragraph", "button",
+  "footer"]`); the email has exactly those blocks, in that order.
+
+Three earlier additions:
 
 1. **Call the email routes directly with the licence key**, like `/agent/stream`. `api_key` is the Eddyter licence; the
    agent checks it, picks the user's own or the platform key, and bills non-BYOK `generate` calls as text. No backend proxy

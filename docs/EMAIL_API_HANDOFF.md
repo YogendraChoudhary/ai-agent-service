@@ -4,6 +4,9 @@ For: the Eddyter frontend engineer integrating AI email generation.
 Backend: this agent service (`src/email_template`, routes in `api.py`).
 Verified: 2026-10-21. 322 automated tests pass, including `tests/email/test_email_edge_cases.py`, which asserts every
 edge case in §8. A live end-to-end request through the route (OpenAI) returned 200.
+Updated: 2026-11-20. **New:** `POST /agent/email/rewrite` (§3.3) and `layout` on `/generate` (§3.2.1); 4,390 tests pass, and
+12/12 live runs on OpenAI and Claude kept the design on every text-only rewrite. Server-side faults now return a plain,
+safe-to-show `error` message (500/502) instead of raw exception text.
 
 ---
 
